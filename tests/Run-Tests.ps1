@@ -475,6 +475,20 @@ function Invoke-JournalTests {
     $readOnlyDictionary['Password'] = 'readonly_password_secret'
     $readOnlyDictionary['Token'] = 'readonly_token_secret'
     $readOnlySecretData = [System.Collections.ObjectModel.ReadOnlyDictionary[string,string]]::new($readOnlyDictionary)
+    $cmdletString = Join-Path (Join-Path $testRoot 'journal cmdlet') 'campaign.json'
+    $protectedCmdletString = Protect-JournalValue $cmdletString
+    Assert-Equal 'System.String' $protectedCmdletString.GetType().FullName 'A cmdlet-produced string was adapted as a PS object.'
+    Assert-Equal $cmdletString $protectedCmdletString 'A cmdlet-produced string was not preserved by Protect-JournalValue.'
+    Assert-True (Test-JournalValueRedacted $cmdletString) 'A cmdlet-produced string was not recognized as already redacted.'
+    $cmdletStringJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Write-JournalEvent -Journal $cmdletStringJournal -Level 'Info' -Message 'cmdlet path checkpoint' -Data ([pscustomobject]@{ Campaign = $cmdletString; Backup = $cmdletString })
+    $reopenedCmdletString = Get-OperationJournal -Path $cmdletStringJournal.JournalPath
+    $cmdletCheckpoint = @($reopenedCmdletString.Checkpoints)[-1]
+    Assert-Equal 'System.String' $cmdletCheckpoint.Data.Campaign.GetType().FullName 'A cmdlet-produced string reloaded from a journal was adapted as a PS object.'
+    Assert-Equal $cmdletString $cmdletCheckpoint.Data.Campaign 'A cmdlet-produced string was corrupted in the journal.'
+    Assert-Equal $cmdletString $cmdletCheckpoint.Data.Backup 'A cmdlet-produced backup path was corrupted in the journal.'
+    $cmdletStringJson = [IO.File]::ReadAllText($cmdletStringJournal.JournalPath)
+    Assert-True ($cmdletStringJson -notmatch '"Length"') 'A cmdlet-produced string was journaled as a Length property.'
     $journal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
     Assert-True (-not [string]::IsNullOrWhiteSpace($journal.Id)) 'Journal ID is empty.'
     Assert-Equal 'Running' $journal.State 'New journal state is invalid.'
@@ -2671,6 +2685,37 @@ function Get-AdsRestorePointFile {
         Where-Object { [IO.Path]::GetFileName($_) -ne 'restore-point.json' })
 }
 
+function Get-AdsManifest {
+    param([string]$BackupRoot)
+
+    return [IO.File]::ReadAllText([IO.Path]::Combine($BackupRoot, 'restore-point.json')) | ConvertFrom-Json
+}
+
+function Write-AdsManifest {
+    param(
+        [string]$BackupRoot,
+        [object]$Manifest
+    )
+
+    [IO.File]::WriteAllText([IO.Path]::Combine($BackupRoot, 'restore-point.json'), ($Manifest | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+}
+
+function New-AdsManifestRecord {
+    param(
+        [string]$Source,
+        [string]$Backup
+    )
+
+    $item = New-Object IO.FileInfo($Backup)
+    return [pscustomobject]@{
+        Source   = $Source
+        Backup   = $Backup
+        Sha256   = (Get-FileHash -LiteralPath $Backup -Algorithm SHA256).Hash
+        ReadOnly = [bool]$item.IsReadOnly
+        Length   = [long]$item.Length
+    }
+}
+
 function Assert-AdsUnchanged {
     param(
         [string]$Path,
@@ -2817,7 +2862,7 @@ function Invoke-AdsTests {
     Assert-Equal 'CriticalError' (Get-OperationJournal -Path $duplicateJournal.JournalPath).Result.Status 'The duplicate suppression failure was not persisted.'
     Assert-Equal 'Running' $adsJournal.State 'A refused duplicate suppression closed an unrelated journal.'
 
-    $restore = Restore-MuMuAds -BackupRoot $adsBackupRoot -Journal $adsJournal
+    $restore = Restore-MuMuAds -BackupRoot $adsBackupRoot -AllowedRoot $globalAdsInstall.InstallRoot -Journal $adsJournal
     Assert-Equal 'Success' $restore.Status "Campaign restore failed. $($restore.Message)"
     Assert-Equal 1 $restore.Data.Restored 'Campaign restore reported the wrong count.'
     Assert-AdsUnchanged -Path $globalCampaign -Expected $globalCampaignJson -Message 'Campaign bytes were not restored exactly.'
@@ -2835,7 +2880,7 @@ function Invoke-AdsTests {
     Assert-Equal 'Success' $readOnlySuppress.Status "Read-only campaign suppression failed. $($readOnlySuppress.Message)"
     Assert-True ((Get-Item -LiteralPath $readOnlyCampaign).IsReadOnly) 'Campaign read-only state was not preserved.'
     Assert-Equal $false ((([IO.File]::ReadAllText($readOnlyCampaign) | ConvertFrom-Json).campaigns[0]).display) 'A read-only campaign was not suppressed.'
-    $readOnlyRestore = Restore-MuMuAds -BackupRoot $readOnlyBackupRoot -Journal $readOnlyJournal
+    $readOnlyRestore = Restore-MuMuAds -BackupRoot $readOnlyBackupRoot -AllowedRoot $readOnlyAdsInstall.InstallRoot -Journal $readOnlyJournal
     Assert-Equal 'Success' $readOnlyRestore.Status "Read-only campaign restore failed. $($readOnlyRestore.Message)"
     Assert-AdsUnchanged -Path $readOnlyCampaign -Expected $readOnlyCampaignJson -Message 'Read-only campaign bytes were not restored exactly.'
     Assert-True ((Get-Item -LiteralPath $readOnlyCampaign).IsReadOnly) 'Restore did not preserve the read-only state.'
@@ -2852,7 +2897,7 @@ function Invoke-AdsTests {
     Assert-Equal 1 $noDisplaySuppress.Data.Skipped 'A campaign without display flags was not counted as skipped.'
     Assert-AdsUnchanged -Path $noDisplayCampaign -Expected $noDisplayCampaignJson -Message 'A campaign without display flags was rewritten.'
     Assert-Equal 0 @(Get-AdsRestorePointFile -BackupRoot $noDisplayBackupRoot).Count 'A skipped campaign created a backup.'
-    $noDisplayRestore = Restore-MuMuAds -BackupRoot $noDisplayBackupRoot -Journal $noDisplayJournal
+    $noDisplayRestore = Restore-MuMuAds -BackupRoot $noDisplayBackupRoot -AllowedRoot $noDisplayAdsInstall.InstallRoot -Journal $noDisplayJournal
     Assert-Equal 'CriticalError' $noDisplayRestore.Status 'A skipped campaign produced a restorable restore point.'
 
     $malformedCampaignCases = @(
@@ -2865,7 +2910,13 @@ function Invoke-AdsTests {
         @{ Label = 'empty array root'; Json = '[]' },
         @{ Label = 'scalar root'; Json = '17' },
         @{ Label = 'string root'; Json = '"alpha"' },
-        @{ Label = 'nonobject records'; Json = '{"campaigns":["alpha"]}' }
+        @{ Label = 'nonobject records'; Json = '{"campaigns":["alpha"]}' },
+        @{ Label = 'single-quoted pseudo json'; Json = "{'campaigns':[{'id':'alpha','display':true}]}" },
+        @{ Label = 'single-quoted pseudo json object'; Json = "{'campaigns':'alpha'}" },
+        @{ Label = 'duplicate campaigns key'; Json = '{"campaigns":[{"id":"alpha","display":true}],"campaigns":[{"id":"beta","display":true}]}' },
+        @{ Label = 'duplicate case-variant key'; Json = '{"campaigns":[],"CAMPAIGNS":[]}' },
+        @{ Label = 'duplicate record key'; Json = '{"campaigns":[{"id":"alpha","display":true,"display":false}]}' },
+        @{ Label = 'trailing comma'; Json = '{"campaigns":[{"id":"alpha","display":true}],}' }
     )
     foreach ($malformedCase in $malformedCampaignCases) {
         $malformedAdsInstall = New-AdsInstallFixture -Name ('malformed ' + $malformedCase.Label + '\MuMu Global') -Edition 'Global'
@@ -2881,6 +2932,72 @@ function Invoke-AdsTests {
         Assert-Equal 'Failed' $malformedJournal.State "A refused campaign document did not journal the failure: $($malformedCase.Label)"
         Assert-Equal 'CriticalError' (Get-OperationJournal -Path $malformedJournal.JournalPath).Result.Status "The refused campaign document failure was not persisted: $($malformedCase.Label)"
     }
+
+    $equivalentLeft = '{"campaigns":[{"id":"a","display":true,"ratio":0.25,"tags":["x","y"]}],"version":3}' | ConvertFrom-Json
+    $equivalentRight = '{"campaigns":[{"id":"a","display":true,"ratio":0.25,"tags":["x","y"]}],"version":3}' | ConvertFrom-Json
+    Assert-True (Test-CampaignEquivalent -Left $equivalentLeft -Right $equivalentRight) 'Two equal campaign documents were reported as different.'
+    $truncatedTail = '1'
+    for ($level = 0; $level -lt 30; $level++) { $truncatedTail = '{"n":' + $truncatedTail + '}' }
+    $truncatedLeft = '{"campaigns":[{"id":"a","meta":' + $truncatedTail + '}]}' | ConvertFrom-Json
+    $truncatedRight = '{"campaigns":[{"id":"a","meta":' + $truncatedTail + '}]}' | ConvertFrom-Json
+    $shallowText = ConvertTo-Json -InputObject $truncatedRight -Depth 20
+    $shallowRight = $shallowText | ConvertFrom-Json
+    Assert-True (-not (Test-CampaignEquivalent -Left $truncatedLeft -Right $shallowRight)) 'A depth-truncated round trip was reported as equivalent.'
+    $typeLeft = '{"campaigns":[{"id":"a","ratio":1}]}' | ConvertFrom-Json
+    $typeRight = '{"campaigns":[{"id":"a","ratio":"1"}]}' | ConvertFrom-Json
+    Assert-True (-not (Test-CampaignEquivalent -Left $typeLeft -Right $typeRight)) 'A type-changed campaign value was reported as equivalent.'
+    $countLeft = '{"campaigns":[{"id":"a","tags":["x"]}]}' | ConvertFrom-Json
+    $countRight = '{"campaigns":[{"id":"a","tags":["x","y"]}]}' | ConvertFrom-Json
+    Assert-True (-not (Test-CampaignEquivalent -Left $countLeft -Right $countRight)) 'A different campaign array length was reported as equivalent.'
+    $nameLeft = '{"campaigns":[{"id":"a","display":true}]}' | ConvertFrom-Json
+    $nameRight = '{"campaigns":[{"ident":"a","display":true}]}' | ConvertFrom-Json
+    Assert-True (-not (Test-CampaignEquivalent -Left $nameLeft -Right $nameRight)) 'A renamed campaign property was reported as equivalent.'
+    $extraLeft = '{"campaigns":[{"id":"a","display":true}]}' | ConvertFrom-Json
+    $extraRight = '{"campaigns":[{"id":"a","display":true,"extra":1}],"version":1}' | ConvertFrom-Json
+    Assert-True (-not (Test-CampaignEquivalent -Left $extraLeft -Right $extraRight)) 'A campaign document with extra properties was reported as equivalent.'
+    $nullLeft = '{"campaigns":[{"id":"a","ratio":null}]}' | ConvertFrom-Json
+    $nullRight = '{"campaigns":[{"id":"a","ratio":0}]}' | ConvertFrom-Json
+    Assert-True (-not (Test-CampaignEquivalent -Left $nullLeft -Right $nullRight)) 'A null campaign value was reported as equivalent to a number.'
+    Assert-True (Test-CampaignEquivalent -Left $null -Right $null) 'Two null campaign values were reported as different.'
+
+    $deepAdsInstall = New-AdsInstallFixture -Name 'Deep\MuMu Global' -Edition 'Global'
+    $deepCampaign = Join-Path $deepAdsInstall.InstallRoot 'shell\ad\campaign.json'
+    $deepTail = '1'
+    for ($level = 0; $level -lt 30; $level++) {
+        $deepTail = '{"n":' + $deepTail + '}'
+    }
+    $deepCampaignJson = '{"campaigns":[{"id":"deep","display":true,"meta":' + $deepTail + '}]}'
+    New-AdsCampaignFixture -Path $deepCampaign -Json $deepCampaignJson
+    $deepBackupRoot = New-AdsBackupRoot -Name 'backup deep'
+    $deepJournal = New-AdsJournal -Name 'journal deep'
+    $deepSuppress = Suppress-MuMuAds -Paths @($deepCampaign) -BackupRoot $deepBackupRoot -Journal $deepJournal
+    Assert-Equal 'Success' $deepSuppress.Status "A deeply nested campaign was refused. $($deepSuppress.Message)"
+    $deepDocument = [IO.File]::ReadAllText($deepCampaign) | ConvertFrom-Json
+    Assert-Equal $false $deepDocument.campaigns[0].display 'The deeply nested campaign was not suppressed.'
+    $deepNode = $deepDocument.campaigns[0].meta
+    for ($level = 0; $level -lt 30; $level++) {
+        $deepNode = $deepNode.n
+    }
+    Assert-Equal 1 $deepNode 'A deeply nested campaign value was truncated.'
+    $deepRestoreJournal = New-AdsJournal -Name 'journal deep restore'
+    $deepRestore = Restore-MuMuAds -BackupRoot $deepBackupRoot -AllowedRoot $deepAdsInstall.InstallRoot -Journal $deepRestoreJournal
+    Assert-Equal 'Success' $deepRestore.Status "The deeply nested campaign was not restored. $($deepRestore.Message)"
+    Assert-AdsUnchanged -Path $deepCampaign -Expected $deepCampaignJson -Message 'The deeply nested campaign was not restored exactly.'
+
+    $alreadyAdsInstall = New-AdsInstallFixture -Name 'AlreadyFalse\MuMu Global' -Edition 'Global'
+    $alreadyCampaign = Join-Path $alreadyAdsInstall.InstallRoot 'shell\ad\campaign.json'
+    $alreadyCampaignJson = '{"campaigns":[{"id":"already","display":false}]}'
+    New-AdsCampaignFixture -Path $alreadyCampaign -Json $alreadyCampaignJson
+    $alreadyBackupRoot = New-AdsBackupRoot -Name 'backup already false'
+    $alreadyJournal = New-AdsJournal -Name 'journal already false'
+    $alreadySuppress = Suppress-MuMuAds -Paths @($alreadyCampaign) -BackupRoot $alreadyBackupRoot -Journal $alreadyJournal
+    Assert-Equal 'AlreadyApplied' $alreadySuppress.Status 'A campaign whose display flags were already false was reported as a change.'
+    Assert-Equal 0 $alreadySuppress.Data.Changed 'A no-op campaign rewrite was counted as a change.'
+    Assert-Equal 1 $alreadySuppress.Data.Skipped 'A no-op campaign rewrite was not counted as skipped.'
+    Assert-Equal 0 @($alreadySuppress.Data.Backups).Count 'A no-op campaign rewrite reported a backup.'
+    Assert-Equal 0 @(Get-AdsRestorePointFile -BackupRoot $alreadyBackupRoot).Count 'A no-op campaign rewrite created a backup file.'
+    Assert-True (-not [IO.File]::Exists([IO.Path]::Combine($alreadyBackupRoot, 'restore-point.json'))) 'A no-op campaign rewrite created a restore point manifest.'
+    Assert-AdsUnchanged -Path $alreadyCampaign -Expected $alreadyCampaignJson -Message 'A no-op campaign rewrite changed the file.'
 
     $lockedAdsInstall = New-AdsInstallFixture -Name 'Locked\MuMu Global' -Edition 'Global'
     $lockedCampaign = Join-Path $lockedAdsInstall.InstallRoot 'shell\ad\campaign.json'
@@ -2906,6 +3023,66 @@ function Invoke-AdsTests {
     $lockedTemporaryFiles = @([IO.Directory]::GetFiles($lockedAdsInstall.InstallRoot, '.*', [IO.SearchOption]::AllDirectories) | Where-Object { $_.Contains('.tmp') -or $_.Contains('.bak') })
     Assert-Equal 0 $lockedTemporaryFiles.Count 'A failed campaign replacement left a temporary file in the campaign directory.'
     Assert-Equal 'Failed' $lockedJournal.State 'A failed campaign replacement did not journal the failure.'
+    $lockedManifestPath = [IO.Path]::Combine($lockedBackupRoot, 'restore-point.json')
+    Assert-True ([IO.File]::Exists($lockedManifestPath)) 'A prepared restore point was not persisted before the campaign replacement was attempted.'
+    $lockedManifest = Get-AdsManifest -BackupRoot $lockedBackupRoot
+    Assert-Equal 0 $lockedManifest.Applied 'A prepared restore point claimed a completed replacement.'
+    Assert-Equal 1 @($lockedManifest.Records).Count 'A prepared restore point did not record the in-flight campaign file.'
+    $lockedManifestRecord = @($lockedManifest.Records)[0]
+    Assert-Equal $lockedCampaign $lockedManifestRecord.Source 'A prepared restore point recorded the wrong campaign path.'
+    $lockedRestoreJournal = New-AdsJournal -Name 'journal locked restore'
+    $lockedRestore = Restore-MuMuAds -BackupRoot $lockedBackupRoot -AllowedRoot $lockedAdsInstall.InstallRoot -Journal $lockedRestoreJournal
+    Assert-Equal 'Success' $lockedRestore.Status "A prepared restore point from a failed replacement could not be restored. $($lockedRestore.Message)"
+    Assert-Equal 1 $lockedRestore.Data.Prepared 'The prepared restore point did not report the prepared count.'
+    Assert-Equal 0 $lockedRestore.Data.Applied 'The prepared restore point reported a completed replacement.'
+    Assert-Equal 1 $lockedRestore.Data.Restored 'The prepared restore point did not restore the in-flight file.'
+    Assert-AdsUnchanged -Path $lockedCampaign -Expected $lockedCampaignJson -Message 'Restoring a prepared record changed the campaign bytes.'
+    Assert-True ((Get-Item -LiteralPath $lockedCampaign).IsReadOnly) 'Restoring a prepared record changed the read-only state.'
+
+    $partialAdsInstall = New-AdsInstallFixture -Name 'Partial\MuMu Global' -Edition 'Global'
+    $partialCampaign = Join-Path $partialAdsInstall.InstallRoot 'shell\ad\campaign.json'
+    $partialCampaignJson = '{"campaigns":[{"id":"partial","display":true}]}'
+    $partialBadCampaign = Join-Path $partialAdsInstall.InstallRoot 'nx_device\configs\campaign.json'
+    $partialBadCampaignJson = '{"campaigns":[{"id":"bad"'
+    New-AdsCampaignFixture -Path $partialCampaign -Json $partialCampaignJson
+    New-AdsCampaignFixture -Path $partialBadCampaign -Json $partialBadCampaignJson
+    $partialBackupRoot = New-AdsBackupRoot -Name 'backup partial'
+    $partialJournal = New-AdsJournal -Name 'journal partial'
+    $partialSuppress = Suppress-MuMuAds -Paths @($partialCampaign, $partialBadCampaign) -BackupRoot $partialBackupRoot -Journal $partialJournal
+    Assert-Equal 'CriticalError' $partialSuppress.Status 'A campaign operation with a valid first file and a malformed second file reported success.'
+    $partialManifest = Get-AdsManifest -BackupRoot $partialBackupRoot
+    Assert-Equal 1 $partialManifest.Applied 'The partial restore point did not report one applied replacement.'
+    Assert-Equal 1 @($partialManifest.Records).Count 'The partial restore point did not record the completed campaign file.'
+    Assert-Equal $partialCampaign @($partialManifest.Records)[0].Source 'The partial restore point recorded the wrong campaign path.'
+    $partialSuppressed = [IO.File]::ReadAllText($partialCampaign) | ConvertFrom-Json
+    Assert-Equal $false $partialSuppressed.campaigns[0].display 'The first campaign was not suppressed before the later failure.'
+    Assert-AdsUnchanged -Path $partialBadCampaign -Expected $partialBadCampaignJson -Message 'The malformed campaign was modified by a partial failure.'
+    $partialRestoreJournal = New-AdsJournal -Name 'journal partial restore'
+    $partialRestore = Restore-MuMuAds -BackupRoot $partialBackupRoot -AllowedRoot $partialAdsInstall.InstallRoot -Journal $partialRestoreJournal
+    Assert-Equal 'Success' $partialRestore.Status "The partially completed campaign operation was not reversible. $($partialRestore.Message)"
+    Assert-Equal 1 $partialRestore.Data.Restored 'The partial restore reported the wrong restored count.'
+    Assert-AdsUnchanged -Path $partialCampaign -Expected $partialCampaignJson -Message 'The partially suppressed campaign was not restored exactly.'
+    $partialRetryRoot = New-AdsBackupRoot -Name 'backup partial retry'
+    $partialRetryJournal = New-AdsJournal -Name 'journal partial retry'
+    $partialRetry = Suppress-MuMuAds -Paths @($partialCampaign) -BackupRoot $partialRetryRoot -Journal $partialRetryJournal
+    Assert-Equal 'Success' $partialRetry.Status "The campaign operation was not retryable after a partial failure. $($partialRetry.Message)"
+    Assert-Equal 1 $partialRetry.Data.Changed 'The retry did not change the campaign file.'
+    Assert-Equal $false (([IO.File]::ReadAllText($partialCampaign) | ConvertFrom-Json).campaigns[0].display) 'The retry did not suppress the campaign.'
+
+    $ownershipRoot = New-AdsBackupRoot -Name 'restore point ownership'
+    $ownershipPath = [IO.Path]::Combine($ownershipRoot, 'restore-point.json')
+    $ownershipCreate = Set-CampaignRestorePoint -Path $ownershipPath -Text '{"SchemaVersion":1,"Applied":0,"Records":[]}' -ExpectedText ''
+    Assert-Equal 'Success' $ownershipCreate.Status "A restore point manifest could not be created. $($ownershipCreate.Message)"
+    $ownershipDuplicate = Set-CampaignRestorePoint -Path $ownershipPath -Text '{"SchemaVersion":1,"Applied":9,"Records":[]}' -ExpectedText ''
+    Assert-Equal 'CriticalError' $ownershipDuplicate.Status 'A create over an existing restore point manifest was accepted.'
+    $ownershipStale = Set-CampaignRestorePoint -Path $ownershipPath -Text '{"SchemaVersion":1,"Applied":9,"Records":[]}' -ExpectedText '{"SchemaVersion":1,"Applied":5,"Records":[]}'
+    Assert-Equal 'CriticalError' $ownershipStale.Status 'A restore point manifest was refreshed without proof of ownership.'
+    Assert-True ($ownershipStale.Message -match '(?i)never overwritten') 'The unowned refresh failure did not explain the no-overwrite rule.'
+    Assert-Equal '{"SchemaVersion":1,"Applied":0,"Records":[]}' ([IO.File]::ReadAllText($ownershipPath)) 'A refused refresh changed the restore point manifest.'
+    $ownershipRefresh = Set-CampaignRestorePoint -Path $ownershipPath -Text '{"SchemaVersion":1,"Applied":1,"Records":[]}' -ExpectedText '{"SchemaVersion":1,"Applied":0,"Records":[]}'
+    Assert-Equal 'Success' $ownershipRefresh.Status "An owned refresh of a restore point manifest failed. $($ownershipRefresh.Message)"
+    Assert-Equal 1 (Get-AdsManifest -BackupRoot $ownershipRoot).Applied 'An owned refresh did not update the manifest.'
+    Assert-Equal 0 @(Get-AdsRestorePointFile -BackupRoot $ownershipRoot).Count 'A manifest refresh left a temporary file behind.'
 
     $multiAdsInstall = New-AdsInstallFixture -Name 'Multi\MuMu Global' -Edition 'Global'
     $multiHostPath = Join-Path $multiAdsInstall.InstallRoot 'shell\ad\hosts'
@@ -2932,7 +3109,7 @@ function Invoke-AdsTests {
     Assert-Equal 2 @(Get-AdsRestorePointFile -BackupRoot $multiBackupRoot).Count 'Multi-file suppression did not write one restore point record per file.'
     Assert-AdsUnchanged -Path $multiHostPath -Expected '127.0.0.1 mumu fixture' -Message 'Campaign suppression modified an unrelated hosts-like file.'
     Assert-AdsUnchanged -Path $multiDataPath -Expected '{"app":"fixture"}' -Message 'Campaign suppression modified an unrelated JSON file.'
-    $multiRestore = Restore-MuMuAds -BackupRoot $multiBackupRoot -Journal $multiJournal
+    $multiRestore = Restore-MuMuAds -BackupRoot $multiBackupRoot -AllowedRoot $multiAdsInstall.InstallRoot -Journal $multiJournal
     Assert-Equal 'Success' $multiRestore.Status "Multi-file campaign restore failed. $($multiRestore.Message)"
     Assert-Equal 2 $multiRestore.Data.Restored 'Multi-file restore reported the wrong count.'
     Assert-AdsUnchanged -Path $multiCampaign -Expected $multiCampaignJson -Message 'Multi-file restore did not restore the first campaign exactly.'
@@ -2948,7 +3125,7 @@ function Invoke-AdsTests {
     Assert-Equal 1 @($chineseSuppressed).Count 'An array-root campaign document was not rewritten as a JSON array.'
     Assert-Equal 'delta' @($chineseSuppressed)[0].id 'The array-root campaign document lost its record identity.'
     Assert-Equal 'cn' @($chineseSuppressed)[0].name 'The array-root campaign document lost an unrelated field.'
-    $secondInstallRestore = Restore-MuMuAds -BackupRoot $secondInstallBackupRoot -Journal $secondInstallJournal
+    $secondInstallRestore = Restore-MuMuAds -BackupRoot $secondInstallBackupRoot -AllowedRoot $chineseAdsInstall.InstallRoot -Journal $secondInstallJournal
     Assert-Equal 'Success' $secondInstallRestore.Status "Chinese campaign restore failed. $($secondInstallRestore.Message)"
     Assert-AdsUnchanged -Path $chineseCampaign -Expected $chineseCampaignJson -Message 'The array-root campaign document was not restored exactly.'
 
@@ -2974,7 +3151,7 @@ function Invoke-AdsTests {
     Assert-Equal 1 @(Get-AdsRestorePointFile -BackupRoot $sharedBackupRoot).Count 'A refused second operation added a restore point file.'
     Assert-AdsUnchanged -Path $otherCampaign -Expected $otherCampaignJson -Message 'A refused second operation changed the new campaign file.'
     Assert-Equal 'Failed' $sharedJournalDuplicate.State 'A refused second operation did not journal the failure.'
-    $sharedRestore = Restore-MuMuAds -BackupRoot $sharedBackupRoot -Journal $sharedJournal
+    $sharedRestore = Restore-MuMuAds -BackupRoot $sharedBackupRoot -AllowedRoot $sharedAdsInstall.InstallRoot -Journal $sharedJournal
     Assert-Equal 'Success' $sharedRestore.Status 'A shared restore point could not be restored after a refused second operation.'
     Assert-AdsUnchanged -Path $sharedCampaign -Expected $sharedCampaignJson -Message 'A shared restore point did not restore the first campaign exactly.'
 
@@ -2998,7 +3175,7 @@ function Invoke-AdsTests {
     $tamperManifestPath = Join-Path $tamperBackupRoot 'restore-point.json'
     $tamperBackupLength = [IO.File]::ReadAllBytes($tamperBackupPath).Length
     [IO.File]::WriteAllText($tamperBackupPath, ('X' * $tamperBackupLength))
-    $tamperRestore = Restore-MuMuAds -BackupRoot $tamperBackupRoot -Journal $tamperJournal
+    $tamperRestore = Restore-MuMuAds -BackupRoot $tamperBackupRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $tamperJournal
     Assert-Equal 'CriticalError' $tamperRestore.Status 'A tampered campaign restore point was restored.'
     Assert-True ($tamperRestore.Message -match '(?i)hash|length') "The tampered restore point failure did not name the verification: $($tamperRestore.Message)"
     Assert-AdsUnchanged -Path $tamperCampaign -Expected $tamperSuppressedJson -Message 'A failed restore changed the campaign bytes.'
@@ -3006,13 +3183,13 @@ function Invoke-AdsTests {
     Assert-True ([IO.File]::Exists($tamperManifestPath)) 'A failed restore deleted the restore point manifest.'
     [IO.File]::WriteAllText($tamperBackupPath, $tamperCampaignJson)
     $repairedJournal = New-AdsJournal -Name 'journal tamper repaired'
-    $repairedRestore = Restore-MuMuAds -BackupRoot $tamperBackupRoot -Journal $repairedJournal
+    $repairedRestore = Restore-MuMuAds -BackupRoot $tamperBackupRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $repairedJournal
     Assert-Equal 'Success' $repairedRestore.Status 'A repaired campaign restore point could not be restored.'
     Assert-AdsUnchanged -Path $tamperCampaign -Expected $tamperCampaignJson -Message 'A repaired restore did not return the original bytes.'
 
     [IO.File]::Delete($tamperBackupPath)
     $missingBackupJournal = New-AdsJournal -Name 'journal missing backup'
-    $missingBackupRestore = Restore-MuMuAds -BackupRoot $tamperBackupRoot -Journal $missingBackupJournal
+    $missingBackupRestore = Restore-MuMuAds -BackupRoot $tamperBackupRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $missingBackupJournal
     Assert-Equal 'CriticalError' $missingBackupRestore.Status 'A restore point with a missing backup file was restored.'
     Assert-True ($missingBackupRestore.Message -match '(?i)missing') 'The missing restore point file failure did not name the missing file.'
     Assert-AdsUnchanged -Path $tamperCampaign -Expected $tamperCampaignJson -Message 'A failed restore with a missing backup changed the campaign bytes.'
@@ -3021,14 +3198,18 @@ function Invoke-AdsTests {
         @{ Label = 'missing manifest'; Manifest = $null },
         @{ Label = 'malformed manifest'; Manifest = '{not-json' },
         @{ Label = 'array manifest'; Manifest = '[]' },
-        @{ Label = 'wrong schema version'; Manifest = '{"SchemaVersion":2,"Records":[]}' },
-        @{ Label = 'string schema version'; Manifest = '{"SchemaVersion":"1","Records":[]}' },
-        @{ Label = 'missing records'; Manifest = '{"SchemaVersion":1}' },
-        @{ Label = 'empty records'; Manifest = '{"SchemaVersion":1,"Records":[]}' },
-        @{ Label = 'string records'; Manifest = '{"SchemaVersion":1,"Records":"alpha"}' },
-        @{ Label = 'missing record property'; Manifest = '{"SchemaVersion":1,"Records":[{"Source":"C:\\fixture\\campaign.json","Backup":"C:\\fixture\\backup\\campaign.json","Sha256":"0000000000000000000000000000000000000000000000000000000000000000","ReadOnly":false}]}' },
-        @{ Label = 'extra record property'; Manifest = '{"SchemaVersion":1,"Records":[{"Source":"C:\\fixture\\campaign.json","Backup":"C:\\fixture\\backup\\campaign.json","Sha256":"0000000000000000000000000000000000000000000000000000000000000000","ReadOnly":false,"Length":1,"Extra":true}]}' },
-        @{ Label = 'invalid record hash'; Manifest = '{"SchemaVersion":1,"Records":[{"Source":"C:\\fixture\\campaign.json","Backup":"C:\\fixture\\backup\\campaign.json","Sha256":"not-a-hash","ReadOnly":false,"Length":1}]}' }
+        @{ Label = 'wrong schema version'; Manifest = '{"SchemaVersion":2,"Applied":1,"Records":[]}' },
+        @{ Label = 'string schema version'; Manifest = '{"SchemaVersion":"1","Applied":1,"Records":[]}' },
+        @{ Label = 'missing applied'; Manifest = '{"SchemaVersion":1,"Records":[]}' },
+        @{ Label = 'string applied'; Manifest = '{"SchemaVersion":1,"Applied":"1","Records":[]}' },
+        @{ Label = 'negative applied'; Manifest = '{"SchemaVersion":1,"Applied":-1,"Records":[]}' },
+        @{ Label = 'applied beyond records'; Manifest = '{"SchemaVersion":1,"Applied":3,"Records":[]}' },
+        @{ Label = 'missing records'; Manifest = '{"SchemaVersion":1,"Applied":0}' },
+        @{ Label = 'empty records'; Manifest = '{"SchemaVersion":1,"Applied":0,"Records":[]}' },
+        @{ Label = 'string records'; Manifest = '{"SchemaVersion":1,"Applied":0,"Records":"alpha"}' },
+        @{ Label = 'missing record property'; Manifest = '{"SchemaVersion":1,"Applied":1,"Records":[{"Source":"C:\\fixture\\campaign.json","Backup":"C:\\fixture\\backup\\campaign.json","Sha256":"0000000000000000000000000000000000000000000000000000000000000000","ReadOnly":false}]}' },
+        @{ Label = 'extra record property'; Manifest = '{"SchemaVersion":1,"Applied":1,"Records":[{"Source":"C:\\fixture\\campaign.json","Backup":"C:\\fixture\\backup\\campaign.json","Sha256":"0000000000000000000000000000000000000000000000000000000000000000","ReadOnly":false,"Length":1,"Extra":true}]}' },
+        @{ Label = 'invalid record hash'; Manifest = '{"SchemaVersion":1,"Applied":1,"Records":[{"Source":"C:\\fixture\\campaign.json","Backup":"C:\\fixture\\backup\\campaign.json","Sha256":"not-a-hash","ReadOnly":false,"Length":1}]}' }
     )
     foreach ($restorePointCase in $restorePointCases) {
         $restorePointRoot = New-AdsBackupRoot -Name ('restore point ' + $restorePointCase.Label)
@@ -3036,7 +3217,7 @@ function Invoke-AdsTests {
             [IO.File]::WriteAllText((Join-Path $restorePointRoot 'restore-point.json'), $restorePointCase.Manifest)
         }
         $restorePointJournal = New-AdsJournal -Name ('restore point journal ' + $restorePointCase.Label)
-        $restorePointResult = Restore-MuMuAds -BackupRoot $restorePointRoot -Journal $restorePointJournal
+        $restorePointResult = Restore-MuMuAds -BackupRoot $restorePointRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $restorePointJournal
         Assert-Equal 'CriticalError' $restorePointResult.Status "An incomplete campaign restore point was accepted: $($restorePointCase.Label)"
         Assert-True (-not [string]::IsNullOrWhiteSpace($restorePointResult.Message)) "An incomplete campaign restore point returned no reason: $($restorePointCase.Label)"
         Assert-Equal 'Failed' $restorePointJournal.State "An incomplete campaign restore point did not journal the failure: $($restorePointCase.Label)"
@@ -3044,41 +3225,99 @@ function Invoke-AdsTests {
 
     $outsideAdsBackupPath = Join-Path $script:adsFixtureRoot 'outside campaign.json'
     [IO.File]::WriteAllText($outsideAdsBackupPath, $tamperCampaignJson)
-    $outsideAdsBackupItem = New-Object IO.FileInfo($outsideAdsBackupPath)
     $escapedRecordRoot = New-AdsBackupRoot -Name 'restore point escaped record'
-    $escapedRecordJson = [ordered]@{
-        SchemaVersion = 1
-        Records = @([ordered]@{
-            Source   = $tamperCampaign
-            Backup   = $outsideAdsBackupPath
-            Sha256   = (Get-FileHash -LiteralPath $outsideAdsBackupPath -Algorithm SHA256).Hash
-            ReadOnly = $false
-            Length   = [long]$outsideAdsBackupItem.Length
+    Write-AdsManifest -BackupRoot $escapedRecordRoot -Manifest ([ordered]@{
+            SchemaVersion = 1
+            Applied       = 1
+            Records       = @([ordered]@{ Source = $tamperCampaign; Backup = $outsideAdsBackupPath; Sha256 = (Get-FileHash -LiteralPath $outsideAdsBackupPath -Algorithm SHA256).Hash; ReadOnly = $false; Length = [long](New-Object IO.FileInfo($outsideAdsBackupPath)).Length })
         })
-    }
-    [IO.File]::WriteAllText((Join-Path $escapedRecordRoot 'restore-point.json'), ($escapedRecordJson | ConvertTo-Json -Depth 6))
     $escapedRecordJournal = New-AdsJournal -Name 'restore point escaped record journal'
-    $escapedRecordRestore = Restore-MuMuAds -BackupRoot $escapedRecordRoot -Journal $escapedRecordJournal
+    $escapedRecordRestore = Restore-MuMuAds -BackupRoot $escapedRecordRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $escapedRecordJournal
     Assert-Equal 'CriticalError' $escapedRecordRestore.Status 'A restore point record outside the backup root was restored.'
     Assert-True ($escapedRecordRestore.Message -match '(?i)backup root|outside') 'The escaped restore point record failure did not name the backup root boundary.'
     Assert-AdsUnchanged -Path $tamperCampaign -Expected $tamperCampaignJson -Message 'An escaped restore point record changed the campaign bytes.'
 
     $missingRecordRoot = New-AdsBackupRoot -Name 'restore point missing record file'
-    $missingRecordJson = [ordered]@{
-        SchemaVersion = 1
-        Records = @([ordered]@{
-            Source   = $tamperCampaign
-            Backup   = (Join-Path $missingRecordRoot 'missing campaign.json')
-            Sha256   = (Get-ToolkitFileSha256 -Path $outsideAdsBackupPath)
-            ReadOnly = $false
-            Length   = [long]$outsideAdsBackupItem.Length
+    Write-AdsManifest -BackupRoot $missingRecordRoot -Manifest ([ordered]@{
+            SchemaVersion = 1
+            Applied       = 1
+            Records       = @([ordered]@{ Source = $tamperCampaign; Backup = [IO.Path]::Combine($missingRecordRoot, 'missing campaign.json'); Sha256 = (Get-ToolkitFileSha256 -Path $outsideAdsBackupPath); ReadOnly = $false; Length = [long](New-Object IO.FileInfo($outsideAdsBackupPath)).Length })
         })
-    }
-    [IO.File]::WriteAllText((Join-Path $missingRecordRoot 'restore-point.json'), ($missingRecordJson | ConvertTo-Json -Depth 6))
     $missingRecordJournal = New-AdsJournal -Name 'restore point missing record file journal'
-    $missingRecordRestore = Restore-MuMuAds -BackupRoot $missingRecordRoot -Journal $missingRecordJournal
+    $missingRecordRestore = Restore-MuMuAds -BackupRoot $missingRecordRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $missingRecordJournal
     Assert-Equal 'CriticalError' $missingRecordRestore.Status 'A restore point record with a missing backup file was restored.'
     Assert-True ($missingRecordRestore.Message -match '(?i)missing') 'The missing restore point backup file failure did not name the missing file.'
+
+    $boundaryAdsInstall = New-AdsInstallFixture -Name 'Boundary\MuMu Global' -Edition 'Global'
+    $boundaryCampaign = Join-Path $boundaryAdsInstall.InstallRoot 'shell\ad\campaign.json'
+    $boundaryCampaignJson = '{"campaigns":[{"id":"boundary","display":true}]}'
+    New-AdsCampaignFixture -Path $boundaryCampaign -Json $boundaryCampaignJson
+    $boundaryBackupRoot = New-AdsBackupRoot -Name 'backup boundary'
+    $boundaryJournal = New-AdsJournal -Name 'journal boundary'
+    $boundarySuppress = Suppress-MuMuAds -Paths @($boundaryCampaign) -BackupRoot $boundaryBackupRoot -Journal $boundaryJournal
+    Assert-Equal 'Success' $boundarySuppress.Status "The boundary fixture was not suppressed. $($boundarySuppress.Message)"
+    $boundaryBackupPath = @(Get-AdsRestorePointFile -BackupRoot $boundaryBackupRoot)[0]
+    $boundaryVictimPath = Join-Path $script:adsFixtureRoot 'outside restore target.json'
+    $boundaryVictimJson = '{"campaigns":[{"id":"victim","display":true}]}'
+    [IO.File]::WriteAllText($boundaryVictimPath, $boundaryVictimJson)
+    $boundaryCases = @(
+        @{ Label = 'outside the allowed root'; Source = $boundaryVictimPath; AllowedRoot = $boundaryAdsInstall.InstallRoot; Pattern = '(?i)boundary|outside' },
+        @{ Label = 'blank allowed root'; Source = $boundaryVictimPath; AllowedRoot = '   '; Pattern = '(?i)boundary' },
+        @{ Label = 'unavailable allowed root'; Source = $boundaryVictimPath; AllowedRoot = (Join-Path $script:adsFixtureRoot 'missing boundary root'); Pattern = '(?i)boundary' },
+        @{ Label = 'missing source'; Source = [IO.Path]::Combine($boundaryAdsInstall.InstallRoot, 'shell\ad\missing campaign.json'); AllowedRoot = $boundaryAdsInstall.InstallRoot; Pattern = '(?i)does not exist' },
+        @{ Label = 'source is a directory'; Source = (Join-Path $boundaryAdsInstall.InstallRoot 'shell\ad'); AllowedRoot = $boundaryAdsInstall.InstallRoot; Pattern = '(?i)not a regular file' }
+    )
+    foreach ($boundaryCase in $boundaryCases) {
+        $boundaryCaseRoot = New-AdsBackupRoot -Name ('backup boundary ' + $boundaryCase.Label)
+        $boundaryCaseBackup = [IO.Path]::Combine($boundaryCaseRoot, 'campaign.json')
+        Copy-Item -LiteralPath $boundaryBackupPath -Destination $boundaryCaseBackup -Force
+        Write-AdsManifest -BackupRoot $boundaryCaseRoot -Manifest ([ordered]@{
+                SchemaVersion = 1
+                Applied       = 1
+                Records       = @(New-AdsManifestRecord -Source $boundaryCase.Source -Backup $boundaryCaseBackup)
+            })
+        $boundaryCaseJournal = New-AdsJournal -Name ('journal boundary ' + $boundaryCase.Label)
+        $boundaryCaseRestore = Restore-MuMuAds -BackupRoot $boundaryCaseRoot -AllowedRoot $boundaryCase.AllowedRoot -Journal $boundaryCaseJournal
+        Assert-Equal 'CriticalError' $boundaryCaseRestore.Status "An out-of-policy campaign restore target was accepted: $($boundaryCase.Label)"
+        Assert-True ($boundaryCaseRestore.Message -match $boundaryCase.Pattern) "The out-of-policy restore failure did not explain the boundary: $($boundaryCase.Label) -> $($boundaryCaseRestore.Message)"
+        Assert-AdsUnchanged -Path $boundaryVictimPath -Expected $boundaryVictimJson -Message "An out-of-policy restore target was overwritten: $($boundaryCase.Label)"
+        Assert-True ([IO.File]::Exists($boundaryCaseBackup)) "A refused restore deleted the restore point: $($boundaryCase.Label)"
+        Assert-Equal 'Failed' $boundaryCaseJournal.State "A refused restore did not journal the failure: $($boundaryCase.Label)"
+    }
+    $boundaryLinkedRoot = Join-Path $boundaryAdsInstall.InstallRoot 'linked ad'
+    $boundaryLinkedTarget = Join-Path $script:adsFixtureRoot 'outside linked ad'
+    [void][IO.Directory]::CreateDirectory($boundaryLinkedTarget)
+    New-AdsCampaignFixture -Path ([IO.Path]::Combine($boundaryLinkedTarget, 'campaign.json')) -Json $boundaryVictimJson
+    New-Item -ItemType Junction -Path $boundaryLinkedRoot -Target $boundaryLinkedTarget | Out-Null
+    $boundaryLinkedBackupRoot = New-AdsBackupRoot -Name 'backup boundary linked source'
+    $boundaryLinkedBackup = [IO.Path]::Combine($boundaryLinkedBackupRoot, 'campaign.json')
+    Copy-Item -LiteralPath $boundaryBackupPath -Destination $boundaryLinkedBackup -Force
+    Write-AdsManifest -BackupRoot $boundaryLinkedBackupRoot -Manifest ([ordered]@{
+            SchemaVersion = 1
+            Applied       = 1
+            Records       = @(New-AdsManifestRecord -Source ([IO.Path]::Combine($boundaryLinkedRoot, 'campaign.json')) -Backup $boundaryLinkedBackup)
+        })
+    $boundaryLinkedJournal = New-AdsJournal -Name 'journal boundary linked source'
+    $boundaryLinkedRestore = Restore-MuMuAds -BackupRoot $boundaryLinkedBackupRoot -AllowedRoot $boundaryAdsInstall.InstallRoot -Journal $boundaryLinkedJournal
+    Assert-Equal 'CriticalError' $boundaryLinkedRestore.Status 'A campaign restore target reached through a junction outside the boundary was accepted.'
+    Assert-True ($boundaryLinkedRestore.Message -match '(?i)boundary|outside') 'The junctioned restore target failure did not name the boundary.'
+    Assert-AdsUnchanged -Path ([IO.Path]::Combine($boundaryLinkedTarget, 'campaign.json')) -Expected $boundaryVictimJson -Message 'A junctioned out-of-boundary restore target was overwritten.'
+
+    $boundaryPartialRoot = New-AdsBackupRoot -Name 'backup boundary partial'
+    $boundaryPartialBackup = [IO.Path]::Combine($boundaryPartialRoot, 'campaign.json')
+    Copy-Item -LiteralPath $boundaryBackupPath -Destination $boundaryPartialBackup -Force
+    Write-AdsManifest -BackupRoot $boundaryPartialRoot -Manifest ([ordered]@{
+            SchemaVersion = 1
+            Applied       = 1
+            Records       = @(
+                (New-AdsManifestRecord -Source $boundaryCampaign -Backup $boundaryPartialBackup),
+                (New-AdsManifestRecord -Source (Join-Path $boundaryAdsInstall.InstallRoot 'shell\ad') -Backup $boundaryPartialBackup)
+            )
+        })
+    $boundaryPartialJournal = New-AdsJournal -Name 'journal boundary partial'
+    $boundaryPartialRestore = Restore-MuMuAds -BackupRoot $boundaryPartialRoot -AllowedRoot $boundaryAdsInstall.InstallRoot -Journal $boundaryPartialJournal
+    Assert-Equal 'CriticalError' $boundaryPartialRestore.Status 'A restore point with an invalid second record was restored.'
+    Assert-Equal $false (([IO.File]::ReadAllText($boundaryCampaign) | ConvertFrom-Json).campaigns[0].display) 'An invalid record in a later position still wrote an earlier campaign file.'
 
     $relinkedAdsBackupTarget = New-AdsBackupRoot -Name 'relinked backup target'
     $relinkedAdsBackupRoot = Join-Path $script:adsFixtureRoot 'relinked backup root junction'
@@ -3090,7 +3329,7 @@ function Invoke-AdsTests {
     Assert-True ($relinkedSuppress.Message -match '(?i)reparse|junction|link') 'The junctioned campaign backup root failure did not name the reparse point.'
     Assert-Equal 0 @([IO.Directory]::GetFiles($relinkedAdsBackupTarget, '*', [IO.SearchOption]::AllDirectories)).Count 'A junctioned campaign backup root received a file.'
     $relinkedRestoreJournal = New-AdsJournal -Name 'journal relinked restore root'
-    $relinkedRestore = Restore-MuMuAds -BackupRoot $relinkedAdsBackupRoot -Journal $relinkedRestoreJournal
+    $relinkedRestore = Restore-MuMuAds -BackupRoot $relinkedAdsBackupRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $relinkedRestoreJournal
     Assert-Equal 'CriticalError' $relinkedRestore.Status 'A junctioned campaign restore root was accepted.'
     Assert-Equal 0 @([IO.Directory]::GetFiles($relinkedAdsBackupTarget, '*', [IO.SearchOption]::AllDirectories)).Count 'A junctioned campaign restore root received a file.'
 
@@ -3117,7 +3356,7 @@ function Invoke-AdsTests {
     Assert-Equal 'CriticalError' (Suppress-MuMuAds -Paths @((Join-Path $script:adsFixtureRoot 'missing campaign.json')) -BackupRoot $validRequestBackupRoot -Journal $invalidRequestJournal).Status 'A missing campaign file was accepted.'
     Assert-Equal 'CriticalError' (Suppress-MuMuAds -Paths @($tamperAdsInstall.InstallRoot) -BackupRoot $validRequestBackupRoot -Journal $invalidRequestJournal).Status 'A campaign directory was accepted.'
     Assert-Equal 'CriticalError' (Suppress-MuMuAds -Paths @('   ') -BackupRoot $validRequestBackupRoot -Journal $invalidRequestJournal).Status 'A blank campaign path was accepted.'
-    Assert-Equal 'CriticalError' (Restore-MuMuAds -BackupRoot $validRequestBackupRoot -Journal $null).Status 'A campaign restore without a journal was accepted.'
+    Assert-Equal 'CriticalError' (Restore-MuMuAds -BackupRoot $validRequestBackupRoot -AllowedRoot $tamperAdsInstall.InstallRoot -Journal $null).Status 'A campaign restore without a journal was accepted.'
     Assert-Equal 0 @(Get-AdsRestorePointFile -BackupRoot $validRequestBackupRoot).Count 'A refused campaign request created a restore point.'
 }
 

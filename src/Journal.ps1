@@ -27,6 +27,9 @@ function Protect-JournalValue {
         $Value -is [System.Delegate]) {
         throw 'Journal object type is unsupported.'
     }
+    if ($Value -is [string]) {
+        return Protect-ToolkitText $Value
+    }
     if ($Value -is [System.Collections.IDictionary]) {
         $copy = @{}
         foreach ($key in $Value.Keys) {
@@ -61,9 +64,6 @@ function Protect-JournalValue {
             $copy += @(Protect-JournalValue $item)
         }
         return ,$copy
-    }
-    if ($Value -is [string]) {
-        return Protect-ToolkitText $Value
     }
     $type = $Value.GetType()
     if ($type.IsPrimitive -or

@@ -4,7 +4,8 @@ $script:ToolkitCampaignRelativePaths = @{
     Global = @('shell\ad\campaign.json', 'nx_device\configs\campaign.json')
     Chinese = @('MuMuPlayer\ad\campaign.json', 'shell\ad\campaign.json')
 }
-$script:ToolkitCampaignJsonDepth = 20
+$script:ToolkitCampaignJsonDepth = 100
+$script:ToolkitCampaignCompareDepth = 128
 
 function New-MuMuAdFailure {
     param(
@@ -71,6 +72,76 @@ function Assert-ToolkitCampaignBackupRoot {
     return $root
 }
 
+function Assert-ToolkitCampaignAllowedRoot {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'A campaign restore boundary is required.'
+    }
+    $root = ConvertTo-ToolkitFullPath -Path $Path
+    if ($null -eq $root) {
+        throw 'The campaign restore boundary path is invalid.'
+    }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw 'The campaign restore boundary is unavailable.'
+    }
+    return $root
+}
+
+function Test-CampaignEquivalent {
+    param(
+        [AllowNull()][object]$Left,
+        [AllowNull()][object]$Right,
+        [int]$Depth = 0
+    )
+
+    if ($Depth -gt $script:ToolkitCampaignCompareDepth) {
+        return $false
+    }
+    if ($null -eq $Left -or $null -eq $Right) {
+        return ($null -eq $Left) -and ($null -eq $Right)
+    }
+    if ($Left -is [string] -or $Right -is [string]) {
+        return ($Left -is [string]) -and ($Right -is [string]) -and ([string]$Left -ceq [string]$Right)
+    }
+    if ($Left -is [Array] -or $Right -is [Array]) {
+        if ($Left -isnot [Array] -or $Right -isnot [Array] -or $Left.Count -ne $Right.Count) {
+            return $false
+        }
+        for ($index = 0; $index -lt $Left.Count; $index++) {
+            if (-not (Test-CampaignEquivalent -Left $Left[$index] -Right $Right[$index] -Depth ($Depth + 1))) {
+                return $false
+            }
+        }
+        return $true
+    }
+    if ($Left -is [pscustomobject] -or $Right -is [pscustomobject]) {
+        if ($Left -isnot [pscustomobject] -or $Right -isnot [pscustomobject]) {
+            return $false
+        }
+        $leftNames = @($Left.PSObject.Properties | ForEach-Object { $_.Name })
+        $rightNames = @($Right.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($leftNames.Count -ne $rightNames.Count) {
+            return $false
+        }
+        foreach ($propertyName in $leftNames) {
+            if ($rightNames -cnotcontains $propertyName) {
+                return $false
+            }
+            $leftValue = $Left.PSObject.Properties[$propertyName].Value
+            $rightValue = $Right.PSObject.Properties[$propertyName].Value
+            if (-not (Test-CampaignEquivalent -Left $leftValue -Right $rightValue -Depth ($Depth + 1))) {
+                return $false
+            }
+        }
+        return $true
+    }
+    if ($Left.GetType() -ne $Right.GetType()) {
+        return $false
+    }
+    return $Left.Equals($Right)
+}
+
 function Get-CampaignText {
     param([byte[]]$Bytes)
 
@@ -99,6 +170,7 @@ function Get-CampaignText {
 function ConvertFrom-CampaignJson {
     param([string]$Text)
 
+    Assert-NoDuplicateJournalProperty -Json $Text
     $document = $Text | ConvertFrom-Json -ErrorAction Stop
     if ($null -eq $document -or $document -is [string] -or $document -is [ValueType]) {
         throw 'Campaign document is malformed.'
@@ -108,6 +180,12 @@ function ConvertFrom-CampaignJson {
         return , @($document)
     }
     return $document
+}
+
+function ConvertTo-CampaignJson {
+    param([object]$Document)
+
+    return ConvertTo-Json -InputObject $Document -Depth $script:ToolkitCampaignJsonDepth -WarningAction SilentlyContinue
 }
 
 function Get-CampaignRecords {
@@ -190,34 +268,77 @@ function Set-CampaignFileContent {
     return Get-ToolkitResult -Status 'Success' -Message 'Campaign file was replaced atomically.'
 }
 
-function Write-CampaignRestorePoint {
+function Get-CampaignRestorePointText {
     param(
-        [string]$Path,
-        [string]$Text
+        [object[]]$Records,
+        [int]$Applied
     )
 
-    $created = $false
-    try {
-        $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        $created = $true
+    $restorePoint = [ordered]@{
+        SchemaVersion = 1
+        Applied       = $Applied
+        Records       = @($Records)
+    }
+    return ($restorePoint | ConvertTo-Json -Depth 6)
+}
+
+function Set-CampaignRestorePoint {
+    param(
+        [string]$Path,
+        [string]$Text,
+        [AllowNull()][string]$ExpectedText
+    )
+
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    $isRefresh = -not [string]::IsNullOrEmpty($ExpectedText)
+    if ($isRefresh) {
+        $currentText = $null
         try {
-            $bytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes($Text)
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush()
+            $currentText = [IO.File]::ReadAllText($Path, $utf8)
         }
-        finally {
-            $stream.Dispose()
+        catch {
+            $currentText = $null
+        }
+        if ($null -eq $currentText -or $currentText -cne $ExpectedText) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The campaign restore point was changed by another process and is never overwritten.'
+        }
+    }
+
+    $temporaryPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($Path), ('.' + [IO.Path]::GetFileName($Path) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'))
+    $replacedPath = $temporaryPath + '.bak'
+    $createdTemporary = $false
+    $replaced = $false
+    try {
+        [IO.File]::WriteAllText($temporaryPath, $Text, $utf8)
+        $createdTemporary = $true
+        if (-not $isRefresh) {
+            [IO.File]::Move($temporaryPath, $Path)
+            $createdTemporary = $false
+        }
+        else {
+            [IO.File]::Replace($temporaryPath, $Path, $replacedPath)
+            $createdTemporary = $false
+            $replaced = $true
         }
     }
     catch {
-        if ($created -and [IO.File]::Exists($Path)) {
+        $writeFailure = Protect-ToolkitText ([string]$_.Exception.Message)
+        if ($createdTemporary -and [IO.File]::Exists($temporaryPath)) {
             try {
-                [IO.File]::Delete($Path)
+                [IO.File]::Delete($temporaryPath)
             }
             catch {
             }
         }
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The campaign restore point manifest could not be written.'
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The campaign restore point manifest could not be written: $writeFailure"
+    }
+    if ($replaced -and [IO.File]::Exists($replacedPath)) {
+        try {
+            [IO.File]::Delete($replacedPath)
+        }
+        catch {
+            return Get-ToolkitResult -Status 'CriticalError' -Message ("The campaign restore point manifest could not be written: " + (Protect-ToolkitText ([string]$_.Exception.Message)))
+        }
     }
     return Get-ToolkitResult -Status 'Success' -Message 'The campaign restore point manifest was written.'
 }
@@ -315,6 +436,7 @@ function Suppress-MuMuAds {
     $changed = 0
     $skipped = 0
     $records = @()
+    $restorePointText = $null
     for ($campaignIndex = 0; $campaignIndex -lt $campaignPaths.Count; $campaignIndex++) {
         $campaignPath = $campaignPaths[$campaignIndex]
         $campaignItem = $null
@@ -344,7 +466,7 @@ function Suppress-MuMuAds {
             $document = $null
         }
         if ($null -eq $document) {
-            return New-MuMuAdFailure -Journal $Journal -Message "Campaign file JSON is malformed: $campaignPath"
+            return New-MuMuAdFailure -Journal $Journal -Message "Campaign file JSON is malformed, not strict, or repeats a property: $campaignPath"
         }
         $campaigns = Get-CampaignRecords -Document $document
         if ($null -eq $campaigns -or $campaigns.Count -eq 0) {
@@ -356,10 +478,23 @@ function Suppress-MuMuAds {
             }
         }
 
+        $originalText = ConvertTo-CampaignJson -Document $document
         $displayCount = Set-CampaignDisplays -Campaigns $campaigns
-        if ($displayCount -eq 0) {
+        $suppressedText = ConvertTo-CampaignJson -Document $document
+        if ($displayCount -eq 0 -or $originalText -ceq $suppressedText) {
             $skipped++
             continue
+        }
+
+        $roundTripped = $null
+        try {
+            $roundTripped = ConvertFrom-CampaignJson -Text $suppressedText
+        }
+        catch {
+            $roundTripped = $null
+        }
+        if ($null -eq $roundTripped -or -not (Test-CampaignEquivalent -Left $document -Right $roundTripped)) {
+            return New-MuMuAdFailure -Journal $Journal -Message "Campaign serialization is not equivalent to the campaign document and is refused: $campaignPath"
         }
 
         $campaignBackupRoot = [IO.Path]::Combine($backupRootPath, [string]$campaignIndex)
@@ -374,10 +509,26 @@ function Suppress-MuMuAds {
             return New-MuMuAdFailure -Journal $Journal -Message $backup.Message
         }
 
-        $replacement = Set-CampaignFileContent -Path $campaignPath -Text (ConvertTo-Json -InputObject $document -Depth $script:ToolkitCampaignJsonDepth) -Encoding $decoded.Encoding -OriginalAttributes $campaignItem.Attributes
-        if ($replacement.Status -ne 'Success') {
-            return New-MuMuAdFailure -Journal $Journal -Message ($replacement.Message + ' The campaign backup was kept.')
+        $records += $backup.Data
+        $preparedText = Get-CampaignRestorePointText -Records $records -Applied $changed
+        $prepared = Set-CampaignRestorePoint -Path $restorePointPath -Text $preparedText -ExpectedText $restorePointText
+        if ($prepared.Status -ne 'Success') {
+            return New-MuMuAdFailure -Journal $Journal -Message ($prepared.Message + ' The campaign backup was kept.')
         }
+        $restorePointText = $preparedText
+
+        $replacement = Set-CampaignFileContent -Path $campaignPath -Text $suppressedText -Encoding $decoded.Encoding -OriginalAttributes $campaignItem.Attributes
+        if ($replacement.Status -ne 'Success') {
+            return New-MuMuAdFailure -Journal $Journal -Message ($replacement.Message + ' The campaign restore point can still restore this file.')
+        }
+        $changed++
+
+        $appliedText = Get-CampaignRestorePointText -Records $records -Applied $changed
+        $refreshed = Set-CampaignRestorePoint -Path $restorePointPath -Text $appliedText -ExpectedText $restorePointText
+        if ($refreshed.Status -ne 'Success') {
+            return New-MuMuAdFailure -Journal $Journal -Message ($refreshed.Message + ' The campaign file is already restorable.')
+        }
+        $restorePointText = $appliedText
 
         try {
             Write-JournalEvent -Journal $Journal -Level 'Info' -Message "Suppressed $displayCount campaign display flag(s)." -Data ([pscustomobject]@{
@@ -389,19 +540,6 @@ function Suppress-MuMuAds {
         catch {
             return New-MuMuAdFailure -Journal $Journal -Message 'A suppressed campaign file could not be journaled.'
         }
-        $records += $backup.Data
-        $changed++
-    }
-
-    if ($changed -gt 0) {
-        $restorePoint = [ordered]@{
-            SchemaVersion = 1
-            Records       = @($records)
-        }
-        $written = Write-CampaignRestorePoint -Path $restorePointPath -Text ($restorePoint | ConvertTo-Json -Depth 6)
-        if ($written.Status -ne 'Success') {
-            return New-MuMuAdFailure -Journal $Journal -Message ($written.Message + ' The campaign backups were kept.')
-        }
     }
 
     $status = if ($changed -eq 0) { 'AlreadyApplied' } else { 'Success' }
@@ -411,6 +549,7 @@ function Suppress-MuMuAds {
 function Restore-MuMuAds {
     param(
         [string]$BackupRoot,
+        [string]$AllowedRoot,
         [object]$Journal
     )
 
@@ -423,6 +562,13 @@ function Restore-MuMuAds {
     $backupRootPath = $null
     try {
         $backupRootPath = Assert-ToolkitCampaignBackupRoot -BackupRoot $BackupRoot
+    }
+    catch {
+        return New-MuMuAdFailure -Journal $Journal -Message ([string]$_.Exception.Message)
+    }
+    $allowedRootPath = $null
+    try {
+        $allowedRootPath = Assert-ToolkitCampaignAllowedRoot -Path $AllowedRoot
     }
     catch {
         return New-MuMuAdFailure -Journal $Journal -Message ([string]$_.Exception.Message)
@@ -443,23 +589,35 @@ function Restore-MuMuAds {
         return New-MuMuAdFailure -Journal $Journal -Message 'The campaign restore point manifest is malformed.'
     }
     $schemaProperty = $restorePoint.PSObject.Properties['SchemaVersion']
+    $appliedProperty = $restorePoint.PSObject.Properties['Applied']
     $recordsProperty = $restorePoint.PSObject.Properties['Records']
     if ($null -eq $schemaProperty -or $schemaProperty.Value -isnot [int] -or $schemaProperty.Value -ne 1 -or
+        $null -eq $appliedProperty -or $appliedProperty.Value -isnot [int] -or $appliedProperty.Value -lt 0 -or
         $null -eq $recordsProperty -or $recordsProperty.Value -isnot [Array] -or @($recordsProperty.Value).Count -eq 0) {
         return New-MuMuAdFailure -Journal $Journal -Message 'The campaign restore point manifest is incomplete.'
     }
+    $applied = [int]$appliedProperty.Value
+    $records = @($recordsProperty.Value)
+    if ($applied -gt $records.Count) {
+        return New-MuMuAdFailure -Journal $Journal -Message 'The campaign restore point manifest is incomplete.'
+    }
 
-    $restored = 0
-    foreach ($record in @($recordsProperty.Value)) {
+    $verifiedRecords = @()
+    foreach ($record in $records) {
         if ($null -eq $record -or $record -isnot [pscustomobject]) {
             return New-MuMuAdFailure -Journal $Journal -Message 'A campaign restore point record is invalid.'
         }
         $backupProperty = $record.PSObject.Properties['Backup']
+        $sourceProperty = $record.PSObject.Properties['Source']
         $backupPath = $null
+        $sourcePath = $null
         if ($null -ne $backupProperty -and $backupProperty.Value -is [string]) {
             $backupPath = ConvertTo-ToolkitFullPath -Path $backupProperty.Value
         }
-        if ($null -eq $backupPath) {
+        if ($null -ne $sourceProperty -and $sourceProperty.Value -is [string]) {
+            $sourcePath = ConvertTo-ToolkitFullPath -Path $sourceProperty.Value
+        }
+        if ($null -eq $backupPath -or $null -eq $sourcePath) {
             return New-MuMuAdFailure -Journal $Journal -Message 'A campaign restore point record is invalid.'
         }
         if (-not [IO.File]::Exists($backupPath)) {
@@ -468,6 +626,23 @@ function Restore-MuMuAds {
         if (-not (Test-ToolkitPathWithinRoot -Path $backupPath -Root $backupRootPath)) {
             return New-MuMuAdFailure -Journal $Journal -Message 'A campaign restore point file is outside the campaign backup root.'
         }
+        if (-not (Test-Path -LiteralPath $sourcePath)) {
+            return New-MuMuAdFailure -Journal $Journal -Message "A campaign restore target does not exist: $sourcePath"
+        }
+        if (-not (Test-ToolkitPathWithinRoot -Path $sourcePath -Root $allowedRootPath)) {
+            return New-MuMuAdFailure -Journal $Journal -Message 'A campaign restore target is outside the campaign restore boundary.'
+        }
+        try {
+            [void](Assert-ToolkitRegularFile -Path $sourcePath -Label 'Campaign restore target')
+        }
+        catch {
+            return New-MuMuAdFailure -Journal $Journal -Message ([string]$_.Exception.Message)
+        }
+        $verifiedRecords += $record
+    }
+
+    $restored = 0
+    foreach ($record in $verifiedRecords) {
         $restore = Restore-BackupFile -BackupRecord $record
         if ($restore.Status -ne 'Success') {
             return New-MuMuAdFailure -Journal $Journal -Message $restore.Message
@@ -476,11 +651,18 @@ function Restore-MuMuAds {
     }
 
     $restoreMessage = "Restored $restored campaign file(s) from their restore point."
+    if ($restored -gt $applied) {
+        $restoreMessage += " $applied of $restored file(s) were confirmed replaced; the remainder were prepared but not applied and were restored from the same restore point."
+    }
     try {
-        Write-JournalEvent -Journal $Journal -Level 'Info' -Message $restoreMessage -Data (@{ Restored = $restored })
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message $restoreMessage -Data ([pscustomobject]@{
+                Restored = $restored
+                Applied  = $applied
+                Prepared = $records.Count
+            })
     }
     catch {
         return New-MuMuAdFailure -Journal $Journal -Message 'The restored campaign files could not be journaled.'
     }
-    return Get-ToolkitResult -Status 'Success' -Message $restoreMessage -Data (@{ Restored = $restored })
+    return Get-ToolkitResult -Status 'Success' -Message $restoreMessage -Data (@{ Restored = $restored; Applied = $applied; Prepared = $records.Count })
 }
