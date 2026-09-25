@@ -7,6 +7,14 @@ function Protect-JournalValue {
     if ($null -eq $Value) {
         return $null
     }
+    if ($Value -is [scriptblock] -or
+        $Value -is [System.IO.Stream] -or
+        $Value -is [System.Threading.WaitHandle] -or
+        $Value -is [System.Delegate] -or
+        $Value -is [System.Type] -or
+        $Value -is [System.Reflection.MemberInfo]) {
+        throw 'Journal object type is unsupported.'
+    }
     if ($Value -is [System.Collections.IDictionary]) {
         $copy = @{}
         foreach ($key in $Value.Keys) {
@@ -42,7 +50,39 @@ function Protect-JournalValue {
         }
         return ,$copy
     }
-    return $Value
+    if ($Value -is [string]) {
+        return Protect-ToolkitText $Value
+    }
+    $type = $Value.GetType()
+    if ($type.IsPrimitive -or
+        $Value -is [decimal] -or
+        $Value -is [DateTime] -or
+        $Value -is [DateTimeOffset] -or
+        $Value -is [Guid] -or
+        $Value -is [TimeSpan] -or
+        $Value -is [Uri] -or
+        $Value -is [Version] -or
+        $Value -is [System.Enum]) {
+        return $Value
+    }
+    $properties = @($Value.PSObject.Properties | Where-Object {
+        $_.IsGettable -and
+        ($_.MemberType -eq [Management.Automation.PSMemberTypes]::Property -or
+         $_.MemberType -eq [Management.Automation.PSMemberTypes]::NoteProperty)
+    })
+    if ($properties.Count -eq 0) {
+        throw 'Journal object type is unsupported.'
+    }
+    $copy = @{}
+    foreach ($property in $properties) {
+        $copy[$property.Name] = if ($property.Name -match 'token|password|secret|authorization|cookie|key') {
+            '[REDACTED]'
+        }
+        else {
+            Protect-JournalValue $property.Value
+        }
+    }
+    return [pscustomobject]$copy
 }
 
 function Test-JournalValueRedacted {
@@ -53,6 +93,9 @@ function Test-JournalValueRedacted {
 
     if ($null -eq $Value) {
         return $true
+    }
+    if ($Value -is [string]) {
+        return (Protect-ToolkitText $Value) -ceq $Value
     }
     if ($Value -is [System.Collections.IDictionary]) {
         foreach ($key in $Value.Keys) {
@@ -114,24 +157,39 @@ function ConvertTo-JournalDateTime {
 function Assert-JournalResult {
     param(
         [AllowNull()]
-        [object]$Result
+        [object]$Result,
+        [string]$State
     )
 
     if ($null -eq $Result) {
+        if ($State -ne 'Running') {
+            throw 'Journal state and result do not match.'
+        }
         return
     }
-    if ($Result -is [Array] -or $Result -isnot [pscustomobject]) {
+    if ($State -eq 'Running' -or $Result -is [Array] -or $Result -isnot [pscustomobject]) {
+        throw 'Journal result does not match journal state.'
+    }
+    $resultProperties = @($Result.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($resultProperties.Count -ne 3) {
         throw 'Journal result is invalid.'
     }
     foreach ($propertyName in @('Status', 'Message', 'Data')) {
-        if ($null -eq $Result.PSObject.Properties[$propertyName]) {
+        if ($resultProperties -cnotcontains $propertyName) {
             throw 'Journal result is invalid.'
         }
     }
+    $allowedStatuses = if ($State -eq 'Completed') {
+        @('Success', 'AlreadyApplied', 'Warning')
+    }
+    else {
+        @('RecoverableError', 'CriticalError')
+    }
     if ($Result.Status -isnot [string] -or
-        @('Success', 'AlreadyApplied', 'Warning', 'RecoverableError', 'CriticalError') -cnotcontains $Result.Status -or
+        $allowedStatuses -cnotcontains $Result.Status -or
         $Result.Message -isnot [string] -or
-        [string]::IsNullOrWhiteSpace($Result.Message)) {
+        [string]::IsNullOrWhiteSpace($Result.Message) -or
+        (Protect-ToolkitText $Result.Message) -cne $Result.Message) {
         throw 'Journal result is invalid.'
     }
     if (-not (Test-JournalValueRedacted $Result.Data)) {
@@ -151,16 +209,22 @@ function Assert-JournalCheckpoints {
         if ($null -eq $checkpoint -or $checkpoint -is [Array] -or $checkpoint -isnot [pscustomobject]) {
             throw 'Journal checkpoint is invalid.'
         }
+        $checkpointProperties = @($checkpoint.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($checkpointProperties.Count -ne 4) {
+            throw 'Journal checkpoint is invalid.'
+        }
         foreach ($propertyName in @('Timestamp', 'Level', 'Message', 'Data')) {
-            if ($null -eq $checkpoint.PSObject.Properties[$propertyName]) {
+            if ($checkpointProperties -cnotcontains $propertyName) {
                 throw 'Journal checkpoint is invalid.'
             }
         }
         [void](ConvertTo-JournalDateTime $checkpoint.Timestamp)
         if ($checkpoint.Level -isnot [string] -or
             [string]::IsNullOrWhiteSpace($checkpoint.Level) -or
+            (Protect-ToolkitText $checkpoint.Level) -cne $checkpoint.Level -or
             $checkpoint.Message -isnot [string] -or
-            [string]::IsNullOrWhiteSpace($checkpoint.Message)) {
+            [string]::IsNullOrWhiteSpace($checkpoint.Message) -or
+            (Protect-ToolkitText $checkpoint.Message) -cne $checkpoint.Message) {
             throw 'Journal checkpoint is invalid.'
         }
         if (-not (Test-JournalValueRedacted $checkpoint.Data)) {
@@ -198,13 +262,62 @@ function Assert-OperationJournal {
     }
     [void](ConvertTo-JournalDateTime $Journal.StartedAt)
     Assert-JournalCheckpoints $Journal.Checkpoints
-    Assert-JournalResult $Journal.Result
-    if (($Journal.State -eq 'Running' -and $null -ne $Journal.Result) -or
-        ($Journal.State -ne 'Running' -and $null -eq $Journal.Result)) {
-        throw 'Journal state and result do not match.'
-    }
+    Assert-JournalResult -Result $Journal.Result -State $Journal.State
     if (-not (Test-JournalValueRedacted $Journal.Instance)) {
         throw 'Journal instance contains unredacted sensitive data.'
+    }
+}
+
+function Remove-OperationJournalTemporaryFile {
+    param(
+        [string]$TemporaryPath
+    )
+
+    if (-not [IO.File]::Exists($TemporaryPath)) {
+        return
+    }
+    try {
+        [IO.File]::Delete($TemporaryPath)
+    }
+    catch {
+        throw 'Journal temporary-file cleanup failed.'
+    }
+}
+
+function Install-OperationJournalFile {
+    param(
+        [string]$TemporaryPath,
+        [string]$JournalPath
+    )
+
+    $replacementFailed = $false
+    $backupPath = $null
+    try {
+        if ([IO.File]::Exists($JournalPath)) {
+            $journalDirectory = [IO.Path]::GetDirectoryName($JournalPath)
+            $backupPath = Join-Path $journalDirectory ('.' + [IO.Path]::GetFileName($JournalPath) + '.' + [Guid]::NewGuid().ToString('N') + '.bak')
+            [IO.File]::Replace($TemporaryPath, $JournalPath, $backupPath)
+        }
+        else {
+            [IO.File]::Move($TemporaryPath, $JournalPath)
+        }
+    }
+    catch {
+        $replacementFailed = $true
+    }
+    Remove-OperationJournalTemporaryFile $TemporaryPath
+    if ($replacementFailed) {
+        throw 'Journal atomic replacement failed.'
+    }
+    if ($null -ne $backupPath -and [IO.File]::Exists($backupPath)) {
+        try {
+            [IO.File]::Delete($backupPath)
+        }
+        catch {
+            $cleanupException = New-Object InvalidOperationException 'Journal backup cleanup failed.'
+            $cleanupException.Data['JournalWriteCommitted'] = $true
+            throw $cleanupException
+        }
     }
 }
 
@@ -223,22 +336,21 @@ function Write-OperationJournal {
             SchemaVersion = 1
             Id = $Journal.Id
             StartedAt = ([DateTime]$Journal.StartedAt).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
-            Operation = $Journal.Operation
+            Operation = Protect-ToolkitText $Journal.Operation
             Instance = Protect-JournalValue $Journal.Instance
             State = $Journal.State
-            Checkpoints = @($Journal.Checkpoints)
+            Checkpoints = Protect-JournalValue $Journal.Checkpoints
             Result = Protect-JournalValue $Journal.Result
         }
         $json = $record | ConvertTo-Json -Depth 20
         $utf8 = [Text.UTF8Encoding]::new($false, $true)
         [IO.File]::WriteAllText($temporaryPath, ($json + [Environment]::NewLine), $utf8)
-        Move-Item -LiteralPath $temporaryPath -Destination $journalPath -Force -ErrorAction Stop
     }
-    finally {
-        if ([IO.File]::Exists($temporaryPath)) {
-            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
-        }
+    catch {
+        Remove-OperationJournalTemporaryFile $temporaryPath
+        throw 'Journal serialization or temporary-file write failed.'
     }
+    Install-OperationJournalFile -TemporaryPath $temporaryPath -JournalPath $journalPath
 }
 
 function New-OperationJournal {
@@ -275,6 +387,149 @@ function New-OperationJournal {
     return $journal
 }
 
+function Get-JournalJsonStringEnd {
+    param(
+        [string]$Json,
+        [int]$StartIndex
+    )
+
+    $index = $StartIndex + 1
+    while ($index -lt $Json.Length) {
+        $character = $Json[$index]
+        if ([int][char]$character -lt 32) {
+            throw 'Journal JSON is invalid.'
+        }
+        if ($character -eq [char]'"') {
+            return $index + 1
+        }
+        if ($character -eq [char]'\') {
+            $index++
+            if ($index -ge $Json.Length) {
+                throw 'Journal JSON is invalid.'
+            }
+            $escape = $Json[$index]
+            if ($escape -notin @([char]'"', [char]'\', [char]'/', [char]'b', [char]'f', [char]'n', [char]'r', [char]'t', [char]'u')) {
+                throw 'Journal JSON is invalid.'
+            }
+            if ($escape -eq [char]'u') {
+                if ($index + 4 -ge $Json.Length) {
+                    throw 'Journal JSON is invalid.'
+                }
+                $index += 4
+            }
+        }
+        $index++
+    }
+    throw 'Journal JSON is invalid.'
+}
+
+function Assert-NoDuplicateJournalProperty {
+    param(
+        [string]$Json
+    )
+
+    $frames = New-Object System.Collections.Stack
+    $index = 0
+    while ($index -lt $Json.Length) {
+        $character = $Json[$index]
+        if ([char]::IsWhiteSpace($character)) {
+            $index++
+            continue
+        }
+        if ($character -eq [char]'"') {
+            $stringStart = $index
+            $index = Get-JournalJsonStringEnd -Json $Json -StartIndex $index
+            if ($frames.Count -gt 0) {
+                $frame = $frames.Peek()
+                if ($frame.Kind -eq 'Object' -and ($frame.State -eq 'PropertyOrEnd' -or $frame.State -eq 'Property')) {
+                    $propertyName = [string]($Json.Substring($stringStart, $index - $stringStart) | ConvertFrom-Json -ErrorAction Stop)
+                    if (-not $frame.Names.Add($propertyName)) {
+                        throw 'Journal JSON contains duplicate properties.'
+                    }
+                    $frame.State = 'Colon'
+                }
+                else {
+                    if ($frame.State -notin @('Value', 'ValueOrEnd')) {
+                        throw 'Journal JSON is invalid.'
+                    }
+                    $frame.State = 'AfterValue'
+                }
+            }
+            continue
+        }
+        if ($character -eq [char]'{' -or $character -eq [char]'[') {
+            if ($frames.Count -gt 0) {
+                $parent = $frames.Peek()
+                if ($parent.State -notin @('Value', 'ValueOrEnd')) {
+                    throw 'Journal JSON is invalid.'
+                }
+                $parent.State = 'InValue'
+            }
+            $kind = if ($character -eq [char]'{') { 'Object' } else { 'Array' }
+            $state = if ($kind -eq 'Object') { 'PropertyOrEnd' } else { 'ValueOrEnd' }
+            $names = $null
+            if ($kind -eq 'Object') {
+                $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            }
+            $frames.Push([pscustomobject]@{ Kind = $kind; State = $state; Names = $names })
+            $index++
+            continue
+        }
+        if ($character -eq [char]'}' -or $character -eq [char]']') {
+            if ($frames.Count -eq 0) {
+                throw 'Journal JSON is invalid.'
+            }
+            $frame = $frames.Peek()
+            $expectedKind = if ($character -eq [char]'}') { 'Object' } else { 'Array' }
+            $allowedStates = if ($expectedKind -eq 'Object') { @('PropertyOrEnd', 'AfterValue') } else { @('ValueOrEnd', 'AfterValue') }
+            if ($frame.Kind -ne $expectedKind -or $frame.State -notin $allowedStates) {
+                throw 'Journal JSON is invalid.'
+            }
+            [void]$frames.Pop()
+            if ($frames.Count -gt 0) {
+                $frames.Peek().State = 'AfterValue'
+            }
+            $index++
+            continue
+        }
+        if ($character -eq [char]':') {
+            if ($frames.Count -eq 0 -or $frames.Peek().Kind -ne 'Object' -or $frames.Peek().State -ne 'Colon') {
+                throw 'Journal JSON is invalid.'
+            }
+            $frames.Peek().State = 'Value'
+            $index++
+            continue
+        }
+        if ($character -eq [char]',') {
+            if ($frames.Count -eq 0 -or $frames.Peek().State -ne 'AfterValue') {
+                throw 'Journal JSON is invalid.'
+            }
+            $frames.Peek().State = if ($frames.Peek().Kind -eq 'Object') { 'Property' } else { 'Value' }
+            $index++
+            continue
+        }
+        $primitiveStart = $index
+        while ($index -lt $Json.Length -and
+            -not [char]::IsWhiteSpace($Json[$index]) -and
+            $Json[$index] -notin @([char]',', [char]'{', [char]'}', [char]'[', [char]']', [char]':')) {
+            $index++
+        }
+        if ($index -eq $primitiveStart) {
+            throw 'Journal JSON is invalid.'
+        }
+        if ($frames.Count -gt 0) {
+            $frame = $frames.Peek()
+            if ($frame.State -notin @('Value', 'ValueOrEnd')) {
+                throw 'Journal JSON is invalid.'
+            }
+            $frame.State = 'AfterValue'
+        }
+    }
+    if ($frames.Count -ne 0) {
+        throw 'Journal JSON is invalid.'
+    }
+}
+
 function Get-OperationJournal {
     param(
         [Parameter(Mandatory = $true)]
@@ -296,6 +551,7 @@ function Get-OperationJournal {
     try {
         $utf8 = [Text.UTF8Encoding]::new($false, $true)
         $json = [IO.File]::ReadAllText($journalPath, $utf8)
+        Assert-NoDuplicateJournalProperty $json
         $record = $json | ConvertFrom-Json -ErrorAction Stop
     }
     catch {
@@ -328,11 +584,7 @@ function Get-OperationJournal {
     }
     $startedAt = ConvertTo-JournalDateTime $record.StartedAt
     Assert-JournalCheckpoints $record.Checkpoints
-    Assert-JournalResult $record.Result
-    if (($record.State -eq 'Running' -and $null -ne $record.Result) -or
-        ($record.State -ne 'Running' -and $null -eq $record.Result)) {
-        throw 'Journal state and result do not match.'
-    }
+    Assert-JournalResult -Result $record.Result -State $record.State
     if (-not (Test-JournalValueRedacted $record.Instance)) {
         throw 'Journal instance contains unredacted sensitive data.'
     }
@@ -369,8 +621,8 @@ function Write-JournalEvent {
     $previousCheckpoints = $Journal.Checkpoints
     $event = [pscustomobject]@{
         Timestamp = [DateTime]::UtcNow
-        Level = $Level
-        Message = $Message
+        Level = Protect-ToolkitText $Level
+        Message = Protect-ToolkitText $Message
         Data = Protect-JournalValue $Data
     }
     $Journal.Checkpoints = @($Journal.Checkpoints) + @($event)
@@ -378,7 +630,9 @@ function Write-JournalEvent {
         Write-OperationJournal $Journal
     }
     catch {
-        $Journal.Checkpoints = $previousCheckpoints
+        if ($_.Exception.Data['JournalWriteCommitted'] -ne $true) {
+            $Journal.Checkpoints = $previousCheckpoints
+        }
         throw
     }
 }
@@ -391,7 +645,7 @@ function Set-OperationJournalState {
     )
 
     $protectedResult = Protect-JournalValue $Result
-    Assert-JournalResult $protectedResult
+    Assert-JournalResult -Result $protectedResult -State $State
     Assert-OperationJournal $Journal
     if ($Journal.State -ne 'Running') {
         throw 'Journal does not accept a final state in its current state.'
@@ -404,8 +658,10 @@ function Set-OperationJournalState {
         Write-OperationJournal $Journal
     }
     catch {
-        $Journal.State = $previousState
-        $Journal.Result = $previousResult
+        if ($_.Exception.Data['JournalWriteCommitted'] -ne $true) {
+            $Journal.State = $previousState
+            $Journal.Result = $previousResult
+        }
         throw
     }
 }

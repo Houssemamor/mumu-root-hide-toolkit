@@ -24,6 +24,24 @@ function Get-ToolkitResult {
     }
 }
 
+function Protect-ToolkitText {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    if ($null -eq $Text) {
+        return $null
+    }
+    $authorizationPattern = '(?i)(["'']?authorization["'']?\s*(?::|=|\bis\b)\s*)(?:Bearer|Basic)\s+[^\s,;}\[\]]+'
+    $Text = [regex]::Replace($Text, $authorizationPattern, '$1[REDACTED]')
+    $labeledPattern = '(?i)(["'']?(?:token|password|secret|authorization|cookie|key)["'']?\s*(?::|=|\bis\b)\s*)(?:"[^"]*"|''[^'']*''|[^\s,;}\[\]]+)'
+    $Text = [regex]::Replace($Text, $labeledPattern, '$1[REDACTED]')
+    $tokenPattern = '(?i)\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+|AKIA[0-9A-Z]{16})\b'
+    return [regex]::Replace($Text, $tokenPattern, '[REDACTED]')
+}
+
 function Invoke-WithRetry {
     param(
         [Parameter(Mandatory = $true)]
@@ -38,10 +56,28 @@ function Invoke-WithRetry {
     $lastResult = Get-ToolkitResult -Status 'RecoverableError' -Message 'Operation did not run.'
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            return & $Operation
+            $outputs = @(& $Operation)
+            if ($outputs.Count -eq 1 -and $outputs[0] -is [pscustomobject]) {
+                $candidate = $outputs[0]
+                $propertyNames = @($candidate.PSObject.Properties | ForEach-Object { $_.Name })
+                if ($propertyNames.Count -eq 3 -and
+                    $propertyNames -ccontains 'Status' -and
+                    $propertyNames -ccontains 'Message' -and
+                    $propertyNames -ccontains 'Data' -and
+                    $candidate.Status -is [string] -and
+                    @('Success', 'AlreadyApplied', 'Warning', 'RecoverableError', 'CriticalError') -ccontains $candidate.Status -and
+                    $candidate.Message -is [string] -and
+                    -not [string]::IsNullOrWhiteSpace($candidate.Message)) {
+                    $message = Protect-ToolkitText $candidate.Message
+                    if (-not [string]::IsNullOrWhiteSpace($message)) {
+                        return Get-ToolkitResult -Status $candidate.Status -Message $message -Data $candidate.Data
+                    }
+                }
+            }
+            return Get-ToolkitResult -Status 'RecoverableError' -Message 'Operation returned an invalid result.'
         }
         catch {
-            $message = [string]$_.Exception.Message
+            $message = Protect-ToolkitText ([string]$_.Exception.Message)
             if ([string]::IsNullOrWhiteSpace($message)) {
                 $message = 'Operation failed.'
             }

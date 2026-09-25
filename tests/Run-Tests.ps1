@@ -352,18 +352,77 @@ function Invoke-AssetTests {
 }
 
 function Invoke-JournalTests {
-    foreach ($commandName in @('New-OperationJournal', 'Get-OperationJournal', 'Write-JournalEvent', 'Complete-OperationJournal', 'Fail-OperationJournal', 'Invoke-WithRetry')) {
+    foreach ($commandName in @('New-OperationJournal', 'Get-OperationJournal', 'Write-JournalEvent', 'Complete-OperationJournal', 'Fail-OperationJournal', 'Invoke-WithRetry', 'Install-OperationJournalFile')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Journal command is unavailable: $commandName"
     }
 
     $journalRoot = Join-Path $testRoot 'journal root with spaces'
     New-Item -ItemType Directory -Path $journalRoot | Out-Null
-    $fixtureInstance = [pscustomobject]@{
-        Index = 1
-        Name = 'fixture'
-        ApiKey = 'instance_key_secret'
-        Metadata = [pscustomobject]@{ Password = 'instance_password_secret' }
+
+    $atomicDirectory = Join-Path $journalRoot 'atomic'
+    New-Item -ItemType Directory -Path $atomicDirectory | Out-Null
+    $atomicDestination = Join-Path $atomicDirectory 'journal.json'
+    $atomicTemporary = Join-Path $atomicDirectory 'journal.tmp'
+    [IO.File]::WriteAllText($atomicDestination, 'old-journal')
+    [IO.File]::WriteAllText($atomicTemporary, 'new-journal')
+    $destinationLock = [IO.File]::Open($atomicDestination, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        Assert-Throws { Install-OperationJournalFile -TemporaryPath $atomicTemporary -JournalPath $atomicDestination } 'Locked atomic replacement did not fail.'
     }
+    finally {
+        $destinationLock.Dispose()
+    }
+    Assert-Equal 'old-journal' ([IO.File]::ReadAllText($atomicDestination)) 'Failed replacement did not preserve the old journal.'
+    Assert-True (-not [IO.File]::Exists($atomicTemporary)) 'Failed replacement left its temporary file.'
+
+    [IO.File]::WriteAllText($atomicTemporary, 'new-journal')
+    $temporaryLock = [IO.File]::Open($atomicTemporary, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $cleanupFailure = $null
+    try {
+        try {
+            Install-OperationJournalFile -TemporaryPath $atomicTemporary -JournalPath $atomicDestination
+        }
+        catch {
+            $cleanupFailure = $_.Exception.Message
+        }
+    }
+    finally {
+        $temporaryLock.Dispose()
+    }
+    try {
+        Assert-True ($null -ne $cleanupFailure -and $cleanupFailure -match '(?i)cleanup') 'Cleanup failure was not surfaced.'
+        Assert-Equal 'old-journal' ([IO.File]::ReadAllText($atomicDestination)) 'Cleanup failure changed the old journal.'
+        Assert-True ([IO.File]::Exists($atomicTemporary)) 'Cleanup-failure fixture did not retain its locked temporary file.'
+    }
+    finally {
+        if ([IO.File]::Exists($atomicTemporary)) {
+            [IO.File]::Delete($atomicTemporary)
+        }
+    }
+
+    Add-Type -TypeDefinition 'public sealed class JournalSecretFixture { public string Password { get; set; } public string Token { get; set; } }'
+    Add-Type -TypeDefinition 'public sealed class JournalSecretException : System.Exception { public string Password { get; set; } public string Token { get; set; } }'
+    $fixtureInstance = New-Object JournalSecretFixture
+    $fixtureInstance.Password = 'instance_password_secret'
+    $fixtureInstance.Token = 'instance_token_secret'
+    $exceptionFixture = New-Object JournalSecretException
+    $exceptionFixture.Password = 'exception_password_secret'
+    $exceptionFixture.Token = 'exception_token_secret'
+    $protectedFixture = Protect-JournalValue $fixtureInstance
+    Assert-Equal '[REDACTED]' $protectedFixture.Password 'Direct .NET Password property was not redacted.'
+    Assert-Equal '[REDACTED]' $protectedFixture.Token 'Direct .NET Token property was not redacted.'
+    try {
+        throw 'base exception fixture'
+    }
+    catch {
+        $baseException = $_.Exception
+    }
+    $protectedBaseException = Protect-JournalValue $baseException
+    Assert-Equal 'System.Management.Automation.PSCustomObject' $protectedBaseException.GetType().FullName 'Arbitrary .NET object was not converted to a safe property record.'
+    $readOnlyDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+    $readOnlyDictionary['Password'] = 'readonly_password_secret'
+    $readOnlyDictionary['Token'] = 'readonly_token_secret'
+    $readOnlySecretData = [System.Collections.ObjectModel.ReadOnlyDictionary[string,string]]::new($readOnlyDictionary)
     $journal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
     Assert-True (-not [string]::IsNullOrWhiteSpace($journal.Id)) 'Journal ID is empty.'
     Assert-Equal 'Running' $journal.State 'New journal state is invalid.'
@@ -379,7 +438,22 @@ function Invoke-JournalTests {
         'cookie_secret',
         'key_secret',
         'nested_secret',
-        'result_password_secret'
+        'result_password_secret',
+        'instance_password_secret',
+        'instance_token_secret',
+        'readonly_password_secret',
+        'readonly_token_secret',
+        'exception_password_secret',
+        'exception_token_secret',
+        'event_token_secret',
+        'event_password_secret',
+        'event_secret_secret',
+        'event_authorization_secret',
+        'event_cookie_secret',
+        'event_key_secret',
+        'ghp_message_token_secret',
+        'json_password_secret',
+        'result_message_secret'
     )
     $eventData = @{
         Path = 'C:\Program Files\MuMu\config.json'
@@ -392,9 +466,12 @@ function Invoke-JournalTests {
         Nested = [pscustomobject]@{
             Items = @([pscustomobject]@{ Secret = $sensitiveValues[6] })
         }
+        ReadOnly = $readOnlySecretData
+        DotNetException = $exceptionFixture
     }
-    Write-JournalEvent -Journal $journal -Level 'Info' -Message 'checkpoint' -Data $eventData
-    Fail-OperationJournal -Journal $journal -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'hash mismatch' -Data @{ Password = $sensitiveValues[7] })
+    $eventMessage = 'checkpoint ghp_message_token_secret token=event_token_secret password=event_password_secret secret=event_secret_secret Authorization=Bearer event_authorization_secret Cookie=event_cookie_secret Key=event_key_secret payload={"password":"json_password_secret"}'
+    Write-JournalEvent -Journal $journal -Level 'Info' -Message $eventMessage -Data $eventData
+    Fail-OperationJournal -Journal $journal -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'hash mismatch password=result_message_secret' -Data @{ Password = $sensitiveValues[7] })
 
     $reopened = Get-OperationJournal -Path $journal.JournalPath
     Assert-Equal 'Failed' $reopened.State 'Failed journal state was not persisted.'
@@ -417,6 +494,28 @@ function Invoke-JournalTests {
     Assert-Equal 'Completed' $reopenedCompleted.State 'Completed journal state was not persisted.'
     Assert-Equal 'Success' $reopenedCompleted.Result.Status 'Completed journal result was not persisted.'
 
+    $tamperedJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Write-JournalEvent -Journal $tamperedJournal -Level 'Info' -Message 'safe' -Data @{ Value = 1 }
+    try {
+        throw 'token=tampered_exception_secret'
+    }
+    catch {
+        @($tamperedJournal.Checkpoints)[0].Data = $_.Exception
+    }
+    Write-JournalEvent -Journal $tamperedJournal -Level 'Info' -Message 'persist' -Data @{ Value = 2 }
+    $tamperedJson = [IO.File]::ReadAllText($tamperedJournal.JournalPath)
+    Assert-True ($tamperedJson -notmatch 'tampered_exception_secret') 'Tampered checkpoint persisted raw exception text.'
+
+    $invalidCompleteJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Assert-Throws { Complete-OperationJournal -Journal $invalidCompleteJournal -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'invalid completion') } 'Completed journal accepted a failure result.'
+    Assert-Equal 'Running' $invalidCompleteJournal.State 'Rejected completion changed journal state.'
+    Assert-True ($null -eq $invalidCompleteJournal.Result) 'Rejected completion changed journal result.'
+    Assert-Equal 'Running' (Get-OperationJournal -Path $invalidCompleteJournal.JournalPath).State 'Rejected completion changed persisted state.'
+    $invalidFailureJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Assert-Throws { Fail-OperationJournal -Journal $invalidFailureJournal -Result (Get-ToolkitResult -Status 'Success' -Message 'invalid failure') } 'Failed journal accepted a success result.'
+    Assert-Equal 'Running' $invalidFailureJournal.State 'Rejected failure changed journal state.'
+    Assert-True ($null -eq $invalidFailureJournal.Result) 'Rejected failure changed journal result.'
+
     $cleanupJournal = New-OperationJournal -Root $journalRoot -Operation 'Root15' -Instance $fixtureInstance
     $cleanupDirectory = [IO.Path]::GetDirectoryName($cleanupJournal.JournalPath)
     $filesBefore = @([IO.Directory]::GetFiles($cleanupDirectory))
@@ -432,6 +531,20 @@ function Invoke-JournalTests {
     $unchangedJournal = Get-OperationJournal -Path $cleanupJournal.JournalPath
     Assert-Equal 'Running' $unchangedJournal.State 'Failed journal write changed persisted state.'
     Assert-Equal 0 @($unchangedJournal.Checkpoints).Count 'Failed journal write changed persisted checkpoints.'
+    Assert-Equal 'Running' $cleanupJournal.State 'Failed journal write changed in-memory state.'
+    Assert-Equal 0 @($cleanupJournal.Checkpoints).Count 'Failed journal write changed in-memory checkpoints.'
+
+    $stateRollbackJournal = New-OperationJournal -Root $journalRoot -Operation 'Root15' -Instance $fixtureInstance
+    $stateRollbackLock = [IO.File]::Open($stateRollbackJournal.JournalPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        Assert-Throws { Fail-OperationJournal -Journal $stateRollbackJournal -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'rollback') } 'Locked final-state write did not fail.'
+    }
+    finally {
+        $stateRollbackLock.Dispose()
+    }
+    Assert-Equal 'Running' $stateRollbackJournal.State 'Failed final-state write did not restore in-memory state.'
+    Assert-True ($null -eq $stateRollbackJournal.Result) 'Failed final-state write did not restore in-memory result.'
+    Assert-Equal 'Running' (Get-OperationJournal -Path $stateRollbackJournal.JournalPath).State 'Failed final-state write changed persisted state.'
 
     $malformedPath = Join-Path $journalRoot 'malformed.json'
     [IO.File]::WriteAllText($malformedPath, '{not-json')
@@ -439,6 +552,148 @@ function Invoke-JournalTests {
     $arrayJournalPath = Join-Path $journalRoot 'array.json'
     [IO.File]::WriteAllText($arrayJournalPath, '[]')
     Assert-Throws { Get-OperationJournal -Path $arrayJournalPath } 'Array journal root was accepted.'
+    $duplicatePropertyPath = Join-Path $journalRoot 'duplicate-property.json'
+    $duplicateId = [Guid]::NewGuid().ToString('N')
+    $duplicateStartedAt = [DateTime]::UtcNow.ToString('o')
+    $duplicateJson = '{"SchemaVersion":1,"Id":"' + $duplicateId + '","StartedAt":"' + $duplicateStartedAt + '","Operation":"Root12","Instance":{"Token":"[REDACTED]","Token":"[REDACTED]"},"State":"Running","Checkpoints":[],"Result":null}'
+    [IO.File]::WriteAllText($duplicatePropertyPath, $duplicateJson)
+    Assert-Throws { Get-OperationJournal -Path $duplicatePropertyPath } 'Duplicate JSON property was accepted.'
+
+    $unknownCheckpointPath = Join-Path $journalRoot 'unknown-checkpoint.json'
+    $unknownCheckpoint = [ordered]@{
+        SchemaVersion = 1
+        Id = [Guid]::NewGuid().ToString('N')
+        StartedAt = [DateTime]::UtcNow.ToString('o')
+        Operation = 'Root12'
+        Instance = $null
+        State = 'Running'
+        Checkpoints = @([ordered]@{
+            Timestamp = [DateTime]::UtcNow.ToString('o')
+            Level = 'Info'
+            Message = 'checkpoint'
+            Data = $null
+            Extra = 'invalid'
+        })
+        Result = $null
+    }
+    [IO.File]::WriteAllText($unknownCheckpointPath, ($unknownCheckpoint | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-OperationJournal -Path $unknownCheckpointPath } 'Checkpoint with an unknown property was accepted.'
+    $unknownResultPath = Join-Path $journalRoot 'unknown-result.json'
+    $unknownResult = [ordered]@{
+        SchemaVersion = 1
+        Id = [Guid]::NewGuid().ToString('N')
+        StartedAt = [DateTime]::UtcNow.ToString('o')
+        Operation = 'Root12'
+        Instance = $null
+        State = 'Completed'
+        Checkpoints = @()
+        Result = [ordered]@{ Status = 'Success'; Message = 'completed'; Data = $null; Extra = 'invalid' }
+    }
+    [IO.File]::WriteAllText($unknownResultPath, ($unknownResult | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-OperationJournal -Path $unknownResultPath } 'Result with an unknown property was accepted.'
+    $unsupportedScriptJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Assert-Throws { Write-JournalEvent -Journal $unsupportedScriptJournal -Level 'Info' -Message 'unsupported' -Data ([scriptblock] { 'value' }) } 'Scriptblock journal data was accepted.'
+    $unsupportedStreamJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Assert-Throws { Write-JournalEvent -Journal $unsupportedStreamJournal -Level 'Info' -Message 'unsupported' -Data ([IO.MemoryStream]::new()) } 'Stream journal data was accepted.'
+
+    $newJournalRecord = {
+        param(
+            [string]$State = 'Running',
+            [object]$Result = $null,
+            [object]$Checkpoints = @()
+        )
+
+        [pscustomobject]@{
+            SchemaVersion = 1
+            Id = [Guid]::NewGuid().ToString('N')
+            StartedAt = [DateTime]::UtcNow.ToString('o')
+            Operation = 'Root12'
+            Instance = $null
+            State = $State
+            Checkpoints = $Checkpoints
+            Result = $Result
+        }
+    }
+    $writeJournalRecord = {
+        param(
+            [string]$Name,
+            [object]$Record
+        )
+
+        $path = Join-Path $journalRoot ($Name + '.json')
+        $utf8 = [Text.UTF8Encoding]::new($false)
+        [IO.File]::WriteAllText($path, ($Record | ConvertTo-Json -Depth 20), $utf8)
+        return $path
+    }
+    $assertInvalidRecord = {
+        param(
+            [string]$Name,
+            [object]$Record,
+            [string]$Reason
+        )
+
+        $path = & $writeJournalRecord $Name $Record
+        Assert-Throws { Get-OperationJournal -Path $path } $Reason
+    }
+
+    $record = & $newJournalRecord
+    $record.SchemaVersion = 2
+    & $assertInvalidRecord 'wrong-schema-version' $record 'Wrong schema version was accepted.'
+    $record = & $newJournalRecord
+    $record.SchemaVersion = '1'
+    & $assertInvalidRecord 'string-schema-version' $record 'String schema version was accepted.'
+    $record = & $newJournalRecord
+    $record | Add-Member -NotePropertyName Extra -NotePropertyValue 'invalid'
+    & $assertInvalidRecord 'extra-root-property' $record 'Extra root property was accepted.'
+    $record = & $newJournalRecord
+    [void]$record.PSObject.Properties.Remove('Operation')
+    & $assertInvalidRecord 'missing-root-property' $record 'Missing root property was accepted.'
+    $record = & $newJournalRecord
+    $record.Id = 'invalid-id'
+    & $assertInvalidRecord 'invalid-id' $record 'Invalid journal ID was accepted.'
+    $record = & $newJournalRecord
+    $record.StartedAt = 'not-a-timestamp'
+    & $assertInvalidRecord 'invalid-timestamp' $record 'Invalid journal timestamp was accepted.'
+    $record = & $newJournalRecord
+    $record.Checkpoints = [pscustomobject]@{ Value = 'invalid' }
+    & $assertInvalidRecord 'invalid-checkpoints' $record 'Non-array checkpoints were accepted.'
+    $record = & $newJournalRecord
+    $record.Checkpoints = @([pscustomobject]@{ Timestamp = [DateTime]::UtcNow.ToString('o'); Level = 'Info'; Data = $null })
+    & $assertInvalidRecord 'missing-checkpoint-property' $record 'Checkpoint missing Message was accepted.'
+    $record = & $newJournalRecord 'Running' $null @([pscustomobject]@{ Timestamp = 'invalid'; Level = 'Info'; Message = 'checkpoint'; Data = $null })
+    & $assertInvalidRecord 'invalid-checkpoint-timestamp' $record 'Invalid checkpoint timestamp was accepted.'
+    $record = & $newJournalRecord 'Running' $null @([pscustomobject]@{ Timestamp = [DateTime]::UtcNow.ToString('o'); Level = 1; Message = 'checkpoint'; Data = $null })
+    & $assertInvalidRecord 'invalid-checkpoint-level' $record 'Invalid checkpoint level was accepted.'
+    $record = & $newJournalRecord 'Failed' 'invalid'
+    & $assertInvalidRecord 'invalid-result-type' $record 'Non-object result was accepted.'
+    $record = & $newJournalRecord 'Completed' ([pscustomobject]@{ Status = 'Success'; Message = 'completed' })
+    & $assertInvalidRecord 'missing-result-property' $record 'Result missing Data was accepted.'
+    $record = & $newJournalRecord 'Completed' ([pscustomobject]@{ Status = 'Invalid'; Message = 'completed'; Data = $null })
+    & $assertInvalidRecord 'invalid-result-status' $record 'Noncanonical result status was accepted.'
+    $record = & $newJournalRecord 'Completed' ([pscustomobject]@{ Status = 'Success'; Message = '   '; Data = $null })
+    & $assertInvalidRecord 'invalid-result-message' $record 'Empty result message was accepted.'
+    $record = & $newJournalRecord 'Running' (Get-ToolkitResult -Status 'Success' -Message 'mismatch')
+    & $assertInvalidRecord 'running-result-mismatch' $record 'Running journal with a result was accepted.'
+    $record = & $newJournalRecord 'Completed' (Get-ToolkitResult -Status 'CriticalError' -Message 'mismatch')
+    & $assertInvalidRecord 'completed-result-mismatch' $record 'Completed journal with a failure result was accepted.'
+    $record = & $newJournalRecord 'Failed' (Get-ToolkitResult -Status 'Success' -Message 'mismatch')
+    & $assertInvalidRecord 'failed-result-mismatch' $record 'Failed journal with a success result was accepted.'
+    $record = & $newJournalRecord 'Running' $null @([pscustomobject]@{
+        Timestamp = [DateTime]::UtcNow.ToString('o')
+        Level = 'Info'
+        Message = 'password=loaded_checkpoint_secret'
+        Data = $null
+    })
+    & $assertInvalidRecord 'checkpoint-free-text-secret' $record 'Unsanitized checkpoint message was accepted.'
+    $record = & $newJournalRecord 'Completed' (Get-ToolkitResult -Status 'Success' -Message 'token=loaded_result_secret')
+    & $assertInvalidRecord 'result-free-text-secret' $record 'Unsanitized result message was accepted.'
+
+    $validJson = (& $newJournalRecord | ConvertTo-Json -Depth 10)
+    $wrongCaseJson = $validJson.Replace('"SchemaVersion"', '"schemaVersion"')
+    $wrongCasePath = Join-Path $journalRoot 'wrong-case-root-property.json'
+    [IO.File]::WriteAllText($wrongCasePath, $wrongCaseJson)
+    Assert-Throws { Get-OperationJournal -Path $wrongCasePath } 'Incorrect root property casing was accepted.'
+
     $invalidStatePath = Join-Path $journalRoot 'invalid-state.json'
     $invalidState = [ordered]@{
         SchemaVersion = 1
@@ -479,15 +734,42 @@ function Invoke-JournalTests {
     Assert-Equal 'Success' $recovered.Status 'Recoverable operation did not return success.'
     Assert-Equal 'recovered' $recovered.Message 'Recoverable operation result was changed.'
 
+    $nullOutput = Invoke-WithRetry -Operation { $null } -Attempts 1 -DelaySeconds 0
+    Assert-Equal 'RecoverableError' $nullOutput.Status 'Retry accepted no output.'
+    Assert-True (-not [string]::IsNullOrWhiteSpace($nullOutput.Message)) 'Retry no-output error has no message.'
+    $arrayOutput = Invoke-WithRetry -Operation {
+        Write-Output -NoEnumerate -InputObject @(
+            [pscustomobject]@{ Status = 'Success'; Message = 'one'; Data = $null },
+            [pscustomobject]@{ Status = 'Success'; Message = 'two'; Data = $null }
+        )
+    } -Attempts 1 -DelaySeconds 0
+    Assert-Equal 'RecoverableError' $arrayOutput.Status 'Retry accepted an array result.'
+    $wrongStatusOutput = Invoke-WithRetry -Operation {
+        [pscustomobject]@{ Status = 'Invalid'; Message = 'wrong status'; Data = $null }
+    } -Attempts 1 -DelaySeconds 0
+    Assert-Equal 'RecoverableError' $wrongStatusOutput.Status 'Retry accepted a noncanonical result status.'
+    $emptyMessageOutput = Invoke-WithRetry -Operation {
+        [pscustomobject]@{ Status = 'Success'; Message = '   '; Data = $null }
+    } -Attempts 1 -DelaySeconds 0
+    Assert-Equal 'RecoverableError' $emptyMessageOutput.Status 'Retry accepted an empty result message.'
+    $extraPropertyOutput = Invoke-WithRetry -Operation {
+        [pscustomobject]@{ Status = 'Success'; Message = 'valid'; Data = $null; Extra = 'invalid' }
+    } -Attempts 1 -DelaySeconds 0
+    Assert-Equal 'RecoverableError' $extraPropertyOutput.Status 'Retry accepted an unknown result property.'
+    $wrongCaseOutput = Invoke-WithRetry -Operation {
+        [pscustomobject]@{ status = 'Success'; Message = 'valid'; Data = $null }
+    } -Attempts 1 -DelaySeconds 0
+    Assert-Equal 'RecoverableError' $wrongCaseOutput.Status 'Retry accepted incorrect result property casing.'
+
     $exhaustedState = @{ Count = 0 }
     $failingOperation = {
         $exhaustedState.Count++
-        throw 'bounded failure'
+        throw 'bounded token=exception_message_secret'
     }.GetNewClosure()
     $exhausted = Invoke-WithRetry -Operation $failingOperation -Attempts 3 -DelaySeconds 0
     Assert-Equal 3 $exhaustedState.Count 'Retry exceeded its attempt bound.'
     Assert-Equal 'RecoverableError' $exhausted.Status 'Retry exhaustion did not return RecoverableError.'
-    Assert-Equal 'bounded failure' $exhausted.Message 'Retry did not preserve the final failure message.'
+    Assert-Equal 'bounded token=[REDACTED]' $exhausted.Message 'Retry persisted the raw exception message.'
     Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 0 -DelaySeconds 0 } 'Zero retry attempts were accepted.'
     Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 11 -DelaySeconds 0 } 'Excessive retry attempts were accepted.'
     Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 1 -DelaySeconds -1 } 'Negative retry delay was accepted.'
