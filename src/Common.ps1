@@ -24,6 +24,36 @@ function Get-ToolkitResult {
     }
 }
 
+function Invoke-WithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [scriptblock]$Operation,
+        [ValidateRange(1, 10)]
+        [int]$Attempts = 3,
+        [ValidateRange(0, 60)]
+        [int]$DelaySeconds = 2
+    )
+
+    $lastResult = Get-ToolkitResult -Status 'RecoverableError' -Message 'Operation did not run.'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            return & $Operation
+        }
+        catch {
+            $message = [string]$_.Exception.Message
+            if ([string]::IsNullOrWhiteSpace($message)) {
+                $message = 'Operation failed.'
+            }
+            $lastResult = Get-ToolkitResult -Status 'RecoverableError' -Message $message
+        }
+        if ($attempt -lt $Attempts) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    return $lastResult
+}
+
 function ConvertTo-ProcessArgument {
     param(
         [AllowNull()]

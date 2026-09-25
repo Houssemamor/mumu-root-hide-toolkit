@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Manifest', 'Process', 'Result', 'All')]
+    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'All')]
     [string]$Suite = 'All'
 )
 
@@ -10,12 +10,16 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $commonPath = Join-Path $repoRoot 'src\Common.ps1'
 $manifestScriptPath = Join-Path $repoRoot 'src\Manifest.ps1'
 $manifestPath = Join-Path $repoRoot 'src\Manifest.json'
+$journalScriptPath = Join-Path $repoRoot 'src\Journal.ps1'
 
 if (Test-Path -LiteralPath $commonPath -PathType Leaf) {
     . $commonPath
 }
 if (Test-Path -LiteralPath $manifestScriptPath -PathType Leaf) {
     . $manifestScriptPath
+}
+if (Test-Path -LiteralPath $journalScriptPath -PathType Leaf) {
+    . $journalScriptPath
 }
 
 function Assert-True {
@@ -347,6 +351,149 @@ function Invoke-AssetTests {
     Assert-Equal 'CriticalError' $malformed.Status 'Malformed manifest asset was accepted.'
 }
 
+function Invoke-JournalTests {
+    foreach ($commandName in @('New-OperationJournal', 'Get-OperationJournal', 'Write-JournalEvent', 'Complete-OperationJournal', 'Fail-OperationJournal', 'Invoke-WithRetry')) {
+        Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Journal command is unavailable: $commandName"
+    }
+
+    $journalRoot = Join-Path $testRoot 'journal root with spaces'
+    New-Item -ItemType Directory -Path $journalRoot | Out-Null
+    $fixtureInstance = [pscustomobject]@{
+        Index = 1
+        Name = 'fixture'
+        ApiKey = 'instance_key_secret'
+        Metadata = [pscustomobject]@{ Password = 'instance_password_secret' }
+    }
+    $journal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Assert-True (-not [string]::IsNullOrWhiteSpace($journal.Id)) 'Journal ID is empty.'
+    Assert-Equal 'Running' $journal.State 'New journal state is invalid.'
+    Assert-Equal 0 @($journal.Checkpoints).Count 'New journal contains checkpoints.'
+    Assert-True (Test-Path -LiteralPath $journal.JournalPath -PathType Leaf) 'New journal was not persisted.'
+    Assert-True ($journal.JournalPath.StartsWith($journalRoot, [StringComparison]::OrdinalIgnoreCase)) 'Journal path is outside the requested root.'
+
+    $sensitiveValues = @(
+        'ghp_example_secret',
+        'password_secret',
+        'secret_secret',
+        'authorization_secret',
+        'cookie_secret',
+        'key_secret',
+        'nested_secret',
+        'result_password_secret'
+    )
+    $eventData = @{
+        Path = 'C:\Program Files\MuMu\config.json'
+        Token = $sensitiveValues[0]
+        password = $sensitiveValues[1]
+        Secret = $sensitiveValues[2]
+        Authorization = $sensitiveValues[3]
+        Cookie = $sensitiveValues[4]
+        ApiKey = $sensitiveValues[5]
+        Nested = [pscustomobject]@{
+            Items = @([pscustomobject]@{ Secret = $sensitiveValues[6] })
+        }
+    }
+    Write-JournalEvent -Journal $journal -Level 'Info' -Message 'checkpoint' -Data $eventData
+    Fail-OperationJournal -Journal $journal -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'hash mismatch' -Data @{ Password = $sensitiveValues[7] })
+
+    $reopened = Get-OperationJournal -Path $journal.JournalPath
+    Assert-Equal 'Failed' $reopened.State 'Failed journal state was not persisted.'
+    Assert-True (@($reopened.Checkpoints).Count -ge 1) 'Journal checkpoint was lost.'
+    Assert-Equal 'C:\Program Files\MuMu\config.json' @($reopened.Checkpoints)[0].Data.Path 'Journal path checkpoint was changed.'
+    Assert-Equal $journal.JournalPath $reopened.JournalPath 'Reopened journal path is invalid.'
+    $journalJson = [IO.File]::ReadAllText($journal.JournalPath)
+    foreach ($sensitiveValue in $sensitiveValues) {
+        Assert-True ($journalJson -notmatch [regex]::Escape($sensitiveValue)) "Journal leaked a sensitive value: $sensitiveValue"
+    }
+    Assert-True ($journalJson -match '\[REDACTED\]') 'Journal did not record a redaction marker.'
+    $journalBytes = [IO.File]::ReadAllBytes($journal.JournalPath)
+    $hasBom = $journalBytes.Length -ge 3 -and $journalBytes[0] -eq 0xef -and $journalBytes[1] -eq 0xbb -and $journalBytes[2] -eq 0xbf
+    Assert-True (-not $hasBom) 'Journal JSON contains a UTF-8 byte order mark.'
+    Assert-True ($null -ne ($journalJson | ConvertFrom-Json -ErrorAction Stop)) 'Journal JSON is invalid.'
+
+    $completedJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Complete-OperationJournal -Journal $completedJournal -Result (Get-ToolkitResult -Status 'Success' -Message 'completed')
+    $reopenedCompleted = Get-OperationJournal -Path $completedJournal.JournalPath
+    Assert-Equal 'Completed' $reopenedCompleted.State 'Completed journal state was not persisted.'
+    Assert-Equal 'Success' $reopenedCompleted.Result.Status 'Completed journal result was not persisted.'
+
+    $cleanupJournal = New-OperationJournal -Root $journalRoot -Operation 'Root15' -Instance $fixtureInstance
+    $cleanupDirectory = [IO.Path]::GetDirectoryName($cleanupJournal.JournalPath)
+    $filesBefore = @([IO.Directory]::GetFiles($cleanupDirectory))
+    $journalLock = [IO.File]::Open($cleanupJournal.JournalPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        Assert-Throws { Write-JournalEvent -Journal $cleanupJournal -Level 'Info' -Message 'must fail' -Data @{ Value = 1 } } 'Locked journal write did not fail.'
+    }
+    finally {
+        $journalLock.Dispose()
+    }
+    $filesAfter = @([IO.Directory]::GetFiles($cleanupDirectory))
+    Assert-Equal $filesBefore.Count $filesAfter.Count 'Failed journal write left a temporary file.'
+    $unchangedJournal = Get-OperationJournal -Path $cleanupJournal.JournalPath
+    Assert-Equal 'Running' $unchangedJournal.State 'Failed journal write changed persisted state.'
+    Assert-Equal 0 @($unchangedJournal.Checkpoints).Count 'Failed journal write changed persisted checkpoints.'
+
+    $malformedPath = Join-Path $journalRoot 'malformed.json'
+    [IO.File]::WriteAllText($malformedPath, '{not-json')
+    Assert-Throws { Get-OperationJournal -Path $malformedPath } 'Malformed journal JSON was accepted.'
+    $arrayJournalPath = Join-Path $journalRoot 'array.json'
+    [IO.File]::WriteAllText($arrayJournalPath, '[]')
+    Assert-Throws { Get-OperationJournal -Path $arrayJournalPath } 'Array journal root was accepted.'
+    $invalidStatePath = Join-Path $journalRoot 'invalid-state.json'
+    $invalidState = [ordered]@{
+        SchemaVersion = 1
+        Id = [Guid]::NewGuid().ToString('N')
+        StartedAt = [DateTime]::UtcNow.ToString('o')
+        Operation = 'Root12'
+        Instance = $null
+        State = 'Trusted'
+        Checkpoints = @()
+        Result = $null
+    }
+    [IO.File]::WriteAllText($invalidStatePath, ($invalidState | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-OperationJournal -Path $invalidStatePath } 'Unrecognized journal state was accepted.'
+    $unredactedPath = Join-Path $journalRoot 'unredacted.json'
+    $unredacted = [ordered]@{
+        SchemaVersion = 1
+        Id = [Guid]::NewGuid().ToString('N')
+        StartedAt = [DateTime]::UtcNow.ToString('o')
+        Operation = 'Root12'
+        Instance = @{ Token = 'untrusted_plain_secret' }
+        State = 'Failed'
+        Checkpoints = @()
+        Result = [pscustomobject]@{ Status = 'CriticalError'; Message = 'failed'; Data = $null }
+    }
+    [IO.File]::WriteAllText($unredactedPath, ($unredacted | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-OperationJournal -Path $unredactedPath } 'Unredacted journal data was accepted.'
+
+    $retryState = @{ Count = 0 }
+    $recoveringOperation = {
+        $retryState.Count++
+        if ($retryState.Count -lt 3) {
+            throw 'transient failure'
+        }
+        Get-ToolkitResult -Status 'Success' -Message 'recovered'
+    }.GetNewClosure()
+    $recovered = Invoke-WithRetry -Operation $recoveringOperation -Attempts 3 -DelaySeconds 0
+    Assert-Equal 3 $retryState.Count 'Retry attempt count is invalid.'
+    Assert-Equal 'Success' $recovered.Status 'Recoverable operation did not return success.'
+    Assert-Equal 'recovered' $recovered.Message 'Recoverable operation result was changed.'
+
+    $exhaustedState = @{ Count = 0 }
+    $failingOperation = {
+        $exhaustedState.Count++
+        throw 'bounded failure'
+    }.GetNewClosure()
+    $exhausted = Invoke-WithRetry -Operation $failingOperation -Attempts 3 -DelaySeconds 0
+    Assert-Equal 3 $exhaustedState.Count 'Retry exceeded its attempt bound.'
+    Assert-Equal 'RecoverableError' $exhausted.Status 'Retry exhaustion did not return RecoverableError.'
+    Assert-Equal 'bounded failure' $exhausted.Message 'Retry did not preserve the final failure message.'
+    Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 0 -DelaySeconds 0 } 'Zero retry attempts were accepted.'
+    Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 11 -DelaySeconds 0 } 'Excessive retry attempts were accepted.'
+    Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 1 -DelaySeconds -1 } 'Negative retry delay was accepted.'
+    Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 1 -DelaySeconds 61 } 'Excessive retry delay was accepted.'
+}
+
 function Invoke-CommonTests {
     Assert-True ($null -ne (Get-Command Get-ToolkitLogPath -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitLogPath is unavailable.'
     $logRoot = Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit\logs'
@@ -369,11 +516,15 @@ try {
         'Result' {
             Invoke-ResultTests
         }
+        'Journal' {
+            Invoke-JournalTests
+        }
         'All' {
             Invoke-ManifestTests
             Invoke-AssetTests
             Invoke-ResultTests
             Invoke-ProcessTests
+            Invoke-JournalTests
             Invoke-CommonTests
         }
     }
