@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "mumu": { "testedVersion": "6.8.0.0" },
+  "dependencies": [
+    {
+      "id": "kitsune",
+      "version": "v31.0-25fa2159",
+      "assetName": "app-release.apk",
+      "url": "https://github.com/Jordan231111/KitsuneMagisk/releases/download/v31.0-25fa2159/app-release.apk",
+      "size": 12574128,
+      "sha256": "fac319d2de262fcfff1684e13e1a5c61c486d2a773a7a8ffcfdbfe6f763a7fd4"
+    },
+    {
+      "id": "hma",
+      "version": "oss-161",
+      "assetName": "HMA-OSS-oss-161-release.apk",
+      "url": "https://github.com/frknkrc44/HMA-OSS/releases/download/oss-161/HMA-OSS-oss-161-release.apk",
+      "size": 3094974,
+      "sha256": "059f9fa4a2ccdef83f281d9434c852d29a0728d5e0e4e0f1e13d96fade6947cd"
+    },
+    {
+      "id": "vector",
+      "version": "v2.0",
+      "assetName": "Vector-v2.0-3021-Release.zip",
+      "url": "https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip",
+      "size": 8434264,
+      "sha256": "d5e39669c02c2c699ab948eb8f3639b348eefb7749553224a9c62fa4a2f2dc18"
+    },
+    {
+      "id": "neozygisk",
+      "version": "v2.3",
+      "assetName": "NeoZygisk-v2.3-275-release.zip",
+      "url": "https://github.com/JingMatrix/NeoZygisk/releases/download/v2.3/NeoZygisk-v2.3-275-release.zip",
+      "size": 3208704,
+      "sha256": "5c84df9f962c04855b3523a3a75022cf5e4f3ad3dfd94794ed92b43e911f3b9a"
+    },
+    {
+      "id": "corepatch",
+      "version": "4.9",
+      "assetName": "app-release.apk",
+      "url": "https://github.com/LSPosed/CorePatch/releases/download/4.9/app-release.apk",
+      "size": 64416,
+      "sha256": "1bdc47d5b48afffd37948a9f5638ae6a5f3d4d02ca01ae36143588284b979996"
+    }
+  ]
+}

@@ -1,2 +1,7 @@
 .worktrees/
 .superpowers/
+cache/
+downloads/
+logs/
+tests/artifacts/
+tests/Fixtures/
