@@ -430,7 +430,7 @@ git commit -m "feat: add safe elevation and verified backups"
 **Interfaces:**
 - Produces `Get-MuMuCampaignPaths -Install <object>` returning existing Global and Chinese campaign paths.
 - Produces `Suppress-MuMuAds -Paths <string[]> -BackupRoot <string> -Journal <object>` returning changed and skipped campaign counts.
-- Produces `Restore-MuMuAds -BackupRoot <string> -Journal <object>` restoring exact bytes and read-only state.
+- Produces `Restore-MuMuAds -BackupRoot <string> -AllowedRoot <string> -Journal <object>` restoring exact bytes and read-only state. `-AllowedRoot` is a mandatory caller-supplied boundary (the install or campaign root) and is never read from the restore-point manifest; a restore without it is refused.
 
 - [ ] **Step 1: Write failing ad fixtures**
 
@@ -442,7 +442,7 @@ Assert-True ($suppress.Status -eq 'Success') 'Valid campaign suppression failed.
 Assert-True ((Get-Item $campaignPath).IsReadOnly) 'Campaign read-only state was not preserved.'
 $duplicate = Suppress-MuMuAds -Paths @($campaignPath) -BackupRoot $testRoot -Journal $journal
 Assert-True ($duplicate.Status -eq 'CriticalError') 'Duplicate suppression overwrote a backup.'
-$restore = Restore-MuMuAds -BackupRoot $testRoot -Journal $journal
+$restore = Restore-MuMuAds -BackupRoot $testRoot -AllowedRoot $campaignRoot -Journal $journal
 Assert-True ((Get-Content $campaignPath -Raw) -eq $originalCampaignJson) 'Campaign bytes were not restored exactly.'
 ```
 
@@ -738,6 +738,7 @@ git commit -m "feat: add selected-app root concealment"
 - Produces `Invoke-MenuAction -Action <string> [-Runner <scriptblock>]` returning one structured action result and never throwing into the interactive loop.
 - `Invoke-MumuToolkit.ps1` accepts `-Action`, `-InstanceIndex`, `-NonInteractive`, and `-SkipToolbar`, dispatches one action, and keeps the menu alive after action errors.
 - `Run-MumuToolkit.bat` invokes PowerShell without self-elevating and leaves the window open when the controller returns an interactive error.
+- The `RemoveAds` and `Restore` actions pass the selected installation's campaign root to `Restore-MuMuAds -AllowedRoot`; the boundary always comes from the selected install and never from a restore-point manifest, and a restore that cannot resolve one is refused rather than run without a boundary.
 
 - [ ] **Step 1: Write failing menu and report tests**
 
