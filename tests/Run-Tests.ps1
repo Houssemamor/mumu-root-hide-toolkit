@@ -5643,18 +5643,19 @@ function Invoke-VerificationTests {
     $versionlessFields = Get-ToolkitPackageVersion -Text $versionlessText -PackageName 'me.weishu.kernelsu'
     Assert-True ($null -ne $versionlessFields) 'The shared package reader refused an installed package with no version name.'
     Assert-Equal '' $versionlessFields.VersionName 'The shared package reader invented a version name.'
-    $trailingNameText = 'Package [me.weishu.kernelsu.beta] (a1b2c3):' + [Environment]::NewLine + '    versionName=3.2.5'
-    Assert-True ($null -eq (Get-ToolkitPackageVersion -Text $trailingNameText -PackageName 'me.weishu.kernelsu')) 'The shared package reader matched a near-name header.'
-    $multiBlockText = $trailingNameText + [Environment]::NewLine + $packageText
+    $nearNameBlockText = 'Package [me.weishu.kernelsu.beta] (ff00ff):' + [Environment]::NewLine + '    versionCode=99999 minSdk=28' + [Environment]::NewLine + '    versionName=9.9.9'
+    Assert-True ($null -eq (Get-ToolkitPackageVersion -Text $nearNameBlockText -PackageName 'me.weishu.kernelsu')) 'The shared package reader matched a near-name header.'
+    $multiBlockText = $nearNameBlockText + [Environment]::NewLine + $packageText
     $multiBlockFields = Get-ToolkitPackageVersion -Text $multiBlockText -PackageName 'me.weishu.kernelsu'
     Assert-True ($null -ne $multiBlockFields) 'The shared package reader refused a response holding the exact package block.'
     Assert-Equal '3.2.5' $multiBlockFields.VersionName 'The shared package reader took a version from a near-name block.'
     Assert-Equal '30205' $multiBlockFields.VersionCode 'The shared package reader took a version code from a near-name block.'
-    $reversedBlockText = $packageText + [Environment]::NewLine + $trailingNameText
+    $reversedBlockText = $packageText + [Environment]::NewLine + $nearNameBlockText
     $reversedBlockFields = Get-ToolkitPackageVersion -Text $reversedBlockText -PackageName 'me.weishu.kernelsu'
     Assert-True ($null -ne $reversedBlockFields) 'The shared package reader refused a response whose near-name block came second.'
     Assert-Equal '3.2.5' $reversedBlockFields.VersionName 'The shared package reader took a version from a later block.'
-    $emptyBlockText = 'Package [me.weishu.kernelsu] (a1b2c3):' + [Environment]::NewLine + '  hiddenApi=land' + [Environment]::NewLine + $trailingNameText
+    Assert-Equal '30205' $reversedBlockFields.VersionCode 'The shared package reader took a version code from a later block.'
+    $emptyBlockText = 'Package [me.weishu.kernelsu] (a1b2c3):' + [Environment]::NewLine + '  hiddenApi=land' + [Environment]::NewLine + $nearNameBlockText
     $emptyBlockFields = Get-ToolkitPackageVersion -Text $emptyBlockText -PackageName 'me.weishu.kernelsu'
     Assert-True ($null -ne $emptyBlockFields) 'The shared package reader refused a block that carries no version.'
     Assert-Equal '' $emptyBlockFields.VersionName 'The shared package reader borrowed a version from the following block.'

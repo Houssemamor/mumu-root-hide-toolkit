@@ -500,7 +500,8 @@ git commit -m "feat: add reversible Mumu ad suppression"
 - Produces `Get-Android12KitsunePrompt` returning the exact text `Install -> Direct Install into system partition`.
 - Produces `Test-KitsuneConfirmation` accepting only `Direct Install into system partition`, and `Read-Android12KitsuneConfirmation` with the `$script:ToolkitKitsuneDefaultPrompt` seam for the operator prompt, defaulting to `Read-Host`.
 - Produces `Prepare-Android12Asset -Manifest <object> [-CacheRoot <string>] [-RequireCached] [-Fetch <scriptblock>]` so the controller can fetch and verify the pinned APK before any elevated phase.
-- Produces `Get-ToolkitRootSetting -ManagerPath <string> -Index <int>` in `src/Verification.ps1`, shared with the Android 15 flow, returning the vendor root setting with a distinct code for every unsupported or malformed manager response shape, including `INDEX_MISMATCH` when the response names another instance.
+- Produces `Get-Android12RootSetting -ManagerPath <string> -Index <int>` returning the vendor root setting with a distinct code for every unsupported or malformed manager response shape.
+- Forward reference, updated by Task 7: that reader is now `Get-ToolkitRootSetting -ManagerPath <string> -Index <int> [-Runner <scriptblock>]` in `src/Verification.ps1`, shared with the Android 15 flow and also reporting `INDEX_MISMATCH` when a response names another instance. Task 6 itself did not create or modify `src/Verification.ps1`.
 - Produces `Resolve-Android12Clone` and `Assert-Android12ResumeClone` so a successful clone with missing data, or a recorded clone that no longer matches, is refused before any further mutation. `-ResumeClone` accepts either the recovery record of a failed call or an equivalent object.
 - Produces `Format-Android12InstallCommand` building the single quoted `install -r "<path>"` command element for MuMuManager.
 - Produces `Test-Android12Root -ManagerPath <string> -InstanceIndex <int>` returning package, daemon, and root checks.
@@ -622,7 +623,7 @@ function Enable-Android15Root {
 
 - [ ] **Step 4: Add negative and idempotency tests**
 
-Cover already-enabled root, missing root toggle, failed boot, absent KernelSU, a near-name KernelSU package, a denied root shell, an ADB transport failure that is not a root-shell denial, an unfiltered package list that returns a usage or error string, a vendor root setting that names another instance, and an Android 15 instance with an existing unrelated Kitsune package. The function must report `AlreadyApplied` only when verification passes, must reject an unconfirmed call with `USER_CONFIRMATION_REQUIRED` before any manager call, and must issue the bare `shell pm list packages` request rather than an unverified filtered form.
+Cover already-enabled root, missing root toggle, failed boot, absent KernelSU, a near-name KernelSU package, a multi-block `dumpsys package` response whose near-name block carries a different version than the real package, a denied root shell, an ADB transport failure that is not a root-shell denial, an unfiltered package list that returns a usage or error string, a vendor root setting that names another instance, and an Android 15 instance with an existing unrelated Kitsune package. The package reader must take `versionName` and `versionCode` only from the matched exact `Package [<name>]` block, never from an adjacent block. The function must report `AlreadyApplied` only when verification passes, must reject an unconfirmed call with `USER_CONFIRMATION_REQUIRED` before any manager call, and must issue the bare `shell pm list packages` request rather than an unverified filtered form.
 
 - [ ] **Step 5: Run tests and commit**
 
