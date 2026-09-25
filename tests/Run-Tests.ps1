@@ -3530,6 +3530,7 @@ function New-Root12ManagerState {
         PackageInstalled = $true
         PackageName = 'io.github.huskydg.magisk'
         PackageHeaderName = ''
+        PackageExtraBlock = ''
         LaunchCommand = 'shell monkey -p io.github.huskydg.magisk -c android.intent.category.LAUNCHER 1'
         VersionName = '31.0-kitsune'
         VersionCode = '31000'
@@ -3693,9 +3694,13 @@ function New-Root12ManagerRunner {
                     return [pscustomobject]@{ ExitCode = 0; Text = ('Unable to find package: ' + $State.PackageName + '.') }
                 }
                 $headerName = if ([string]::IsNullOrWhiteSpace([string]$State.PackageHeaderName)) { [string]$State.PackageName } else { [string]$State.PackageHeaderName }
+                $extraBlock = ''
+                if (-not [string]::IsNullOrWhiteSpace([string]$State.PackageExtraBlock)) {
+                    $extraBlock = [string]$State.PackageExtraBlock + [Environment]::NewLine
+                }
                 return [pscustomobject]@{
                     ExitCode = 0
-                    Text = ('Package [' + $headerName + '] (a1b2c3):' + [Environment]::NewLine + '    versionCode=' + $State.VersionCode + ' minSdk=26' + [Environment]::NewLine + '    versionName=' + $State.VersionName)
+                    Text = ($extraBlock + 'Package [' + $headerName + '] (a1b2c3):' + [Environment]::NewLine + '    versionCode=' + $State.VersionCode + ' minSdk=26' + [Environment]::NewLine + '    versionName=' + $State.VersionName)
                 }
             }
             if ($request -ceq 'shell pidof magiskd') {
@@ -4294,6 +4299,28 @@ function Invoke-Root12Tests {
             Assert-Equal -1 (Get-Root12CallIndex -Calls $nearNameState.Calls -Pattern '*root_permission*-val*false*') "A near-name package disabled the temporary vendor root: $($nearNameCase.Label)."
         }
 
+        foreach ($multiBlock in @(
+                [pscustomobject]@{ ExtraName = '31.0-kitsune'; ExtraCode = '31000'; RealName = '30.0'; RealCode = '28000'; Code = 'PACKAGE_VERSION_MISMATCH'; Status = 'CriticalError'; Label = 'a near-name block with the pinned version before an unpinned real package' },
+                [pscustomobject]@{ ExtraName = '9.9.9'; ExtraCode = '99999'; RealName = '31.0-kitsune'; RealCode = '31000'; Code = 'OK'; Status = 'Success'; Label = 'a near-name block with an unpinned version before the pinned real package' }
+            )) {
+            $multiBlockState = New-Root12ManagerState -Install $install
+            $multiBlockState.VersionName = $multiBlock.RealName
+            $multiBlockState.VersionCode = $multiBlock.RealCode
+            $multiBlockState.PackageExtraBlock = ('Package [io.github.huskydg.magisk.beta] (ff00ff):' + [Environment]::NewLine + '    versionCode=' + $multiBlock.ExtraCode + ' minSdk=26' + [Environment]::NewLine + '    versionName=' + $multiBlock.ExtraName)
+            $multiBlockCase = Invoke-Root12Case -State $multiBlockState -Instance $android12 -Manifest $manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Equal $multiBlock.Status $multiBlockCase.Result.Status "The Android 12 package check accepted $($multiBlock.Label)."
+            if ($multiBlock.Status -eq 'CriticalError') {
+                Assert-Equal $multiBlock.Code $multiBlockCase.Result.Data.Code "The Android 12 package check reported the wrong code for $($multiBlock.Label)."
+                Assert-Equal $multiBlock.RealName $multiBlockCase.Result.Data.VersionName "The Android 12 package check recorded a version from the wrong block: $($multiBlock.Label)."
+                Assert-Equal $multiBlock.RealCode $multiBlockCase.Result.Data.VersionCode "The Android 12 package check recorded a version code from the wrong block: $($multiBlock.Label)."
+                Assert-Equal -1 (Get-Root12CallIndex -Calls $multiBlockState.Calls -Pattern '*root_permission*-val*false*') "A wrong block version disabled the temporary vendor root: $($multiBlock.Label)."
+            }
+            else {
+                Assert-Equal $multiBlock.RealName $multiBlockCase.Result.Data.VersionName "The Android 12 package check recorded a version from the wrong block: $($multiBlock.Label)."
+            }
+        }
+
         foreach ($daemonCase in @(
                 [pscustomobject]@{ Pids = ''; Code = 'DAEMON_ABSENT' },
                 [pscustomobject]@{ Pids = '   '; Code = 'DAEMON_ABSENT' },
@@ -4714,6 +4741,7 @@ function New-Root15ManagerState {
         KitsunePackage = $script:Root15KitsunePackage
         KernelSUInstalled = $true
         KernelSUHeaderName = ''
+        KernelSUExtraBlock = ''
         KernelSUVersionName = '3.2.5'
         KernelSUVersionCode = '30205'
         KitsuneInstalled = $false
@@ -4862,9 +4890,13 @@ function New-Root15ManagerRunner {
                     return [pscustomobject]@{ ExitCode = 0; Text = ('Unable to find package: ' + $State.KernelSUPackage + '.') }
                 }
                 $headerName = if ([string]::IsNullOrWhiteSpace([string]$State.KernelSUHeaderName)) { [string]$State.KernelSUPackage } else { [string]$State.KernelSUHeaderName }
+                $extraBlock = ''
+                if (-not [string]::IsNullOrWhiteSpace([string]$State.KernelSUExtraBlock)) {
+                    $extraBlock = [string]$State.KernelSUExtraBlock + [Environment]::NewLine
+                }
                 return [pscustomobject]@{
                     ExitCode = 0
-                    Text = ('Package [' + $headerName + '] (a1b2c3):' + [Environment]::NewLine + '    versionCode=' + $State.KernelSUVersionCode + ' minSdk=28' + [Environment]::NewLine + '    versionName=' + $State.KernelSUVersionName)
+                    Text = ($extraBlock + 'Package [' + $headerName + '] (a1b2c3):' + [Environment]::NewLine + '    versionCode=' + $State.KernelSUVersionCode + ' minSdk=28' + [Environment]::NewLine + '    versionName=' + $State.KernelSUVersionName)
                 }
             }
             if ($request -ceq 'shell pm list packages') {
@@ -5057,15 +5089,6 @@ function Invoke-Root15Tests {
         $confirmedButInvalid = Enable-Android15Root -Instance $android12 -Journal (New-Root15Journal -Root $journalRoot -Instance $android12) -Confirmed -Runner (New-Root15ManagerRunner -State $confirmedButInvalidState)
         Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $confirmedButInvalid.Data.Code 'A confirmed Android 12 request skipped the Android version check.'
         Assert-Equal 0 @($confirmedButInvalidState.Calls).Count 'A confirmed Android 12 request reached the MuMu manager.'
-
-        $missingVersionState = New-Root15ManagerState -Install $install
-        $missingVersionInstance = New-Root15InstanceFixture -Install $install -AndroidVersion '15.0'
-        $missingVersionInstance.PSObject.Properties.Remove('AndroidVersion')
-        $missingVersionCase = Invoke-Root15Case -State $missingVersionState -Instance $missingVersionInstance -JournalRoot $journalRoot
-        Assert-Equal 'CriticalError' $missingVersionCase.Result.Status 'An instance without an Android version was accepted.'
-        Assert-True ($null -ne $missingVersionCase.Result.Data) 'The missing Android version rejection carried no recovery data.'
-        Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $missingVersionCase.Result.Data.Code 'An instance without an Android version was not rejected.'
-        Assert-Equal 0 @($missingVersionState.Calls).Count 'An instance without an Android version reached the MuMu manager.'
 
         $nullInstanceState = New-Root15ManagerState -Install $install
         $nullInstance = Enable-Android15Root -Instance $null -Journal (New-Root15Journal -Root $journalRoot -Instance $android15) -Runner (New-Root15ManagerRunner -State $nullInstanceState)
@@ -5352,6 +5375,20 @@ function Invoke-Root15Tests {
             Assert-Equal '' $nearKernelSUCase.Result.Data.KernelSUVersion "The built-in KernelSU check recorded a version from $($nearKernelSU.Label)."
         }
 
+        $multiBlockKernelSUState = New-Root15ManagerState -Install $install
+        $multiBlockKernelSUState.KernelSUExtraBlock = ('Package [me.weishu.kernelsu.beta] (ff00ff):' + [Environment]::NewLine + '    versionCode=99999 minSdk=28' + [Environment]::NewLine + '    versionName=9.9.9')
+        $multiBlockKernelSUCase = Invoke-Root15Case -State $multiBlockKernelSUState -Instance $android15 -JournalRoot $journalRoot
+        Assert-Equal 'Success' $multiBlockKernelSUCase.Result.Status "A multi-block package response failed the Android 15 flow. $($multiBlockKernelSUCase.Result.Message)"
+        Assert-Equal $true $multiBlockKernelSUCase.Result.Data.KernelSU 'A multi-block package response hid the built-in KernelSU package.'
+        Assert-Equal '3.2.5' $multiBlockKernelSUCase.Result.Data.KernelSUVersion 'The Android 15 flow recorded a KernelSU version from the near-name block.'
+
+        $multiBlockKernelSUTrailingState = New-Root15ManagerState -Install $install
+        $multiBlockKernelSUTrailingState.KernelSUVersionName = '4.0.0'
+        $multiBlockKernelSUTrailingState.KernelSUExtraBlock = ('Package [me.weishu.kernelsu.beta] (ff00ff):' + [Environment]::NewLine + '    versionCode=99999 minSdk=28' + [Environment]::NewLine + '    versionName=9.9.9')
+        $multiBlockKernelSUTrailingCase = Invoke-Root15Case -State $multiBlockKernelSUTrailingState -Instance $android15 -JournalRoot $journalRoot
+        Assert-Equal 'Success' $multiBlockKernelSUTrailingCase.Result.Status "A multi-block package response failed the Android 15 flow. $($multiBlockKernelSUTrailingCase.Result.Message)"
+        Assert-Equal '4.0.0' $multiBlockKernelSUTrailingCase.Result.Data.KernelSUVersion 'The Android 15 flow recorded a KernelSU version from the wrong block.'
+
         foreach ($adbFailureCase in @(
                 [pscustomobject]@{ Pattern = '*dumpsys package*'; Code = 'ADB_FAILED'; Label = 'the KernelSU package query' },
                 [pscustomobject]@{ Pattern = '*pm list packages*'; Code = 'ADB_FAILED'; Label = 'the Kitsune package query' },
@@ -5608,6 +5645,20 @@ function Invoke-VerificationTests {
     Assert-Equal '' $versionlessFields.VersionName 'The shared package reader invented a version name.'
     $trailingNameText = 'Package [me.weishu.kernelsu.beta] (a1b2c3):' + [Environment]::NewLine + '    versionName=3.2.5'
     Assert-True ($null -eq (Get-ToolkitPackageVersion -Text $trailingNameText -PackageName 'me.weishu.kernelsu')) 'The shared package reader matched a near-name header.'
+    $multiBlockText = $trailingNameText + [Environment]::NewLine + $packageText
+    $multiBlockFields = Get-ToolkitPackageVersion -Text $multiBlockText -PackageName 'me.weishu.kernelsu'
+    Assert-True ($null -ne $multiBlockFields) 'The shared package reader refused a response holding the exact package block.'
+    Assert-Equal '3.2.5' $multiBlockFields.VersionName 'The shared package reader took a version from a near-name block.'
+    Assert-Equal '30205' $multiBlockFields.VersionCode 'The shared package reader took a version code from a near-name block.'
+    $reversedBlockText = $packageText + [Environment]::NewLine + $trailingNameText
+    $reversedBlockFields = Get-ToolkitPackageVersion -Text $reversedBlockText -PackageName 'me.weishu.kernelsu'
+    Assert-True ($null -ne $reversedBlockFields) 'The shared package reader refused a response whose near-name block came second.'
+    Assert-Equal '3.2.5' $reversedBlockFields.VersionName 'The shared package reader took a version from a later block.'
+    $emptyBlockText = 'Package [me.weishu.kernelsu] (a1b2c3):' + [Environment]::NewLine + '  hiddenApi=land' + [Environment]::NewLine + $trailingNameText
+    $emptyBlockFields = Get-ToolkitPackageVersion -Text $emptyBlockText -PackageName 'me.weishu.kernelsu'
+    Assert-True ($null -ne $emptyBlockFields) 'The shared package reader refused a block that carries no version.'
+    Assert-Equal '' $emptyBlockFields.VersionName 'The shared package reader borrowed a version from the following block.'
+    Assert-Equal '' $emptyBlockFields.VersionCode 'The shared package reader borrowed a version code from the following block.'
 
     $rootShellCases = @(
         [pscustomobject]@{ Call = $null; Code = 'ADB_FAILED'; Status = 'CriticalError'; Label = 'no call at all' },

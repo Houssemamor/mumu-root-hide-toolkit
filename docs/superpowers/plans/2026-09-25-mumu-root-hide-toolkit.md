@@ -44,7 +44,7 @@ The implementation will create these focused files:
 - `src/Root15.ps1`: Android 15 built-in root toggle and KernelSU verification.
 - `src/Concealment.ps1`: HMA/Vector installation, reusable Root template, selected-app scope, and KernelSU profile handoff.
 - `src/Ads.ps1`: MuMu campaign suppression and exact restoration.
-- `src/Verification.ps1`: read-only status report.
+- `src/Verification.ps1`: shared read-only root verification primitives, and from Task 9 the read-only status report.
 - `src/Manifest.json`: tested versions, official URLs, asset names, sizes, and SHA-256 values.
 - `tests/Run-Tests.ps1`: dependency-free test runner and assertions.
 - `tests/Fixtures/`: generated temporary fixture data only; no real credentials or installations.
@@ -577,13 +577,13 @@ git commit -m "feat: add guided Android 12 Kitsune rooting"
 
 **Files:**
 - Create: `src/Root15.ps1`
-- Modify: `src/Verification.ps1`
+- Create: `src/Verification.ps1`
 - Modify: `tests/Run-Tests.ps1`
 
 **Interfaces:**
 - Produces `Enable-Android15Root -Instance <object> -Journal <object> [-Confirmed] [-Runner <scriptblock>]` returning the root-toggle and cold-boot result. `-Confirmed` is an explicit switch: without it the call returns `USER_CONFIRMATION_REQUIRED` before any manager or clone mutation, and the controller collects that confirmation explicitly rather than auto-confirming.
 - Produces `Test-Android15Root -ManagerPath <string> -InstanceIndex <int> [-Runner <scriptblock>]` returning `RootPermission`, `KernelSU`, `RootShell`, and `KitsuneAbsent` fields.
-- Consumes the shared read-only primitives in `src/Verification.ps1`: `Invoke-ToolkitManagerAdb`, `Wait-ToolkitBootCompleted`, `Get-ToolkitRootSetting`, `Get-ToolkitPackageVersion`, `Get-ToolkitRootShellStatus`, and `New-ToolkitRootFailure`. Both root workflows use them, so the ADB request shape, the boot wait, the vendor root reader, the package identity rule, and the failure closer exist once.
+- Creates the shared read-only primitives in `src/Verification.ps1`, which this task also rewires the Android 12 flow to use: `Invoke-ToolkitManagerAdb`, `Wait-ToolkitBootCompleted`, `Get-ToolkitRootSetting`, `Get-ToolkitPackageVersion`, `Get-ToolkitRootShellStatus`, and `New-ToolkitRootFailure`. Both root workflows use them, so the ADB request shape, the boot wait, the vendor root reader, the package identity rule, and the failure closer exist once. `src/Verification.ps1` must be dot-sourced before the first call into either root workflow, which this task does not enforce at definition time; the controller dot-sources the composed script set before it dispatches an action. Task 9 modifies the same file to add `Get-ToolkitReport`.
 
 - [ ] **Step 1: Write failing Android 15 tests**
 
@@ -592,7 +592,7 @@ Assert that the function rejects Android 12, never calls the Kitsune downloader,
 ```powershell
 $android12 = Enable-Android15Root -Instance $android12Fixture -Journal $journal -Runner $fakeRunner
 Assert-True ($android12.Status -eq 'CriticalError') 'Android 12 was sent to Android 15 root flow.'
-$android15 = Enable-Android15Root -Instance $android15Fixture -Journal $journal -Runner $fakeRunner
+$android15 = Enable-Android15Root -Instance $android15Fixture -Journal $journal -Confirmed -Runner $fakeRunner
 Assert-True ($android15.Status -eq 'Success') 'Android 15 root flow failed.'
 Assert-True ($fakeRunner.HyperVCalls.Count -eq 0) 'Android 15 flow changed Hyper-V.'
 Assert-True ($fakeRunner.KitsuneDownloads.Count -eq 0) 'Android 15 flow downloaded Kitsune.'
@@ -734,14 +734,14 @@ git commit -m "feat: add selected-app root concealment"
 ### Task 9: Implement verification and the persistent menu controller
 
 **Files:**
-- Create: `src/Verification.ps1`
+- Modify: `src/Verification.ps1`
 - Create: `src/Invoke-MumuToolkit.ps1`
 - Create: `Run-MumuToolkit.bat`
 - Modify: `src/Common.ps1`
 - Modify: `tests/Run-Tests.ps1`
 
 **Interfaces:**
-- Produces `Get-ToolkitReport -Install <object> -Instance <object> -Journal <object>` returning a read-only report object.
+- Produces `Get-ToolkitReport -Install <object> -Instance <object> -Journal <object>` returning a read-only report object, added to the `src/Verification.ps1` that Task 7 created with the shared read-only primitives.
 - Produces `Invoke-ToolkitAction -Action <string>` dispatching one named operation and returning its structured result.
 - Produces `Invoke-MenuAction -Action <string> [-Runner <scriptblock>]` returning one structured action result and never throwing into the interactive loop.
 - `Invoke-MumuToolkit.ps1` accepts `-Action`, `-InstanceIndex`, `-NonInteractive`, and `-SkipToolbar`, dispatches one action, and keeps the menu alive after action errors.

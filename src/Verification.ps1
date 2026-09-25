@@ -115,12 +115,18 @@ function Get-ToolkitPackageVersion {
     }
 
     $headerPattern = '(?m)^\s*Package \[' + [regex]::Escape($PackageName) + '\](?=[\s(:])'
-    if (-not [regex]::IsMatch($Text, $headerPattern)) {
+    $headerMatch = [regex]::Match($Text, $headerPattern)
+    if (-not $headerMatch.Success) {
         return $null
     }
 
-    $nameMatch = [regex]::Match($Text, '(?m)^\s*versionName=(\S+)')
-    $codeMatch = [regex]::Match($Text, '(?m)^\s*versionCode=(\d+)\b')
+    $nextHeaderRegex = New-Object Text.RegularExpressions.Regex '(?m)^\s*Package \['
+    $nextHeader = $nextHeaderRegex.Match($Text, $headerMatch.Index + $headerMatch.Length)
+    $blockEnd = if ($nextHeader.Success) { $nextHeader.Index } else { $Text.Length }
+    $block = $Text.Substring($headerMatch.Index, $blockEnd - $headerMatch.Index)
+
+    $nameMatch = [regex]::Match($block, '(?m)^\s*versionName=(\S+)')
+    $codeMatch = [regex]::Match($block, '(?m)^\s*versionCode=(\d+)\b')
     return @{
         VersionName = if ($nameMatch.Success) { $nameMatch.Groups[1].Value } else { '' }
         VersionCode = if ($codeMatch.Success) { $codeMatch.Groups[1].Value } else { '' }
