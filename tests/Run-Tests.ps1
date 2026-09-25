@@ -141,6 +141,18 @@ function Invoke-ManifestTests {
     $stringSizeManifest.dependencies[0].size = '12574128'
     [IO.File]::WriteAllText($stringSizePath, ($stringSizeManifest | ConvertTo-Json -Depth 10))
     Assert-Throws { Get-ToolkitManifest -Path $stringSizePath } 'Manifest string dependency size was accepted.'
+
+    $arrayMumuPath = Join-Path $testRoot 'array-mumu.json'
+    $arrayMumuManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $arrayMumuManifest.mumu.testedVersion = @('6.8.0.0')
+    [IO.File]::WriteAllText($arrayMumuPath, ($arrayMumuManifest | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-ToolkitManifest -Path $arrayMumuPath } 'Manifest array MuMu version was accepted.'
+
+    $numericVersionPath = Join-Path $testRoot 'numeric-version.json'
+    $numericVersionManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $numericVersionManifest.dependencies[4].version = 4.9
+    [IO.File]::WriteAllText($numericVersionPath, ($numericVersionManifest | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-ToolkitManifest -Path $numericVersionPath } 'Manifest numeric dependency version was accepted.'
 }
 
 function Invoke-ResultTests {
@@ -262,6 +274,28 @@ function Invoke-AssetTests {
     Assert-Equal $kitsunePath $kitsuneAsset.Data 'Kitsune namespaced asset path is invalid.'
     Assert-Equal $corePatchPath $corePatchAsset.Data 'CorePatch namespaced asset path is invalid.'
 
+    $escapeCacheRoot = Join-Path $testRoot 'cache'
+    New-Item -ItemType Directory -Path $escapeCacheRoot | Out-Null
+    $outsideAssetPath = Join-Path $testRoot 'outside.bin'
+    [IO.File]::WriteAllText($outsideAssetPath, 'outside fixture')
+    $outsideAssetItem = Get-Item -LiteralPath $outsideAssetPath
+    $outsideAssetHash = (Get-FileHash -LiteralPath $outsideAssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    foreach ($unsafeId in @('..', '.', 'child\asset', '..\outside', '../outside', 'C:\outside', 'C:outside')) {
+        $unsafeManifest = [pscustomobject]@{
+            dependencies = @(
+                [pscustomobject]@{
+                    id = $unsafeId
+                    assetName = 'outside.bin'
+                    size = [long]$outsideAssetItem.Length
+                    sha256 = $outsideAssetHash
+                }
+            )
+        }
+        $unsafeResult = Get-VerifiedAsset -Manifest $unsafeManifest -Id $unsafeId -CacheRoot $escapeCacheRoot
+        Assert-Equal 'CriticalError' $unsafeResult.Status "Unsafe asset ID was accepted: $unsafeId"
+        Assert-True ($null -eq $unsafeResult.Data) "Unsafe asset ID returned a path: $unsafeId"
+    }
+
     $assetDirectory = Join-Path $testRoot 'fixture'
     New-Item -ItemType Directory -Path $assetDirectory | Out-Null
     $assetPath = Join-Path $assetDirectory 'verified-asset.bin'
@@ -282,6 +316,20 @@ function Invoke-AssetTests {
     $verified = Get-VerifiedAsset -Manifest $assetManifest -Id 'fixture' -CacheRoot $testRoot
     Assert-Equal 'Success' $verified.Status 'Verified fixture asset was rejected.'
     Assert-Equal $assetPath $verified.Data 'Verified fixture asset path is invalid.'
+
+    $numericStringSizeManifest = [pscustomobject]@{
+        dependencies = @(
+            [pscustomobject]@{
+                id = 'fixture'
+                assetName = 'verified-asset.bin'
+                size = [string]$assetItem.Length
+                sha256 = $assetHash
+            }
+        )
+    }
+    $numericStringSize = Get-VerifiedAsset -Manifest $numericStringSizeManifest -Id 'fixture' -CacheRoot $testRoot
+    Assert-Equal 'CriticalError' $numericStringSize.Status 'Verifier numeric string size was accepted.'
+    Assert-True ($null -eq $numericStringSize.Data) 'Verifier numeric string size returned a path.'
 
     $sizeMismatch = Get-VerifiedAsset -Manifest ([pscustomobject]@{ dependencies = @([pscustomobject]@{ id = 'fixture'; assetName = 'verified-asset.bin'; size = [long]($assetItem.Length + 1); sha256 = $assetHash }) }) -Id 'fixture' -CacheRoot $testRoot
     Assert-Equal 'CriticalError' $sizeMismatch.Status 'Asset size mismatch was accepted.'

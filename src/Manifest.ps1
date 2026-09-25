@@ -24,7 +24,9 @@ function Get-ToolkitManifest {
         throw 'Manifest schema version is invalid.'
     }
     if ($null -eq $manifest.PSObject.Properties['mumu'] -or
+        $manifest.mumu -is [Array] -or
         $null -eq $manifest.mumu.PSObject.Properties['testedVersion'] -or
+        $manifest.mumu.testedVersion -isnot [string] -or
         $manifest.mumu.testedVersion -ne '6.8.0.0') {
         throw 'Manifest MuMu version is invalid.'
     }
@@ -94,6 +96,11 @@ function Get-ToolkitManifest {
         if ($dependency.size -isnot [int] -and $dependency.size -isnot [long]) {
             throw "Manifest dependency $index size is not an integer."
         }
+        foreach ($propertyName in @('id', 'version', 'assetName', 'url', 'sha256')) {
+            if ($dependency.PSObject.Properties[$propertyName].Value -isnot [string]) {
+                throw "Manifest dependency $index $propertyName is not a string."
+            }
+        }
         if ([string]$dependency.id -match '(?i)debug' -or
             [string]$dependency.assetName -match '(?i)debug' -or
             [string]$dependency.url -match '(?i)debug') {
@@ -125,7 +132,7 @@ function Get-VerifiedAsset {
     if ($null -eq $Manifest -or
         $null -eq $Manifest.PSObject.Properties['dependencies'] -or
         [string]::IsNullOrWhiteSpace($Id) -or
-        $Id -ne [IO.Path]::GetFileName($Id) -or
+        $Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or
         [string]::IsNullOrWhiteSpace($CacheRoot)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset verification input is invalid.'
     }
@@ -148,15 +155,22 @@ function Get-VerifiedAsset {
 
     $assetName = [string]$dependency.assetName
     $expectedHash = [string]$dependency.sha256
-    if ([string]::IsNullOrWhiteSpace($assetName) -or
+    if (($dependency.size -isnot [int] -and $dependency.size -isnot [long]) -or
+        [string]::IsNullOrWhiteSpace($assetName) -or
         $assetName -ne [IO.Path]::GetFileName($assetName) -or
         $expectedHash -notmatch '^[0-9a-fA-F]{64}$') {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset verification input is invalid.'
     }
 
     try {
-        $dependencyCacheRoot = Join-Path $CacheRoot $Id
-        $path = Join-Path $dependencyCacheRoot $assetName
+        $cacheRootPath = [IO.Path]::GetFullPath($CacheRoot)
+        $dependencyCacheRoot = Join-Path $cacheRootPath $Id
+        $path = [IO.Path]::GetFullPath((Join-Path $dependencyCacheRoot $assetName))
+        $rootSeparators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $cachePrefix = $cacheRootPath.TrimEnd($rootSeparators) + [IO.Path]::DirectorySeparatorChar
+        if (-not $path.StartsWith($cachePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset path is outside the cache root.'
+        }
         $expectedSize = [long]$dependency.size
     }
     catch {
