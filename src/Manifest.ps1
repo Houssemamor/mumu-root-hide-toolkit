@@ -18,7 +18,9 @@ function Get-ToolkitManifest {
     if ($null -eq $manifest -or $manifest -is [Array]) {
         throw 'Manifest root must be an object.'
     }
-    if ($null -eq $manifest.PSObject.Properties['schemaVersion'] -or $manifest.schemaVersion -ne 1) {
+    if ($null -eq $manifest.PSObject.Properties['schemaVersion'] -or
+        (($manifest.schemaVersion -isnot [int] -and $manifest.schemaVersion -isnot [long]) -or
+        $manifest.schemaVersion -ne 1)) {
         throw 'Manifest schema version is invalid.'
     }
     if ($null -eq $manifest.PSObject.Properties['mumu'] -or
@@ -89,6 +91,9 @@ function Get-ToolkitManifest {
                 throw "Manifest dependency $index is missing $propertyName."
             }
         }
+        if ($dependency.size -isnot [int] -and $dependency.size -isnot [long]) {
+            throw "Manifest dependency $index size is not an integer."
+        }
         if ([string]$dependency.id -match '(?i)debug' -or
             [string]$dependency.assetName -match '(?i)debug' -or
             [string]$dependency.url -match '(?i)debug') {
@@ -120,6 +125,7 @@ function Get-VerifiedAsset {
     if ($null -eq $Manifest -or
         $null -eq $Manifest.PSObject.Properties['dependencies'] -or
         [string]::IsNullOrWhiteSpace($Id) -or
+        $Id -ne [IO.Path]::GetFileName($Id) -or
         [string]::IsNullOrWhiteSpace($CacheRoot)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset verification input is invalid.'
     }
@@ -149,7 +155,8 @@ function Get-VerifiedAsset {
     }
 
     try {
-        $path = Join-Path $CacheRoot $assetName
+        $dependencyCacheRoot = Join-Path $CacheRoot $Id
+        $path = Join-Path $dependencyCacheRoot $assetName
         $expectedSize = [long]$dependency.size
     }
     catch {

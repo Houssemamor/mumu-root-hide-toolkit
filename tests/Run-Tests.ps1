@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Manifest', 'All')]
+    [ValidateSet('Manifest', 'Process', 'Result', 'All')]
     [string]$Suite = 'All'
 )
 
@@ -129,10 +129,32 @@ function Invoke-ManifestTests {
     $debugAssetManifest.dependencies[0].assetName = 'app-debug.apk'
     [IO.File]::WriteAllText($debugAssetPath, ($debugAssetManifest | ConvertTo-Json -Depth 10))
     Assert-Throws { Get-ToolkitManifest -Path $debugAssetPath } 'Manifest with a debug asset was accepted.'
+
+    $stringSchemaPath = Join-Path $testRoot 'string-schema.json'
+    $stringSchemaManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $stringSchemaManifest.schemaVersion = '1'
+    [IO.File]::WriteAllText($stringSchemaPath, ($stringSchemaManifest | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-ToolkitManifest -Path $stringSchemaPath } 'Manifest string schemaVersion was accepted.'
+
+    $stringSizePath = Join-Path $testRoot 'string-size.json'
+    $stringSizeManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $stringSizeManifest.dependencies[0].size = '12574128'
+    [IO.File]::WriteAllText($stringSizePath, ($stringSizeManifest | ConvertTo-Json -Depth 10))
+    Assert-Throws { Get-ToolkitManifest -Path $stringSizePath } 'Manifest string dependency size was accepted.'
 }
 
-function Invoke-CommonTests {
+function Invoke-ResultTests {
     Assert-True ($null -ne (Get-Command Get-ToolkitResult -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitResult is unavailable.'
+    $resultCommand = Get-Command Get-ToolkitResult -CommandType Function
+    foreach ($parameterName in @('Status', 'Message')) {
+        $parameterAttributes = @($resultCommand.Parameters[$parameterName].Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] })
+        Assert-Equal 1 $parameterAttributes.Count "Result parameter metadata is invalid for $parameterName."
+        Assert-True ([bool]$parameterAttributes[0].Mandatory) "Result parameter is not required: $parameterName"
+    }
+    Assert-Throws { Get-ToolkitResult -Status '' -Message 'fixture' } 'Empty result status was accepted.'
+    Assert-Throws { Get-ToolkitResult -Status 'Success' -Message '' } 'Empty result message was accepted.'
+    Assert-Throws { Get-ToolkitResult -Status 'Success' -Message '   ' } 'Whitespace result message was accepted.'
+    Assert-Throws { Get-ToolkitResult -Status 'success' -Message 'fixture' } 'Noncanonical result status was accepted.'
     foreach ($status in @('Success', 'AlreadyApplied', 'Warning', 'RecoverableError', 'CriticalError')) {
         $result = Get-ToolkitResult -Status $status -Message 'fixture' -Data @{ Value = 1 }
         Assert-Equal $status $result.Status "Result status is invalid for $status."
@@ -140,12 +162,16 @@ function Invoke-CommonTests {
         Assert-Equal 1 $result.Data.Value "Result data is invalid for $status."
     }
     Assert-Throws { Get-ToolkitResult -Status 'Invalid' -Message 'fixture' } 'Invalid result status was accepted.'
+}
 
-    Assert-True ($null -ne (Get-Command Get-ToolkitLogPath -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitLogPath is unavailable.'
-    $logRoot = Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit\logs'
-    $logPath = Get-ToolkitLogPath
-    Assert-True ($logPath.StartsWith($logRoot, [StringComparison]::OrdinalIgnoreCase)) 'Log path is outside the per-user log directory.'
+function New-ProcessArgumentFixture {
+    $path = Join-Path $testRoot 'argument-fixture.exe'
+    $code = 'using System; using System.Text; public static class ArgumentFixture { public static int Main(string[] args) { string[] encoded = new string[args.Length]; for (int index = 0; index < args.Length; index++) { encoded[index] = Convert.ToBase64String(Encoding.UTF8.GetBytes(args[index])); } Console.WriteLine(args.Length + "|" + string.Join("|", encoded)); return 0; } }'
+    Add-Type -TypeDefinition $code -OutputAssembly $path -OutputType ConsoleApplication | Out-Null
+    return $path
+}
 
+function Invoke-ProcessTests {
     Assert-True ($null -ne (Get-Command Invoke-CheckedProcess -CommandType Function -ErrorAction SilentlyContinue)) 'Invoke-CheckedProcess is unavailable.'
     $fakeRunner = {
         param($ActualFilePath, $ActualArgumentList)
@@ -159,6 +185,28 @@ function Invoke-CommonTests {
     Assert-Equal 5 $injected.ExitCode 'Injected process exit code was not preserved.'
     Assert-Equal 'C:\Program Files\Fixture Tool.exe|alpha|argument with spaces' $injected.Text 'Process arguments were interpolated or changed.'
 
+    $argumentFixture = New-ProcessArgumentFixture
+    $argumentVector = @(
+        'plain',
+        'argument with spaces',
+        'embedded"double"quotes',
+        'backslash\"quote"',
+        '',
+        'trailing\',
+        'line' + [Environment]::NewLine + 'break',
+        '$(Write-Output unsafe);&|<>'
+    )
+    $expectedArguments = @($argumentVector | ForEach-Object {
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_))
+    })
+    $argumentResult = Invoke-CheckedProcess -FilePath $argumentFixture -ArgumentList $argumentVector
+    $actualArguments = $argumentResult.Text.TrimEnd([char[]]"`r`n").Split([char]'|')
+    Assert-Equal 0 $argumentResult.ExitCode 'Native argument fixture did not succeed.'
+    Assert-Equal $argumentVector.Count $actualArguments[0] 'Native process received the wrong argument count.'
+    for ($index = 0; $index -lt $argumentVector.Count; $index++) {
+        Assert-Equal $expectedArguments[$index] $actualArguments[$index + 1] "Native process changed argument $index."
+    }
+
     $powershellPath = Join-Path $PSHOME 'powershell.exe'
     $native = Invoke-CheckedProcess -FilePath $powershellPath -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', "[Console]::Out.WriteLine('fixture output')")
     Assert-Equal 0 $native.ExitCode 'Native fixture process did not succeed.'
@@ -166,8 +214,57 @@ function Invoke-CommonTests {
     $nativeFailure = Invoke-CheckedProcess -FilePath $powershellPath -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'exit 7')
     Assert-Equal 7 $nativeFailure.ExitCode 'Native fixture exit code was not captured.'
 
+    $global:LASTEXITCODE = 0
+    $missingExecutablePath = Join-Path $testRoot 'missing-process.exe'
+    try {
+        $missingExecutable = Invoke-CheckedProcess -FilePath $missingExecutablePath -ArgumentList @('argument')
+    }
+    catch {
+        $missingExecutable = [pscustomobject]@{ ExitCode = 0; Text = $_.Exception.Message }
+    }
+    Assert-True ($missingExecutable.ExitCode -ne 0) 'Missing executable launch returned success.'
+    Assert-True ($missingExecutable.Text -match 'Process launch failed') 'Missing executable launch did not report a launch failure.'
+}
+
+function Invoke-AssetTests {
     Assert-True ($null -ne (Get-Command Get-VerifiedAsset -CommandType Function -ErrorAction SilentlyContinue)) 'Get-VerifiedAsset is unavailable.'
-    $assetPath = Join-Path $testRoot 'verified-asset.bin'
+
+    $kitsuneDirectory = Join-Path $testRoot 'kitsune'
+    $corePatchDirectory = Join-Path $testRoot 'corepatch'
+    New-Item -ItemType Directory -Path $kitsuneDirectory | Out-Null
+    New-Item -ItemType Directory -Path $corePatchDirectory | Out-Null
+    $kitsunePath = Join-Path $kitsuneDirectory 'app-release.apk'
+    $corePatchPath = Join-Path $corePatchDirectory 'app-release.apk'
+    [IO.File]::WriteAllText($kitsunePath, 'kitsune fixture')
+    [IO.File]::WriteAllText($corePatchPath, 'corepatch fixture')
+    $kitsuneItem = Get-Item -LiteralPath $kitsunePath
+    $corePatchItem = Get-Item -LiteralPath $corePatchPath
+    $collisionManifest = [pscustomobject]@{
+        dependencies = @(
+            [pscustomobject]@{
+                id = 'kitsune'
+                assetName = 'app-release.apk'
+                size = [long]$kitsuneItem.Length
+                sha256 = (Get-FileHash -LiteralPath $kitsunePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            },
+            [pscustomobject]@{
+                id = 'corepatch'
+                assetName = 'app-release.apk'
+                size = [long]$corePatchItem.Length
+                sha256 = (Get-FileHash -LiteralPath $corePatchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        )
+    }
+    $kitsuneAsset = Get-VerifiedAsset -Manifest $collisionManifest -Id 'kitsune' -CacheRoot $testRoot
+    $corePatchAsset = Get-VerifiedAsset -Manifest $collisionManifest -Id 'corepatch' -CacheRoot $testRoot
+    Assert-Equal 'Success' $kitsuneAsset.Status 'Kitsune namespaced asset was rejected.'
+    Assert-Equal 'Success' $corePatchAsset.Status 'CorePatch namespaced asset was rejected.'
+    Assert-Equal $kitsunePath $kitsuneAsset.Data 'Kitsune namespaced asset path is invalid.'
+    Assert-Equal $corePatchPath $corePatchAsset.Data 'CorePatch namespaced asset path is invalid.'
+
+    $assetDirectory = Join-Path $testRoot 'fixture'
+    New-Item -ItemType Directory -Path $assetDirectory | Out-Null
+    $assetPath = Join-Path $assetDirectory 'verified-asset.bin'
     [IO.File]::WriteAllText($assetPath, 'verified asset fixture')
     $assetItem = Get-Item -LiteralPath $assetPath
     $assetHash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -202,6 +299,13 @@ function Invoke-CommonTests {
     Assert-Equal 'CriticalError' $malformed.Status 'Malformed manifest asset was accepted.'
 }
 
+function Invoke-CommonTests {
+    Assert-True ($null -ne (Get-Command Get-ToolkitLogPath -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitLogPath is unavailable.'
+    $logRoot = Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit\logs'
+    $logPath = Get-ToolkitLogPath
+    Assert-True ($logPath.StartsWith($logRoot, [StringComparison]::OrdinalIgnoreCase)) 'Log path is outside the per-user log directory.'
+}
+
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('mumu-toolkit-tests-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 $exitCode = 0
@@ -209,10 +313,19 @@ try {
     switch ($Suite) {
         'Manifest' {
             Invoke-ManifestTests
-            Invoke-CommonTests
+            Invoke-AssetTests
+        }
+        'Process' {
+            Invoke-ProcessTests
+        }
+        'Result' {
+            Invoke-ResultTests
         }
         'All' {
             Invoke-ManifestTests
+            Invoke-AssetTests
+            Invoke-ResultTests
+            Invoke-ProcessTests
             Invoke-CommonTests
         }
     }
