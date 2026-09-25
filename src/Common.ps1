@@ -57,6 +57,22 @@ function Invoke-WithRetry {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
             $outputs = @(& $Operation)
+            $invalidMessage = if ($outputs.Count -eq 0) {
+                'Operation returned no output.'
+            }
+            elseif ($outputs.Count -gt 1) {
+                "Operation returned $($outputs.Count) output items; expected one toolkit result object."
+            }
+            elseif ($outputs[0] -is [Array]) {
+                'Operation returned one array; expected one toolkit result object.'
+            }
+            elseif ($outputs[0] -is [pscustomobject]) {
+                $propertyCount = @($outputs[0].PSObject.Properties).Count
+                "Operation returned one object with $propertyCount properties; expected exactly Status, Message, and Data."
+            }
+            else {
+                "Operation returned one $($outputs[0].GetType().FullName) value; expected one toolkit result object."
+            }
             if ($outputs.Count -eq 1 -and $outputs[0] -is [pscustomobject]) {
                 $candidate = $outputs[0]
                 $propertyNames = @($candidate.PSObject.Properties | ForEach-Object { $_.Name })
@@ -74,7 +90,7 @@ function Invoke-WithRetry {
                     }
                 }
             }
-            return Get-ToolkitResult -Status 'RecoverableError' -Message 'Operation returned an invalid result.'
+            return Get-ToolkitResult -Status 'RecoverableError' -Message $invalidMessage
         }
         catch {
             $message = Protect-ToolkitText ([string]$_.Exception.Message)

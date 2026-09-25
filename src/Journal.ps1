@@ -7,12 +7,24 @@ function Protect-JournalValue {
     if ($null -eq $Value) {
         return $null
     }
+    if ($Value -is [System.Exception]) {
+        return [pscustomobject]@{
+            Type = $Value.GetType().FullName
+            Message = Protect-ToolkitText $Value.Message
+            Source = Protect-ToolkitText $Value.Source
+            HResult = $Value.HResult
+            Data = Protect-JournalValue $Value.Data
+            InnerException = Protect-JournalValue $Value.InnerException
+            TargetSite = '[OMITTED]'
+        }
+    }
+    if ($Value -is [System.Reflection.MemberInfo]) {
+        return '[OMITTED]'
+    }
     if ($Value -is [scriptblock] -or
         $Value -is [System.IO.Stream] -or
         $Value -is [System.Threading.WaitHandle] -or
-        $Value -is [System.Delegate] -or
-        $Value -is [System.Type] -or
-        $Value -is [System.Reflection.MemberInfo]) {
+        $Value -is [System.Delegate]) {
         throw 'Journal object type is unsupported.'
     }
     if ($Value -is [System.Collections.IDictionary]) {
@@ -241,8 +253,13 @@ function Assert-OperationJournal {
     if ($null -eq $Journal -or $Journal -is [Array] -or $Journal -isnot [pscustomobject]) {
         throw 'Journal object is invalid.'
     }
-    foreach ($propertyName in @('Id', 'StartedAt', 'State', 'Operation', 'Instance', 'Checkpoints', 'Result', 'JournalPath')) {
-        if ($null -eq $Journal.PSObject.Properties[$propertyName]) {
+    $requiredProperties = @('Id', 'StartedAt', 'State', 'Operation', 'Instance', 'Checkpoints', 'Result', 'JournalPath')
+    $actualProperties = @($Journal.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($actualProperties.Count -ne $requiredProperties.Count) {
+        throw 'Journal object is invalid.'
+    }
+    foreach ($propertyName in $requiredProperties) {
+        if ($actualProperties -cnotcontains $propertyName) {
             throw 'Journal object is invalid.'
         }
     }
@@ -252,7 +269,9 @@ function Assert-OperationJournal {
     if ($Journal.State -isnot [string] -or @('Running', 'Completed', 'Failed') -cnotcontains $Journal.State) {
         throw 'Journal state is invalid.'
     }
-    if ($Journal.Operation -isnot [string] -or [string]::IsNullOrWhiteSpace($Journal.Operation)) {
+    if ($Journal.Operation -isnot [string] -or
+        [string]::IsNullOrWhiteSpace($Journal.Operation) -or
+        (Protect-ToolkitText $Journal.Operation) -cne $Journal.Operation) {
         throw 'Journal operation is invalid.'
     }
     if ($Journal.JournalPath -isnot [string] -or
@@ -290,7 +309,7 @@ function Install-OperationJournalFile {
         [string]$JournalPath
     )
 
-    $replacementFailed = $false
+    $replacementFailure = $null
     $backupPath = $null
     try {
         if ([IO.File]::Exists($JournalPath)) {
@@ -303,11 +322,15 @@ function Install-OperationJournalFile {
         }
     }
     catch {
-        $replacementFailed = $true
+        $replacementFailure = $_.Exception
     }
     Remove-OperationJournalTemporaryFile $TemporaryPath
-    if ($replacementFailed) {
-        throw 'Journal atomic replacement failed.'
+    if ($null -ne $replacementFailure) {
+        $failureMessage = Protect-ToolkitText ([string]$replacementFailure.Message)
+        if ([string]::IsNullOrWhiteSpace($failureMessage)) {
+            $failureMessage = 'Unknown replacement failure.'
+        }
+        throw "Journal atomic replacement failed: $failureMessage"
     }
     if ($null -ne $backupPath -and [IO.File]::Exists($backupPath)) {
         try {
@@ -347,8 +370,17 @@ function Write-OperationJournal {
         [IO.File]::WriteAllText($temporaryPath, ($json + [Environment]::NewLine), $utf8)
     }
     catch {
-        Remove-OperationJournalTemporaryFile $temporaryPath
-        throw 'Journal serialization or temporary-file write failed.'
+        $failureMessage = Protect-ToolkitText ([string]$_.Exception.Message)
+        try {
+            Remove-OperationJournalTemporaryFile $temporaryPath
+        }
+        catch {
+            $failureMessage = Protect-ToolkitText ([string]$_.Exception.Message)
+        }
+        if ([string]::IsNullOrWhiteSpace($failureMessage)) {
+            $failureMessage = 'Unknown write failure.'
+        }
+        throw "Journal write failed: $failureMessage"
     }
     Install-OperationJournalFile -TemporaryPath $temporaryPath -JournalPath $journalPath
 }
@@ -365,6 +397,10 @@ function New-OperationJournal {
     if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Operation)) {
         throw 'Journal root and operation are required.'
     }
+    $operationText = Protect-ToolkitText $Operation
+    if ([string]::IsNullOrWhiteSpace($operationText)) {
+        throw 'Journal operation is invalid.'
+    }
     try {
         $rootPath = [IO.Path]::GetFullPath($Root)
     }
@@ -377,7 +413,7 @@ function New-OperationJournal {
         Id = $id
         StartedAt = [DateTime]::UtcNow
         State = 'Running'
-        Operation = $Operation
+        Operation = $operationText
         Instance = Protect-JournalValue $Instance
         Checkpoints = @()
         Result = $null
@@ -576,7 +612,9 @@ function Get-OperationJournal {
     if ($record.Id -isnot [string] -or $record.Id -notmatch '^[a-f0-9]{32}$') {
         throw 'Journal ID is invalid.'
     }
-    if ($record.Operation -isnot [string] -or [string]::IsNullOrWhiteSpace($record.Operation)) {
+    if ($record.Operation -isnot [string] -or
+        [string]::IsNullOrWhiteSpace($record.Operation) -or
+        (Protect-ToolkitText $record.Operation) -cne $record.Operation) {
         throw 'Journal operation is invalid.'
     }
     if ($record.State -isnot [string] -or @('Running', 'Completed', 'Failed') -cnotcontains $record.State) {
