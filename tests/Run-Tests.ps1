@@ -3364,6 +3364,42 @@ function Invoke-AdsTests {
     Assert-Equal 0 @(Get-AdsRestorePointFile -BackupRoot $validRequestBackupRoot).Count 'A refused campaign request created a restore point.'
 }
 
+$script:Root12Codes = @(
+    'ANDROID_VERSION_UNSUPPORTED',
+    'INSTANCE_INVALID',
+    'JOURNAL_INVALID',
+    'JOURNAL_WRITE_FAILED',
+    'MANAGER_UNAVAILABLE',
+    'CACHE_UNAVAILABLE',
+    'ASSET_VERIFICATION_FAILED',
+    'ASSET_PATH_INVALID',
+    'USER_CONFIRMATION_REQUIRED',
+    'CLONE_UNVERIFIED',
+    'CLONE_INVALID',
+    'RESUME_RECORD_INVALID',
+    'RESUME_CLONE_MISSING',
+    'RESUME_CLONE_IDENTITY',
+    'RESUME_CLONE_VERSION',
+    'RESUME_CLONE_CONTAINMENT',
+    'RESUME_CLONE_DISK',
+    'VENDOR_ROOT_ENABLE_FAILED',
+    'VENDOR_ROOT_NOT_ENABLED',
+    'VENDOR_ROOT_SETTING_UNREADABLE',
+    'VENDOR_ROOT_DISABLE_FAILED',
+    'VENDOR_ROOT_NOT_DISABLED',
+    'APK_INSTALL_FAILED',
+    'APK_LAUNCH_FAILED',
+    'BOOT_CONTROL_FAILED',
+    'STOP_TIMEOUT',
+    'BOOT_TIMEOUT',
+    'PACKAGE_MISSING',
+    'PACKAGE_VERSION_MISMATCH',
+    'DAEMON_ABSENT',
+    'DAEMON_DUPLICATE',
+    'ROOT_DENIED',
+    'ADB_FAILED'
+)
+
 function New-Root12InstallFixture {
     param(
         [string]$InstallRoot,
@@ -3455,25 +3491,51 @@ function New-Root12ManagerState {
         SourceIndex = $Install.SourceIndex
         CloneIndex = 5
         CloneName = 'Target clone'
+        CloneExitCode = 0
+        CloneCreatesRecord = $true
+        CloneCreatesDisk = $true
+        CloneVmsPath = ''
+        CloneAndroid = '12.0'
         Calls = @()
         Instances = @(
-            [pscustomobject]@{ Index = 0; Name = 'Base'; IsMain = $true; Running = $false; Android = '12.0' }
-            [pscustomobject]@{ Index = $Install.SourceIndex; Name = 'Target'; IsMain = $false; Running = $true; Android = '12.0' }
+            [pscustomobject]@{ Index = 0; Name = 'Base'; IsMain = $true; Running = $false; Android = '12.0'; VmsPath = '' }
+            [pscustomobject]@{ Index = $Install.SourceIndex; Name = 'Target'; IsMain = $false; Running = $true; Android = '12.0'; VmsPath = '' }
         )
         RootSettings = @{}
         IgnoreRootEnable = $false
         IgnoreRootDisable = $false
-        CloneExitCode = 0
+        RootSettingExitCode = 0
+        RootSettingQueryExitCode = 0
+        RootSettingFailValue = ''
+        RootSettingText = ''
+        AdbFailPattern = ''
+        AdbFailExitCode = 1
+        ControlFailPattern = ''
+        ControlFailExitCode = 1
         ApkInstallExitCode = 0
         InstalledPath = ''
         BootPolls = @{}
         BootReadyPolls = 1
         PackageInstalled = $true
+        PackageName = 'io.github.huskydg.magisk'
+        LaunchCommand = 'shell monkey -p io.github.huskydg.magisk -c android.intent.category.LAUNCHER 1'
         VersionName = '31.0-kitsune'
         VersionCode = '31000'
         DaemonPids = '4242'
         RootAllowed = $true
         RootShellText = 'uid=0(root) gid=0(root) groups=0(root)'
+        JournalLockPath = ''
+        JournalLockPattern = ''
+        JournalLock = $null
+    }
+}
+
+function Release-Root12JournalLock {
+    param([hashtable]$State)
+
+    if ($null -ne $State.JournalLock) {
+        $State.JournalLock.Dispose()
+        $State.JournalLock = $null
     }
 }
 
@@ -3485,6 +3547,11 @@ function New-Root12ManagerRunner {
         $State.Calls += ,@($ActualArgumentList)
         $arguments = @($ActualArgumentList | ForEach-Object { [string]$_ })
         $command = $arguments[0]
+        $commandText = @($arguments) -join ' '
+        if ($null -eq $State.JournalLock -and -not [string]::IsNullOrWhiteSpace([string]$State.JournalLockPath) -and
+            $commandText -like $State.JournalLockPattern) {
+            $State.JournalLock = [IO.File]::Open([string]$State.JournalLockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        }
         if ($command -eq 'info') {
             $requested = $arguments[2]
             $selected = @($State.Instances | Where-Object { $requested -eq 'all' -or [string]$_.Index -ceq $requested })
@@ -3493,17 +3560,24 @@ function New-Root12ManagerRunner {
             }
             $records = @()
             foreach ($selectedInstance in $selected) {
-                $records += [pscustomobject]@{
+                $record = [ordered]@{
                     index = [string]$selectedInstance.Index
                     name = $selectedInstance.Name
                     is_main = [string]$selectedInstance.IsMain
                     is_process_started = [string]$selectedInstance.Running
                     android_version = $selectedInstance.Android
                 }
+                if (-not [string]::IsNullOrWhiteSpace([string]$selectedInstance.VmsPath)) {
+                    $record['vms_path'] = [string]$selectedInstance.VmsPath
+                }
+                $records += [pscustomobject]$record
             }
             return [pscustomobject]@{ ExitCode = 0; Text = (ConvertTo-Json -InputObject @($records) -Depth 4 -Compress) }
         }
         if ($command -eq 'control') {
+            if (-not [string]::IsNullOrWhiteSpace([string]$State.ControlFailPattern) -and $commandText -like $State.ControlFailPattern) {
+                return [pscustomobject]@{ ExitCode = $State.ControlFailExitCode; Text = '{"error_code":1}' }
+            }
             if ($arguments[3] -eq 'shutdown') {
                 foreach ($controlInstance in $State.Instances) {
                     if ([string]$controlInstance.Index -ceq $arguments[2]) {
@@ -3517,15 +3591,24 @@ function New-Root12ManagerRunner {
             if ($State.CloneExitCode -ne 0) {
                 return [pscustomobject]@{ ExitCode = $State.CloneExitCode; Text = '{"error_code":1}' }
             }
-            $cloneRoot = Join-Path $State.VmsPath ([string]$State.CloneIndex)
-            New-Item -ItemType Directory -Path $cloneRoot -Force | Out-Null
-            [IO.File]::WriteAllText((Join-Path $cloneRoot 'system.img'), 'clone disk payload')
-            $State.Instances = @($State.Instances) + [pscustomobject]@{
-                Index = [int]$State.CloneIndex
-                Name = $State.CloneName
-                IsMain = $false
-                Running = $false
-                Android = '12.0'
+            $cloneVmsPath = [string]$State.CloneVmsPath
+            if ([string]::IsNullOrWhiteSpace($cloneVmsPath)) {
+                $cloneVmsPath = [string]$State.VmsPath
+            }
+            if ($State.CloneCreatesRecord) {
+                $cloneRoot = Join-Path $cloneVmsPath ([string]$State.CloneIndex)
+                New-Item -ItemType Directory -Path $cloneRoot -Force | Out-Null
+                if ($State.CloneCreatesDisk) {
+                    [IO.File]::WriteAllText((Join-Path $cloneRoot 'system.img'), 'clone disk payload')
+                }
+                $State.Instances = @($State.Instances) + [pscustomobject]@{
+                    Index = [int]$State.CloneIndex
+                    Name = $State.CloneName
+                    IsMain = $false
+                    Running = $false
+                    Android = [string]$State.CloneAndroid
+                    VmsPath = [string]$State.CloneVmsPath
+                }
             }
             return [pscustomobject]@{ ExitCode = 0; Text = '{"error_code":0}' }
         }
@@ -3534,10 +3617,20 @@ function New-Root12ManagerRunner {
             $valueIndex = [array]::IndexOf($arguments, '-val')
             if ($valueIndex -ge 0) {
                 $requestedValue = $arguments[$valueIndex + 1] -ceq 'true'
+                if ($State.RootSettingExitCode -ne 0 -and
+                    (([string]$State.RootSettingFailValue).Length -eq 0 -or [string]$State.RootSettingFailValue -ceq $arguments[$valueIndex + 1])) {
+                    return [pscustomobject]@{ ExitCode = $State.RootSettingExitCode; Text = '{"error_code":1}' }
+                }
                 $ignored = ($requestedValue -and $State.IgnoreRootEnable) -or ((-not $requestedValue) -and $State.IgnoreRootDisable)
                 if (-not $ignored) {
                     $State.RootSettings[$index] = $requestedValue
                 }
+            }
+            if ($State.RootSettingQueryExitCode -ne 0) {
+                return [pscustomobject]@{ ExitCode = $State.RootSettingQueryExitCode; Text = '{"error_code":1}' }
+            }
+            if (-not [string]::IsNullOrEmpty([string]$State.RootSettingText)) {
+                return [pscustomobject]@{ ExitCode = 0; Text = $State.RootSettingText }
             }
             $current = $false
             if ($State.RootSettings.ContainsKey($index)) {
@@ -3547,12 +3640,18 @@ function New-Root12ManagerRunner {
         }
         if ($command -eq 'adb') {
             $index = $arguments[2]
-            $request = @($arguments[4..($arguments.Count - 1)] -join ' ')
+            $request = [string]$arguments[4]
+            if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbFailPattern) -and $request -like $State.AdbFailPattern) {
+                return [pscustomobject]@{ ExitCode = $State.AdbFailExitCode; Text = 'adb: fixture failure' }
+            }
             if ($request -like 'install *') {
                 if ($State.ApkInstallExitCode -ne 0) {
                     return [pscustomobject]@{ ExitCode = $State.ApkInstallExitCode; Text = 'adb: failed to install' }
                 }
-                $State.InstalledPath = [string]$arguments[6]
+                $State.InstalledCommand = [string]$request
+                if ([string]$request -match '^install -r "(.+)"$') {
+                    $State.InstalledPath = [string]$Matches[1]
+                }
                 return [pscustomobject]@{ ExitCode = 0; Text = 'Success' }
             }
             if ($request -ceq 'shell getprop sys.boot_completed') {
@@ -3567,9 +3666,9 @@ function New-Root12ManagerRunner {
                 }
                 return [pscustomobject]@{ ExitCode = 0; Text = '0' }
             }
-            if ($request -ceq 'shell dumpsys package io.github.huskydg.magisk') {
+            if ($request -ceq ('shell dumpsys package ' + $State.PackageName)) {
                 if (-not $State.PackageInstalled) {
-                    return [pscustomobject]@{ ExitCode = 0; Text = 'Unable to find package: io.github.huskydg.magisk.' }
+                    return [pscustomobject]@{ ExitCode = 0; Text = ('Unable to find package: ' + $State.PackageName + '.') }
                 }
                 return [pscustomobject]@{
                     ExitCode = 0
@@ -3585,6 +3684,9 @@ function New-Root12ManagerRunner {
                 }
                 return [pscustomobject]@{ ExitCode = 0; Text = $State.RootShellText }
             }
+            if ($request -ceq $State.LaunchCommand) {
+                return [pscustomobject]@{ ExitCode = 0; Text = 'Events injected: 1' }
+            }
             return [pscustomobject]@{ ExitCode = 1; Text = 'unsupported adb request' }
         }
         return [pscustomobject]@{ ExitCode = 1; Text = '{"error_code":1}' }
@@ -3599,18 +3701,51 @@ function Invoke-Root12Case {
         [string]$JournalRoot,
         [string]$CacheRoot,
         [bool]$Interactive = $true,
-        [string]$Confirmation = ''
+        [string]$Confirmation = '',
+        [scriptblock]$Prompt = $null,
+        [object]$ResumeClone = $null,
+        [switch]$RequireCachedAsset
     )
 
     $journal = New-Root12Journal -Root $JournalRoot -Instance $Instance
-    $result = Install-Android12Root -Instance $Instance -Manifest $Manifest -Journal $journal `
-        -Interactive $Interactive -Confirmation $Confirmation -CacheRoot $CacheRoot `
-        -Runner (New-Root12ManagerRunner -State $State)
+    $parameters = @{
+        Instance = $Instance
+        Manifest = $Manifest
+        Journal = $journal
+        Interactive = $Interactive
+        Confirmation = $Confirmation
+        CacheRoot = $CacheRoot
+        Runner = (New-Root12ManagerRunner -State $State)
+    }
+    if ($null -ne $Prompt) {
+        $parameters['Prompt'] = $Prompt
+    }
+    if ($null -ne $ResumeClone) {
+        $parameters['ResumeClone'] = $ResumeClone
+    }
+    if ($RequireCachedAsset) {
+        $parameters['RequireCachedAsset'] = $true
+    }
+    $result = Install-Android12Root @parameters
     [pscustomobject]@{
         Result = $result
         Journal = $journal
         State = $State
     }
+}
+
+function New-Root12VerifiedCloneState {
+    param(
+        [object]$Install,
+        [object]$Instance,
+        [object]$Manifest,
+        [string]$JournalRoot,
+        [string]$CacheRoot
+    )
+
+    $state = New-Root12ManagerState -Install $Install
+    $null = Invoke-Root12Case -State $state -Instance $Instance -Manifest $Manifest -JournalRoot $JournalRoot -CacheRoot $CacheRoot -Interactive $true -Prompt { 'decline' }
+    return $state
 }
 
 function Get-Root12CallIndex {
@@ -3637,6 +3772,8 @@ function Assert-Root12Failure {
 
     Assert-Equal 'CriticalError' $Result.Status $Message
     Assert-True ($null -ne $Result.Data) "$Message The failure carried no recovery data."
+    Assert-True ($script:Root12Codes -ccontains [string]$Result.Data.Code) "$Message The failure reported an undocumented code: $($Result.Data.Code)"
+    Assert-True ([string]$Result.Data.Code -cne 'UNKNOWN') "$Message The failure reported an unknown code."
     Assert-Equal $Code $Result.Data.Code "$Message The failure code is invalid."
     Assert-Equal 'Failed' $Journal.State "$Message The failure was not journaled."
     $reopened = Get-OperationJournal -Path $Journal.JournalPath
@@ -3647,7 +3784,7 @@ function Assert-Root12Failure {
 }
 
 function Invoke-Root12Tests {
-    foreach ($commandName in @('Install-Android12Root', 'Get-Android12KitsunePrompt', 'Test-KitsuneConfirmation', 'Test-Android12Root')) {
+    foreach ($commandName in @('Install-Android12Root', 'Get-Android12KitsunePrompt', 'Test-KitsuneConfirmation', 'Test-Android12Root', 'Read-Android12KitsuneConfirmation', 'Prepare-Android12Asset', 'Resolve-Android12Clone', 'Assert-Android12ResumeClone', 'Get-Android12RootSetting', 'Format-Android12InstallCommand')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Android 12 command is unavailable: $commandName"
     }
     Assert-True (Test-Path -LiteralPath $root12ScriptPath -PathType Leaf) 'src/Root12.ps1 does not exist.'
@@ -3655,6 +3792,7 @@ function Invoke-Root12Tests {
     Assert-True ($null -ne (Get-Command 'Save-ToolkitAsset' -CommandType Function -ErrorAction SilentlyContinue)) 'Save-ToolkitAsset is unavailable.'
 
     $root12Source = [IO.File]::ReadAllText($root12ScriptPath)
+    Assert-True ($root12Source -notmatch "'UNKNOWN'") 'The Android 12 source reports an UNKNOWN failure code.'
     foreach ($forbidden in @(
             'Invoke-Expression',
             'ScriptBlock]::Create',
@@ -3665,13 +3803,20 @@ function Invoke-Root12Tests {
             'schtasks',
             'Set-ExecutionPolicy',
             'icacls',
-            'Set-Acl'
+            'Set-Acl',
+            'New-NetFirewallRule',
+            'Set-NetFirewallProfile',
+            'EnableLUA',
+            'Set-MpPreference'
         )) {
         Assert-True ($root12Source -notmatch [regex]::Escape($forbidden)) "Android 12 source uses a forbidden construct: $forbidden"
     }
+    $defaultPrompt = (Get-Command Read-Android12KitsuneConfirmation -CommandType Function).Definition
+    Assert-True ($defaultPrompt -match 'Read-Host') 'The default Kitsune prompt does not read the operator answer.'
 
     $bootAttemptsVariable = Get-Variable -Name 'ToolkitBootPollAttempts' -Scope Script -ErrorAction SilentlyContinue
     $bootDelayVariable = Get-Variable -Name 'ToolkitBootPollDelaySeconds' -Scope Script -ErrorAction SilentlyContinue
+    $defaultPromptVariable = Get-Variable -Name 'ToolkitKitsuneDefaultPrompt' -Scope Script -ErrorAction SilentlyContinue
     $script:ToolkitBootPollAttempts = 2
     $script:ToolkitBootPollDelaySeconds = 0
     try {
@@ -3686,8 +3831,9 @@ function Invoke-Root12Tests {
                 'Select and Patch a File',
                 'direct install into system partition',
                 'Direct Install into system partition ',
+                'Direct Install into system partition;',
+                'Install -> Direct Install into system partition',
                 ' Install -> Direct Install into system partition',
-                'Install -> Direct Install into system partition; Patch a File',
                 '',
                 '   ',
                 'yes'
@@ -3697,6 +3843,15 @@ function Invoke-Root12Tests {
 
         Assert-Equal ([IO.Path]::Combine($env:LOCALAPPDATA, 'mumu-root-hide-toolkit', 'assets')) (Get-ToolkitAssetCacheRoot) 'The asset cache root is not the per-user dependency cache.'
 
+        $installCommand = Format-Android12InstallCommand -Path 'C:\parent dir\app-release.apk'
+        Assert-Equal 'Success' $installCommand.Status 'A spaced asset path was refused.'
+        Assert-Equal 'install -r "C:\parent dir\app-release.apk"' $installCommand.Data 'The install command is not one quoted structured element.'
+        foreach ($unsafePath in @('   ', 'C:\bad"path\app-release.apk', ('C:\bad' + [Environment]::NewLine + 'path\app-release.apk'))) {
+            $unsafeCommand = Format-Android12InstallCommand -Path $unsafePath
+            Assert-Equal 'CriticalError' $unsafeCommand.Status "An unsafe asset path was accepted: $unsafePath"
+            Assert-Equal 'ASSET_PATH_INVALID' $unsafeCommand.Data.Code "An unsafe asset path reported the wrong code: $unsafePath"
+        }
+
         $root12Root = Join-Path $testRoot 'root12 fixtures'
         $assetCacheRoot = Join-Path $root12Root 'asset cache with spaces'
         New-Item -ItemType Directory -Path (Join-Path $assetCacheRoot 'kitsune') -Force | Out-Null
@@ -3705,8 +3860,13 @@ function Invoke-Root12Tests {
         $manifest = New-Root12FixtureManifest -AssetPath $kitsuneAssetPath
         $journalRoot = Join-Path $root12Root 'journals'
         $install = New-Root12InstallFixture -InstallRoot (Join-Path $root12Root 'MuMu Global') -SourceIndex 3
+        $outsideVms = Join-Path $root12Root 'outside vms'
+        New-Item -ItemType Directory -Path $outsideVms -Force | Out-Null
         $android12 = New-Root12InstanceFixture -Install $install -AndroidVersion '12.0'
         $android15 = New-Root12InstanceFixture -Install $install -AndroidVersion '15.0'
+        $blockedCacheFile = Join-Path $root12Root 'blocked cache'
+        [IO.File]::WriteAllText($blockedCacheFile, 'this path is a file')
+        $blockedCacheRoot = Join-Path $blockedCacheFile 'assets'
 
         $android15State = New-Root12ManagerState -Install $install
         $android15Journal = New-Root12Journal -Root $journalRoot -Instance $android15
@@ -3725,6 +3885,137 @@ function Invoke-Root12Tests {
         Assert-Equal 'CriticalError' $unsupportedVersion.Status 'An unsupported Android 11 instance was accepted.'
         Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $unsupportedVersion.Data.Code 'Android 11 was not rejected as an unsupported Android version.'
         Assert-Equal 0 @($unsupportedState.Calls).Count 'An unsupported Android version reached the MuMu manager.'
+
+        $foreignInstall = New-Root12InstallFixture -InstallRoot (Join-Path $root12Root 'Foreign MuMu') -SourceIndex 3
+        $foreignInstance = New-Root12InstanceFixture -Install $install -AndroidVersion '12.0'
+        $foreignInstance.Install.ManagerPath = $foreignInstall.ManagerPath
+        $foreignState = New-Root12ManagerState -Install $install
+        $foreignCase = Invoke-Root12Case -State $foreignState -Instance $foreignInstance `
+            -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $foreignCase.Result -Journal $foreignCase.Journal -Code 'MANAGER_UNAVAILABLE' -Message 'A manager outside its own install root was accepted.'
+        Assert-Equal 0 @($foreignState.Calls).Count 'A manager outside its own install root was executed.'
+
+        $nullInstanceState = New-Root12ManagerState -Install $install
+        $nullInstanceJournal = New-Root12Journal -Root $journalRoot -Instance $android12
+        $nullInstance = Install-Android12Root -Instance $null -Manifest $manifest -Journal $nullInstanceJournal `
+            -Interactive $false -CacheRoot $assetCacheRoot -Runner (New-Root12ManagerRunner -State $nullInstanceState)
+        Assert-Root12Failure -Result $nullInstance -Journal $nullInstanceJournal -Code 'INSTANCE_INVALID' -Message 'A missing instance was accepted.'
+        Assert-Equal 0 @($nullInstanceState.Calls).Count 'A missing instance reached the MuMu manager.'
+
+        $missingJournalState = New-Root12ManagerState -Install $install
+        $missingJournal = Install-Android12Root -Instance $android12 -Manifest $manifest -Journal $null `
+            -Interactive $false -CacheRoot $assetCacheRoot -Runner (New-Root12ManagerRunner -State $missingJournalState)
+        Assert-Equal 'CriticalError' $missingJournal.Status 'A missing journal was accepted.'
+        Assert-Equal 'JOURNAL_INVALID' $missingJournal.Data.Code 'A missing journal was not rejected as an invalid journal.'
+        Assert-Equal 0 @($missingJournalState.Calls).Count 'A missing journal reached the MuMu manager.'
+
+        $invalidJournalState = New-Root12ManagerState -Install $install
+        $invalidJournal = New-Root12Journal -Root $journalRoot -Instance $android12
+        $invalidJournal | Add-Member -NotePropertyName Extra -NotePropertyValue 'invalid'
+        $rejectedJournal = Install-Android12Root -Instance $android12 -Manifest $manifest -Journal $invalidJournal `
+            -Interactive $false -CacheRoot $assetCacheRoot -Runner (New-Root12ManagerRunner -State $invalidJournalState)
+        Assert-Equal 'CriticalError' $rejectedJournal.Status 'An invalid journal was accepted.'
+        Assert-Equal 'JOURNAL_INVALID' $rejectedJournal.Data.Code 'An invalid journal was not rejected as an invalid journal.'
+        Assert-Equal 0 @($invalidJournalState.Calls).Count 'An invalid journal reached the MuMu manager.'
+
+        $blockedCacheState = New-Root12ManagerState -Install $install
+        $blockedCacheJournal = New-Root12Journal -Root $journalRoot -Instance $android12
+        $blockedCache = Install-Android12Root -Instance $android12 -Manifest $manifest -Journal $blockedCacheJournal `
+            -Interactive $true -Confirmation 'Direct Install into system partition' -CacheRoot $blockedCacheRoot `
+            -Runner (New-Root12ManagerRunner -State $blockedCacheState)
+        Assert-Equal 'CriticalError' $blockedCache.Status 'An unusable dependency cache root was accepted.'
+        Assert-Equal 'CACHE_UNAVAILABLE' $blockedCache.Data.Code 'An unusable dependency cache root reported the wrong code.'
+        Assert-Equal 0 @($blockedCacheState.Calls).Count 'An unusable dependency cache root reached the MuMu manager.'
+
+        $tamperedManifest = New-Root12FixtureManifest -AssetPath $kitsuneAssetPath -Sha256 ('0' * 64)
+        foreach ($unverified in @(
+                [pscustomobject]@{ Manifest = $tamperedManifest; Label = 'wrong hash' },
+                [pscustomobject]@{ Manifest = (New-Root12FixtureManifest -AssetPath $kitsuneAssetPath -Size 12574128L); Label = 'wrong size' },
+                [pscustomobject]@{ Manifest = (New-Root12FixtureManifest -AssetPath $kitsuneAssetPath -OmitSha256); Label = 'missing hash' }
+            )) {
+            $unverifiedState = New-Root12ManagerState -Install $install
+            $unverifiedCase = Invoke-Root12Case -State $unverifiedState -Instance $android12 -Manifest $unverified.Manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Root12Failure -Result $unverifiedCase.Result -Journal $unverifiedCase.Journal -Code 'ASSET_VERIFICATION_FAILED' -Message "An unverified Kitsune asset was accepted: $($unverified.Label)."
+            Assert-Equal 0 @($unverifiedState.Calls).Count "An unverified Kitsune asset reached the MuMu manager: $($unverified.Label)."
+        }
+
+        $nonInteractiveState = New-Root12ManagerState -Install $install
+        $nonInteractiveCase = Invoke-Root12Case -State $nonInteractiveState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $false
+        Assert-Root12Failure -Result $nonInteractiveCase.Result -Journal $nonInteractiveCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A non-interactive request did not require operator confirmation.'
+        Assert-True ($nonInteractiveCase.Result.Message -match 'USER_CONFIRMATION_REQUIRED') 'The non-interactive failure did not report USER_CONFIRMATION_REQUIRED.'
+        Assert-Equal 0 @($nonInteractiveState.Calls).Count 'A non-interactive request mutated the instance.'
+
+        $decliningState = New-Root12ManagerState -Install $install
+        $decliningCase = Invoke-Root12Case -State $decliningState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { 'no' }
+        Assert-Root12Failure -Result $decliningCase.Result -Journal $decliningCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A declined Kitsune confirmation was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern 'control*-v*launch*') 'A declined confirmation cold-booted the instance.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*getprop sys.boot_completed*') 'A declined confirmation waited for the boot.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*pidof magiskd*') 'A declined confirmation verified the root daemon.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*root_permission*-val*false*') 'A declined confirmation disabled the vendor root.'
+        Assert-Equal $decliningState.CloneIndex $decliningCase.Result.Data.CloneIndex 'A declined confirmation did not report the recoverable clone.'
+        $decliningJournal = Get-OperationJournal -Path $decliningCase.Journal.JournalPath
+        $decliningText = ([string](@($decliningJournal.Checkpoints) | ForEach-Object { $_.Message }) -join ' ')
+        Assert-True ($decliningText -match 'Direct Install into system partition') 'A declined confirmation did not journal the exact Kitsune instruction.'
+        Assert-True ($decliningText -match 'Select and Patch a File') 'A declined confirmation did not journal the rejected Kitsune alternatives.'
+
+        $interruptedState = New-Root12ManagerState -Install $install
+        $interruptedCase = Invoke-Root12Case -State $interruptedState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { '   ' }
+        Assert-Root12Failure -Result $interruptedCase.Result -Journal $interruptedCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'An interrupted Kitsune confirmation was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $interruptedState.Calls -Pattern '*pidof magiskd*') 'An interrupted confirmation verified the root daemon.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $interruptedState.Calls -Pattern '*root_permission*-val*false*') 'An interrupted confirmation disabled the vendor root.'
+
+        $throwingState = New-Root12ManagerState -Install $install
+        $throwingCase = Invoke-Root12Case -State $throwingState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { throw 'console unavailable' }
+        Assert-Root12Failure -Result $throwingCase.Result -Journal $throwingCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'An unavailable console prompt was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $throwingState.Calls -Pattern '*pidof magiskd*') 'An unavailable console prompt verified the root daemon.'
+
+        $ordinaryState = New-Root12ManagerState -Install $install
+        $ordinaryCase = Invoke-Root12Case -State $ordinaryState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install'
+        Assert-Root12Failure -Result $ordinaryCase.Result -Journal $ordinaryCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'An ordinary Direct Install confirmation was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $ordinaryState.Calls -Pattern 'control*-v*launch*') 'An ordinary Direct Install confirmation cold-booted the instance.'
+
+        $promptState = @{ Text = ''; Calls = 0 }
+        $answeringPrompt = {
+            param($PromptText)
+            $promptState.Text = [string]$PromptText
+            $promptState.Calls++
+            'Direct Install into system partition'
+        }.GetNewClosure()
+        $promptedState = New-Root12ManagerState -Install $install
+        $promptedCase = Invoke-Root12Case -State $promptedState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt $answeringPrompt
+        Assert-Equal 'Success' $promptedCase.Result.Status "An interactive Kitsune run could not be completed by the operator. $($promptedCase.Result.Message)"
+        Assert-Equal 1 $promptState.Calls 'The operator was not asked exactly once for the Kitsune confirmation.'
+        Assert-True ($promptState.Text -match 'Install -> Direct Install into system partition') 'The prompt did not show the exact Kitsune instruction.'
+        Assert-True ($promptState.Text -match 'Select and Patch a File') 'The prompt did not warn about the rejected Kitsune options.'
+        Assert-Equal $true $promptedCase.Result.Data.RootVerified 'A prompted Kitsune run did not verify the root shell.'
+
+        $defaultPromptState = @{ Text = ''; Calls = 0 }
+        $script:ToolkitKitsuneDefaultPrompt = {
+            param($PromptText)
+            $defaultPromptState.Text = [string]$PromptText
+            $defaultPromptState.Calls++
+            'Direct Install into system partition'
+        }
+        try {
+            $defaultPromptedState = New-Root12ManagerState -Install $install
+            $defaultPromptedCase = Invoke-Root12Case -State $defaultPromptedState -Instance $android12 -Manifest $manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true
+            Assert-Equal 'Success' $defaultPromptedCase.Result.Status 'The default operator prompt did not complete the workflow.'
+            Assert-Equal 1 $defaultPromptState.Calls 'The default operator prompt was not used.'
+            Assert-True ($defaultPromptState.Text -match 'Install -> Direct Install into system partition') 'The default prompt did not show the exact Kitsune instruction.'
+        }
+        finally {
+            if ($null -ne $defaultPromptVariable) {
+                $script:ToolkitKitsuneDefaultPrompt = $defaultPromptVariable.Value
+            }
+        }
 
         $confirmedState = New-Root12ManagerState -Install $install
         $confirmedCase = Invoke-Root12Case -State $confirmedState -Instance $android12 -Manifest $manifest `
@@ -3745,81 +4036,138 @@ function Invoke-Root12Tests {
         Assert-Equal $kitsuneAssetPath $confirmedState.InstalledPath 'The verified asset was not the APK that was installed.'
         Assert-Equal $false $confirmedState.RootSettings[[string]$confirmedState.CloneIndex] 'The temporary vendor root was not disabled after verification.'
         $daemonCall = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern '*pidof magiskd*'
-        $disableCall = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern '*root_permission*-val*false*'
         $rootCall = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern '*su -c id*'
+        $disableCall = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern '*root_permission*-val*false*'
         Assert-True ($daemonCall -ge 0) 'The confirmed workflow did not query the root daemon.'
         Assert-True ($rootCall -ge 0) 'The confirmed workflow did not verify the root shell.'
         Assert-True ($disableCall -gt $rootCall) 'The temporary vendor root was disabled before root verification completed.'
-        $installCalls = @($confirmedState.Calls | Where-Object { @($_)[0] -ceq 'adb' -and @($_)[4] -ceq 'install' })
-        Assert-Equal 1 $installCalls.Count 'The verified APK was not installed through one structured ADB request.'
-        $installArguments = [string[]]@($installCalls[0])
-        Assert-Equal 'adb' $installArguments[0] 'The APK install request is not an ADB request.'
-        Assert-Equal ([string]$confirmedState.CloneIndex) $installArguments[2] 'The APK was not installed on the clone.'
-        Assert-Equal '-c' $installArguments[3] 'The APK install request lost its ADB command flag.'
-        Assert-Equal 'install' $installArguments[4] 'The APK install request is not an install request.'
-        Assert-Equal '-r' $installArguments[5] 'The APK install request is not a replace request.'
-        Assert-Equal $kitsuneAssetPath $installArguments[6] 'The verified APK path was changed or interpolated into the ADB request.'
-        Assert-True ((@($installArguments) -join ' ') -notmatch '"') 'The ADB request was quoted into a shell string.'
         foreach ($sourceCall in $confirmedState.Calls) {
             $sourceArguments = @($sourceCall)
             if ($sourceArguments[0] -ceq 'setting' -or $sourceArguments[0] -ceq 'adb') {
-                Assert-True ([string]$sourceArguments[2] -cne [string]$install.SourceIndex) 'The selected source instance was mutated instead of the clone.'
+                Assert-True ([string]$sourceArguments[2] -cne [string]$install.SourceIndex) 'A setting or ADB request reconfigured the selected source instance instead of the clone.'
             }
         }
-        $pauseJournal = Get-OperationJournal -Path $confirmedCase.Journal.JournalPath
-        $pauseText = ([string](@($pauseJournal.Checkpoints) | ForEach-Object { $_.Message }) -join ' ')
-        Assert-True ($pauseText -match 'Direct Install into system partition') 'The journal did not record the exact Kitsune system-partition instruction.'
-        Assert-True ($pauseText -match 'Select and Patch a File') 'The journal did not record the rejected Kitsune alternatives.'
+        $expectedInstallCommand = 'install -r "' + $kitsuneAssetPath + '"'
+        $installCalls = @($confirmedState.Calls | Where-Object { @($_)[0] -ceq 'adb' -and @($_)[4] -ceq $expectedInstallCommand })
+        Assert-Equal 1 $installCalls.Count 'The verified APK was not installed as one quoted structured ADB command element.'
+        $installArguments = [string[]]@($installCalls[0])
+        Assert-Equal 5 $installArguments.Count 'The APK install request carried an unexpected argument count.'
+        Assert-Equal 'adb' $installArguments[0] 'The APK install request is not an ADB request.'
+        Assert-Equal ([string]$confirmedState.CloneIndex) $installArguments[2] 'The APK was not installed on the clone.'
+        Assert-Equal '-c' $installArguments[3] 'The APK install request lost its ADB command flag.'
+        Assert-Equal $expectedInstallCommand $installArguments[4] 'The APK install command element is not one quoted install command.'
+        $launchCalls = @($confirmedState.Calls | Where-Object { @($_)[0] -ceq 'adb' -and @($_)[4] -ceq $confirmedState.LaunchCommand })
+        Assert-Equal 1 $launchCalls.Count 'The installed Kitsune APK was not launched through a structured ADB command.'
+        Assert-True ((@($launchCalls[0]) -join ' ') -match 'io\.github\.huskydg\.magisk') 'The Kitsune launch was not targeted at the Kitsune package.'
+        $installCallIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern ('*' + $expectedInstallCommand + '*')
+        $launchCallIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern ('*' + $confirmedState.LaunchCommand + '*')
+        $bootCallIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern 'control*-v*launch*'
+        Assert-True ($installCallIndex -lt $launchCallIndex) 'The Kitsune APK was launched before it was installed.'
+        Assert-True ($launchCallIndex -lt $bootCallIndex) 'The Kitsune APK was launched after the confirmation gate.'
 
-        $ordinaryState = New-Root12ManagerState -Install $install
-        $ordinaryCase = Invoke-Root12Case -State $ordinaryState -Instance $android12 -Manifest $manifest `
-            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install'
-        Assert-Root12Failure -Result $ordinaryCase.Result -Journal $ordinaryCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'An ordinary Direct Install confirmation was accepted.'
-        Assert-True ($ordinaryCase.Result.Message -match 'USER_CONFIRMATION_REQUIRED') 'The rejected ordinary confirmation did not report USER_CONFIRMATION_REQUIRED.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $ordinaryState.Calls -Pattern '*getprop sys.boot_completed*') 'A rejected ordinary confirmation cold-booted the instance.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $ordinaryState.Calls -Pattern '*pidof magiskd*') 'A rejected ordinary confirmation verified the root daemon.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $ordinaryState.Calls -Pattern '*root_permission*-val*false*') 'A rejected ordinary confirmation disabled the vendor root.'
-        Assert-Equal $ordinaryState.CloneIndex $ordinaryCase.Result.Data.CloneIndex 'The rejected confirmation did not report the recoverable clone.'
+        $launchFailureState = New-Root12ManagerState -Install $install
+        $launchFailureState.AdbFailPattern = '*monkey*'
+        $launchPromptState = @{ Calls = 0 }
+        $launchFailurePrompt = { param($PromptText) $launchPromptState.Calls++; 'Direct Install into system partition' }.GetNewClosure()
+        $launchFailureCase = Invoke-Root12Case -State $launchFailureState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt $launchFailurePrompt
+        Assert-Root12Failure -Result $launchFailureCase.Result -Journal $launchFailureCase.Journal -Code 'APK_LAUNCH_FAILED' -Message 'A failed Kitsune launch was accepted.'
+        Assert-Equal 0 $launchPromptState.Calls 'A failed Kitsune launch still asked the operator to confirm.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $launchFailureState.Calls -Pattern 'control*-v*launch*') 'A failed Kitsune launch cold-booted the instance.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $launchFailureState.Calls -Pattern '*root_permission*-val*false*') 'A failed Kitsune launch disabled the vendor root.'
 
-        $interruptedState = New-Root12ManagerState -Install $install
-        $interruptedCase = Invoke-Root12Case -State $interruptedState -Instance $android12 -Manifest $manifest `
-            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true
-        Assert-Root12Failure -Result $interruptedCase.Result -Journal $interruptedCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A missing confirmation was accepted.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $interruptedState.Calls -Pattern '*launch*') 'A missing confirmation launched the instance.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $interruptedState.Calls -Pattern '*pidof magiskd*') 'A missing confirmation verified the root daemon.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $interruptedState.Calls -Pattern '*root_permission*-val*false*') 'A missing confirmation disabled the vendor root.'
-        Assert-Equal $true $interruptedState.RootSettings[[string]$interruptedState.CloneIndex] 'A missing confirmation did not leave the documented recovery state.'
-        $interruptedReopened = Get-OperationJournal -Path $interruptedCase.Journal.JournalPath
-        $interruptedText = ([string](@($interruptedReopened.Checkpoints) | ForEach-Object { $_.Message }) -join ' ')
-        Assert-True ($interruptedText -match 'Direct Install into system partition') 'The interrupted workflow did not journal the exact Kitsune instruction.'
+        $resumeState = New-Root12VerifiedCloneState -Install $install -Instance $android12 -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot
+        $declinedRecord = [pscustomobject]@{ CloneIndex = $resumeState.CloneIndex; CloneName = $resumeState.CloneName; SourceIndex = $install.SourceIndex }
+        $resumedCase = Invoke-Root12Case -State $resumeState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition' -ResumeClone $declinedRecord
+        Assert-Equal 'Success' $resumedCase.Result.Status "A resume of the recorded clone did not complete. $($resumedCase.Result.Message)"
+        Assert-Equal $resumeState.CloneIndex $resumedCase.Result.Data.CloneIndex 'The resume reported the wrong clone.'
+        Assert-Equal 1 @($resumeState.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'The resume created a second clone.'
+        $resumeJournal = Get-OperationJournal -Path $resumedCase.Journal.JournalPath
+        $resumeText = ([string](@($resumeJournal.Checkpoints) | ForEach-Object { $_.Message }) -join ' ')
+        Assert-True ($resumeText -match 'resumed') 'The resume was not recorded in the journal.'
 
-        $nonInteractiveState = New-Root12ManagerState -Install $install
-        $nonInteractiveCase = Invoke-Root12Case -State $nonInteractiveState -Instance $android12 -Manifest $manifest `
-            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $false
-        Assert-Root12Failure -Result $nonInteractiveCase.Result -Journal $nonInteractiveCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A non-interactive request did not require operator confirmation.'
-        Assert-True ($nonInteractiveCase.Result.Message -match 'USER_CONFIRMATION_REQUIRED') 'The non-interactive failure did not report USER_CONFIRMATION_REQUIRED.'
-        Assert-Equal 0 @($nonInteractiveState.Calls).Count 'A non-interactive request mutated the instance.'
+        $resumeFailureState = New-Root12VerifiedCloneState -Install $install -Instance $android12 -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot
+        $resumeFailureState.BootReadyPolls = 99
+        $resumeFailureCase = Invoke-Root12Case -State $resumeFailureState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition' `
+            -ResumeClone ([pscustomobject]@{ CloneIndex = $resumeFailureState.CloneIndex })
+        Assert-Root12Failure -Result $resumeFailureCase.Result -Journal $resumeFailureCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A failed resume did not report a structured failure.'
+        Assert-Equal $resumeFailureState.CloneIndex $resumeFailureCase.Result.Data.CloneIndex 'A failed resume did not report the recoverable clone.'
+        Assert-Equal 1 @($resumeFailureState.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'A failed resume created a second clone.'
 
-        $tamperedManifest = New-Root12FixtureManifest -AssetPath $kitsuneAssetPath -Sha256 ('0' * 64)
-        $tamperedState = New-Root12ManagerState -Install $install
-        $tamperedCase = Invoke-Root12Case -State $tamperedState -Instance $android12 -Manifest $tamperedManifest `
-            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
-        Assert-Root12Failure -Result $tamperedCase.Result -Journal $tamperedCase.Journal -Code 'ASSET_VERIFICATION_FAILED' -Message 'An unverified Kitsune hash was accepted.'
-        Assert-Equal 0 @($tamperedState.Calls).Count 'An unverified Kitsune asset reached the MuMu manager.'
+        $emptyState = New-Root12ManagerState -Install $install
+        $missingCloneCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+            -Record ([pscustomobject]@{ CloneIndex = $emptyState.CloneIndex }) -Runner (New-Root12ManagerRunner -State $emptyState)
+        Assert-Equal 'CriticalError' $missingCloneCheck.Status 'A resume against a missing clone was accepted.'
+        Assert-Equal 'RESUME_CLONE_MISSING' $missingCloneCheck.Data.Code 'A resume against a missing clone reported the wrong code.'
 
-        $oversizeManifest = New-Root12FixtureManifest -AssetPath $kitsuneAssetPath -Size 12574128L
-        $oversizeState = New-Root12ManagerState -Install $install
-        $oversizeCase = Invoke-Root12Case -State $oversizeState -Instance $android12 -Manifest $oversizeManifest `
-            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
-        Assert-Root12Failure -Result $oversizeCase.Result -Journal $oversizeCase.Journal -Code 'ASSET_VERIFICATION_FAILED' -Message 'An unverified Kitsune size was accepted.'
-        Assert-Equal 0 @($oversizeState.Calls).Count 'An unverified Kitsune asset reached the MuMu manager.'
+        foreach ($invalidRecord in @(
+                [pscustomobject]@{ Record = 'invalid'; Label = 'string' },
+                [pscustomobject]@{ Record = @([pscustomobject]@{ CloneIndex = 5 }); Label = 'array' },
+                [pscustomobject]@{ Record = ([pscustomobject]@{ CloneIndex = 'abc' }); Label = 'non-numeric index' },
+                [pscustomobject]@{ Record = ([pscustomobject]@{ CloneIndex = -1 }); Label = 'negative index' },
+                [pscustomobject]@{ Record = ([pscustomobject]@{ CloneIndex = $null }); Label = 'missing index' },
+                [pscustomobject]@{ Record = ([pscustomobject]@{ CloneIndex = 5; CloneName = '   ' }); Label = 'blank name' }
+            )) {
+            $invalidRecordState = New-Root12ManagerState -Install $install
+            $invalidRecordCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+                -Record $invalidRecord.Record -Runner (New-Root12ManagerRunner -State $invalidRecordState)
+            Assert-Equal 'CriticalError' $invalidRecordCheck.Status "An invalid resume record was accepted: $($invalidRecord.Label)"
+            Assert-Equal 'RESUME_RECORD_INVALID' $invalidRecordCheck.Data.Code "An invalid resume record reported the wrong code: $($invalidRecord.Label)"
+            Assert-Equal 0 @($invalidRecordState.Calls).Count "An invalid resume record reached the MuMu manager: $($invalidRecord.Label)"
+        }
 
-        $missingHashManifest = New-Root12FixtureManifest -AssetPath $kitsuneAssetPath -OmitSha256
-        $missingHashState = New-Root12ManagerState -Install $install
-        $missingHashCase = Invoke-Root12Case -State $missingHashState -Instance $android12 -Manifest $missingHashManifest `
-            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
-        Assert-Root12Failure -Result $missingHashCase.Result -Journal $missingHashCase.Journal -Code 'ASSET_VERIFICATION_FAILED' -Message 'A manifest without a Kitsune hash was accepted.'
-        Assert-Equal 0 @($missingHashState.Calls).Count 'A manifest without a Kitsune hash reached the MuMu manager.'
+        foreach ($resumeDefect in @('identity', 'version', 'containment', 'disk', 'base')) {
+            $defectState = New-Root12VerifiedCloneState -Install $install -Instance $android12 -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot
+            $defectRecord = @($defectState.Instances | Where-Object { $_.Index -eq $defectState.CloneIndex })[0]
+            $expectedName = $defectState.CloneName
+            switch ($resumeDefect) {
+                'identity' { $expectedName = 'Some other clone' }
+                'version' { $defectRecord.Android = '15.0' }
+                'containment' { $defectRecord.VmsPath = $outsideVms }
+                'disk' { [IO.File]::Delete((Join-Path (Join-Path $install.VmsPath ([string]$defectState.CloneIndex)) 'system.img')) }
+                'base' { $defectRecord.IsMain = $true }
+            }
+            $defectCode = switch ($resumeDefect) {
+                'identity' { 'RESUME_CLONE_IDENTITY' }
+                'version' { 'RESUME_CLONE_VERSION' }
+                'containment' { 'RESUME_CLONE_CONTAINMENT' }
+                'disk' { 'RESUME_CLONE_DISK' }
+                'base' { 'RESUME_CLONE_IDENTITY' }
+            }
+            $defectCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+                -Record ([pscustomobject]@{ CloneIndex = $defectState.CloneIndex; CloneName = $expectedName }) `
+                -Runner (New-Root12ManagerRunner -State $defectState)
+            Assert-Equal 'CriticalError' $defectCheck.Status "A defective clone was accepted for resume: $resumeDefect"
+            Assert-Equal $defectCode $defectCheck.Data.Code "A defective clone reported the wrong resume code: $resumeDefect"
+        }
+
+        $brokenResumeState = New-Root12VerifiedCloneState -Install $install -Instance $android12 -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot
+        $brokenCloneRecord = @($brokenResumeState.Instances | Where-Object { $_.Index -eq $brokenResumeState.CloneIndex })[0]
+        $brokenCloneRecord.Name = 'Some other clone'
+        $brokenCallsBefore = @($brokenResumeState.Calls).Count
+        $brokenResumeCase = Invoke-Root12Case -State $brokenResumeState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition' `
+            -ResumeClone ([pscustomobject]@{ CloneIndex = $brokenResumeState.CloneIndex; CloneName = $brokenResumeState.CloneName })
+        $brokenResumeCalls = @(@($brokenResumeState.Calls)[$brokenCallsBefore..(@($brokenResumeState.Calls).Count - 1)])
+        Assert-Root12Failure -Result $brokenResumeCase.Result -Journal $brokenResumeCase.Journal -Code 'RESUME_CLONE_IDENTITY' -Message 'A resume against a clone that no longer matches its recorded identity was accepted.'
+        Assert-Equal 0 (@($brokenResumeCalls | Where-Object { @($_)[0] -ceq 'setting' -or @($_)[0] -ceq 'adb' }).Count) 'A resume against a defective clone still reconfigured the clone.'
+        Assert-Equal 0 (@($brokenResumeCalls | Where-Object { @($_)[0] -ceq 'control' }).Count) 'A resume against a defective clone still controlled the instance.'
+        Assert-Equal 1 @($brokenResumeState.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'A resume against a defective clone created a second clone.'
+
+        $nullCloneResult = Resolve-Android12Clone -CloneResult (Get-ToolkitResult -Status 'Success' -Message 'clone' -Data $null) -Journal (New-Root12Journal -Root $journalRoot -Instance $android12)
+        Assert-Equal 'CriticalError' $nullCloneResult.Status 'A successful clone result without data was accepted as a root result.'
+        Assert-Equal 'CLONE_UNVERIFIED' $nullCloneResult.Data.Code 'A successful clone result without data reported the wrong code.'
+        foreach ($invalidClone in @(
+                [pscustomobject]@{ Data = @{ CloneIndex = 'abc' }; Label = 'non-numeric index' },
+                [pscustomobject]@{ Data = @{ CloneIndex = -1 }; Label = 'negative index' },
+                [pscustomobject]@{ Data = @{ CloneIndex = 5; CloneName = '   ' }; Label = 'blank name' }
+            )) {
+            $invalidCloneResult = Resolve-Android12Clone -CloneResult (Get-ToolkitResult -Status 'Success' -Message 'clone' -Data $invalidClone.Data) -Journal (New-Root12Journal -Root $journalRoot -Instance $android12)
+            Assert-Equal 'CriticalError' $invalidCloneResult.Status "An invalid clone result was accepted: $($invalidClone.Label)"
+            Assert-Equal 'CLONE_INVALID' $invalidCloneResult.Data.Code "An invalid clone result reported the wrong code: $($invalidClone.Label)"
+        }
 
         $cloneState = New-Root12ManagerState -Install $install
         $cloneState.CloneExitCode = 3
@@ -3830,15 +4178,6 @@ function Invoke-Root12Tests {
         Assert-Equal 'Failed' $cloneCase.Journal.State 'A failed instance clone was not journaled.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $cloneState.Calls -Pattern '*adb*') 'A failed instance clone reached the instance.'
 
-        $foreignInstall = New-Root12InstallFixture -InstallRoot (Join-Path $root12Root 'Foreign MuMu') -SourceIndex 3
-        $foreignInstance = New-Root12InstanceFixture -Install $install -AndroidVersion '12.0'
-        $foreignInstance.Install.ManagerPath = $foreignInstall.ManagerPath
-        $foreignState = New-Root12ManagerState -Install $install
-        $foreignCase = Invoke-Root12Case -State $foreignState -Instance $foreignInstance `
-            -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
-        Assert-Root12Failure -Result $foreignCase.Result -Journal $foreignCase.Journal -Code 'MANAGER_UNAVAILABLE' -Message 'A manager outside its own install root was accepted.'
-        Assert-Equal 0 @($foreignState.Calls).Count 'A manager outside its own install root was executed.'
-
         $bootTimeoutState = New-Root12ManagerState -Install $install
         $bootTimeoutState.BootReadyPolls = 99
         $bootTimeoutCase = Invoke-Root12Case -State $bootTimeoutState -Instance $android12 -Manifest $manifest `
@@ -3846,8 +4185,23 @@ function Invoke-Root12Tests {
         Assert-Root12Failure -Result $bootTimeoutCase.Result -Journal $bootTimeoutCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A boot timeout was accepted.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $bootTimeoutState.Calls -Pattern '*pidof magiskd*') 'A boot timeout still verified the root daemon.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $bootTimeoutState.Calls -Pattern '*root_permission*-val*false*') 'A boot timeout disabled the temporary vendor root.'
-        Assert-Equal $true $bootTimeoutState.RootSettings[[string]$bootTimeoutState.CloneIndex] 'A boot timeout did not leave the documented recovery state.'
         Assert-Equal $bootTimeoutState.CloneIndex $bootTimeoutCase.Result.Data.CloneIndex 'A boot timeout did not report the recoverable clone.'
+
+        $bootControlState = New-Root12ManagerState -Install $install
+        $bootControlState.ControlFailPattern = '*launch*'
+        $bootControlCase = Invoke-Root12Case -State $bootControlState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $bootControlCase.Result -Journal $bootControlCase.Journal -Code 'BOOT_CONTROL_FAILED' -Message 'A failed cold-boot launch was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $bootControlState.Calls -Pattern '*getprop sys.boot_completed*') 'A failed cold-boot launch still waited for the boot.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $bootControlState.Calls -Pattern '*root_permission*-val*false*') 'A failed cold-boot launch disabled the temporary vendor root.'
+
+        $stopControlState = New-Root12ManagerState -Install $install
+        $stopControlState.Instances[1].Running = $false
+        $stopControlState.ControlFailPattern = '*shutdown*'
+        $stopControlCase = Invoke-Root12Case -State $stopControlState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $stopControlCase.Result -Journal $stopControlCase.Journal -Code 'BOOT_CONTROL_FAILED' -Message 'A failed cold-boot shutdown was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $stopControlState.Calls -Pattern '*getprop sys.boot_completed*') 'A failed cold-boot shutdown still waited for the boot.'
 
         $missingPackageState = New-Root12ManagerState -Install $install
         $missingPackageState.PackageInstalled = $false
@@ -3900,11 +4254,30 @@ function Invoke-Root12Tests {
             Assert-Equal -1 (Get-Root12CallIndex -Calls $rootDeniedState.Calls -Pattern '*root_permission*-val*false*') "A root shell without root identity disabled the temporary vendor root: $($rootCase.Label)."
         }
 
+        foreach ($adbCase in @(
+                [pscustomobject]@{ Pattern = '*dumpsys*'; Label = 'package query' },
+                [pscustomobject]@{ Pattern = '*pidof*'; Label = 'daemon query' }
+            )) {
+            $adbState = New-Root12ManagerState -Install $install
+            $adbState.AdbFailPattern = $adbCase.Pattern
+            $adbFailure = Invoke-Root12Case -State $adbState -Instance $android12 -Manifest $manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Root12Failure -Result $adbFailure.Result -Journal $adbFailure.Journal -Code 'ADB_FAILED' -Message "A failed $($adbCase.Label) was accepted."
+            Assert-Equal -1 (Get-Root12CallIndex -Calls $adbState.Calls -Pattern '*root_permission*-val*false*') "A failed $($adbCase.Label) disabled the temporary vendor root."
+        }
+
+        $bootAdbState = New-Root12ManagerState -Install $install
+        $bootAdbState.AdbFailPattern = '*getprop*'
+        $bootAdbCase = Invoke-Root12Case -State $bootAdbState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $bootAdbCase.Result -Journal $bootAdbCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A failed boot readiness query was accepted.'
+
         $apkFailureState = New-Root12ManagerState -Install $install
         $apkFailureState.ApkInstallExitCode = 1
         $apkFailureCase = Invoke-Root12Case -State $apkFailureState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
         Assert-Root12Failure -Result $apkFailureCase.Result -Journal $apkFailureCase.Journal -Code 'APK_INSTALL_FAILED' -Message 'A failed APK install was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $apkFailureState.Calls -Pattern '*monkey*') 'A failed APK install still launched the Kitsune app.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $apkFailureState.Calls -Pattern '*pidof magiskd*') 'A failed APK install still verified the root daemon.'
 
         $ignoredEnableState = New-Root12ManagerState -Install $install
@@ -3912,7 +4285,7 @@ function Invoke-Root12Tests {
         $ignoredEnableCase = Invoke-Root12Case -State $ignoredEnableState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
         Assert-Root12Failure -Result $ignoredEnableCase.Result -Journal $ignoredEnableCase.Journal -Code 'VENDOR_ROOT_NOT_ENABLED' -Message 'A vendor root change the clone did not report was accepted.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $ignoredEnableState.Calls -Pattern '*install*-r*') 'An unreported vendor root change still installed the Kitsune APK.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $ignoredEnableState.Calls -Pattern '*install -r*') 'An unreported vendor root change still installed the Kitsune APK.'
 
         $ignoredDisableState = New-Root12ManagerState -Install $install
         $ignoredDisableState.IgnoreRootDisable = $true
@@ -3922,67 +4295,117 @@ function Invoke-Root12Tests {
         Assert-Equal $true $ignoredDisableState.RootSettings[[string]$ignoredDisableState.CloneIndex] 'A vendor root the clone still reports was not preserved for recovery.'
         Assert-Equal $true $ignoredDisableCase.Result.Data.RootVerified 'The reported failure did not state that root verification had passed.'
 
-        $nullInstanceState = New-Root12ManagerState -Install $install
-        $nullInstanceJournal = New-Root12Journal -Root $journalRoot -Instance $android12
-        $nullInstance = Install-Android12Root -Instance $null -Manifest $manifest -Journal $nullInstanceJournal `
-            -Interactive $false -CacheRoot $assetCacheRoot -Runner (New-Root12ManagerRunner -State $nullInstanceState)
-        Assert-Root12Failure -Result $nullInstance -Journal $nullInstanceJournal -Code 'INSTANCE_INVALID' -Message 'A missing instance was accepted.'
-        Assert-Equal 0 @($nullInstanceState.Calls).Count 'A missing instance reached the MuMu manager.'
+        $rootEnableFailureState = New-Root12ManagerState -Install $install
+        $rootEnableFailureState.RootSettingExitCode = 1
+        $rootEnableFailureCase = Invoke-Root12Case -State $rootEnableFailureState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $rootEnableFailureCase.Result -Journal $rootEnableFailureCase.Journal -Code 'VENDOR_ROOT_ENABLE_FAILED' -Message 'A failed vendor root enable was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $rootEnableFailureState.Calls -Pattern '*install -r*') 'A failed vendor root enable still installed the Kitsune APK.'
 
-        $missingJournalState = New-Root12ManagerState -Install $install
-        $missingJournal = Install-Android12Root -Instance $android12 -Manifest $manifest -Journal $null `
-            -Interactive $false -CacheRoot $assetCacheRoot -Runner (New-Root12ManagerRunner -State $missingJournalState)
-        Assert-Equal 'CriticalError' $missingJournal.Status 'A missing journal was accepted.'
-        Assert-Equal 'JOURNAL_INVALID' $missingJournal.Data.Code 'A missing journal was not rejected as an invalid journal.'
-        Assert-Equal 0 @($missingJournalState.Calls).Count 'A missing journal reached the MuMu manager.'
+        $rootDisableFailureState = New-Root12ManagerState -Install $install
+        $rootDisableFailureState.RootSettingExitCode = 1
+        $rootDisableFailureState.RootSettingFailValue = 'false'
+        $rootDisableFailureCase = Invoke-Root12Case -State $rootDisableFailureState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $rootDisableFailureCase.Result -Journal $rootDisableFailureCase.Journal -Code 'VENDOR_ROOT_DISABLE_FAILED' -Message 'A failed vendor root disable was accepted.'
+        Assert-Equal $true $rootDisableFailureCase.Result.Data.RootVerified 'A failed vendor root disable did not report that verification had passed.'
 
-        $invalidJournalState = New-Root12ManagerState -Install $install
-        $invalidJournal = New-Root12Journal -Root $journalRoot -Instance $android12
-        $invalidJournal | Add-Member -NotePropertyName Extra -NotePropertyValue 'invalid'
-        $rejectedJournal = Install-Android12Root -Instance $android12 -Manifest $manifest -Journal $invalidJournal `
-            -Interactive $false -CacheRoot $assetCacheRoot -Runner (New-Root12ManagerRunner -State $invalidJournalState)
-        Assert-Equal 'CriticalError' $rejectedJournal.Status 'An invalid journal was accepted.'
-        Assert-Equal 'JOURNAL_INVALID' $rejectedJournal.Data.Code 'An invalid journal was not rejected as an invalid journal.'
-        Assert-Equal 0 @($invalidJournalState.Calls).Count 'An invalid journal reached the MuMu manager.'
+        $rootUnreadableState = New-Root12ManagerState -Install $install
+        $rootUnreadableState.RootSettingText = '{"unexpected":true}'
+        $rootUnreadableCase = Invoke-Root12Case -State $rootUnreadableState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $rootUnreadableCase.Result -Journal $rootUnreadableCase.Journal -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Message 'An unreadable vendor root setting was accepted.'
 
-        $verifyState = New-Root12ManagerState -Install $install
-        $verifyChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $verifyState)
-        Assert-Equal 'Success' $verifyChecks.Status "The Android 12 root checks failed. $($verifyChecks.Message)"
-        Assert-Equal 'OK' $verifyChecks.Data.Code 'The Android 12 root checks reported an invalid code.'
-        Assert-Equal 'io.github.huskydg.magisk' $verifyChecks.Data.PackageName 'The Android 12 root checks reported the wrong package.'
-        Assert-Equal '31.0-kitsune' $verifyChecks.Data.VersionName 'The Android 12 root checks reported the wrong version name.'
-        Assert-Equal '31000' $verifyChecks.Data.VersionCode 'The Android 12 root checks reported the wrong version code.'
-        Assert-Equal 1 $verifyChecks.Data.DaemonCount 'The Android 12 root checks did not count exactly one daemon.'
-        Assert-Equal $true $verifyChecks.Data.RootVerified 'The Android 12 root checks did not verify the root shell.'
-        $verifyCommands = @($verifyState.Calls | ForEach-Object {
-                $verifyCall = @($_)
-                (@($verifyCall[4..($verifyCall.Count - 1)]) -join ' ')
-            })
-        Assert-Equal 3 $verifyCommands.Count 'The Android 12 root checks made an unexpected number of ADB requests.'
-        Assert-True ($verifyCommands -ccontains 'shell dumpsys package io.github.huskydg.magisk') 'The package check is not the expected structured ADB request.'
-        Assert-True ($verifyCommands -ccontains 'shell pidof magiskd') 'The daemon check is not the expected structured ADB request.'
-        Assert-True ($verifyCommands -ccontains 'shell su -c id') 'The root check is not the expected structured ADB request.'
-        foreach ($verifyCall in $verifyState.Calls) {
-            Assert-True ((@($verifyCall) -join ' ') -notmatch '&') 'An Android 12 ADB request was shell-interpolated.'
-            Assert-True ((@($verifyCall) -join ' ') -notmatch '"') 'An Android 12 ADB request was quoted into a shell string.'
+        foreach ($settingShape in @(
+                [pscustomobject]@{ Text = '{"root_permission":"true"}'; Value = $true; Label = 'object' },
+                [pscustomobject]@{ Text = '[{"root_permission":"true"}]'; Value = $true; Label = 'array' },
+                [pscustomobject]@{ Text = '{"value":true}'; Value = $true; Label = 'value record' },
+                [pscustomobject]@{ Text = '{"index":"7","value":"true"}'; Value = $true; Label = 'indexed record' },
+                [pscustomobject]@{ Text = '{"root_setting":"false"}'; Value = $false; Label = 'underscore field' }
+            )) {
+            $shapeState = New-Root12ManagerState -Install $install
+            $shapeState.RootSettingText = $settingShape.Text
+            $shapeCheck = Get-Android12RootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $shapeState)
+            Assert-Equal 'Success' $shapeCheck.Status "A documented manager setting shape was refused: $($settingShape.Label)"
+            Assert-Equal $settingShape.Value $shapeCheck.Data.Value "A documented manager setting shape returned the wrong value: $($settingShape.Label)"
         }
 
-        $blankManagerState = New-Root12ManagerState -Install $install
-        $blankManagerChecks = Test-Android12Root -ManagerPath '   ' -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $blankManagerState)
-        Assert-Equal 'CriticalError' $blankManagerChecks.Status 'A blank manager was accepted for root verification.'
-        Assert-Equal 'MANAGER_UNAVAILABLE' $blankManagerChecks.Data.Code 'A blank manager was not reported as unavailable.'
-        Assert-Equal 0 @($blankManagerState.Calls).Count 'A blank manager reached the process runner.'
+        foreach ($settingDefect in @(
+                [pscustomobject]@{ Text = '{"error_code":1}'; Code = 'MANAGER_ERROR' },
+                [pscustomobject]@{ Text = 'not json'; Code = 'MANAGER_JSON_INVALID' },
+                [pscustomobject]@{ Text = '   '; Code = 'MANAGER_JSON_INVALID' },
+                [pscustomobject]@{ Text = '[]'; Code = 'SHAPE_UNSUPPORTED' },
+                [pscustomobject]@{ Text = '{"unexpected":true}'; Code = 'SHAPE_UNSUPPORTED' },
+                [pscustomobject]@{ Text = '[{"unexpected":true}]'; Code = 'SHAPE_UNSUPPORTED' },
+                [pscustomobject]@{ Text = '[{"value":"true"},{"value":"false"}]'; Code = 'SHAPE_UNSUPPORTED' },
+                [pscustomobject]@{ Text = '{"index":"9","value":"true"}'; Code = 'INDEX_MISMATCH' },
+                [pscustomobject]@{ Text = '{"value":"maybe"}'; Code = 'VALUE_INVALID' }
+            )) {
+            $defectState = New-Root12ManagerState -Install $install
+            $defectState.RootSettingText = $settingDefect.Text
+            $defectCheck = Get-Android12RootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $defectState)
+            Assert-Equal 'CriticalError' $defectCheck.Status "A defective manager setting response was accepted: $($settingDefect.Code)"
+            Assert-Equal $settingDefect.Code $defectCheck.Data.Code "A defective manager setting response reported the wrong code: $($settingDefect.Code)"
+        }
+        $settingManagerFailureState = New-Root12ManagerState -Install $install
+        $settingManagerFailureState.RootSettingQueryExitCode = 1
+        $settingManagerFailureCheck = Get-Android12RootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $settingManagerFailureState)
+        Assert-Equal 'CriticalError' $settingManagerFailureCheck.Status 'A failed manager setting query was accepted.'
+        Assert-Equal 'MANAGER_FAILED' $settingManagerFailureCheck.Data.Code 'A failed manager setting query reported the wrong code.'
+        $blankSettingManager = Get-Android12RootSetting -ManagerPath '   ' -Index 7 -Runner (New-Root12ManagerRunner -State (New-Root12ManagerState -Install $install))
+        Assert-Equal 'CriticalError' $blankSettingManager.Status 'A blank manager was accepted for a setting query.'
+        Assert-Equal 'MANAGER_UNAVAILABLE' $blankSettingManager.Data.Code 'A blank manager reported the wrong setting code.'
 
-        $negativeIndexState = New-Root12ManagerState -Install $install
-        $negativeIndexChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex -1 -Runner (New-Root12ManagerRunner -State $negativeIndexState)
-        Assert-Equal 'CriticalError' $negativeIndexChecks.Status 'A negative instance index was accepted for root verification.'
-        Assert-Equal 0 @($negativeIndexState.Calls).Count 'A negative instance index reached the process runner.'
+        foreach ($journalCase in @(
+                [pscustomobject]@{ Pattern = '*install -r*'; Label = 'APK installed checkpoint' },
+                [pscustomobject]@{ Pattern = '*monkey*'; Label = 'Kitsune instruction checkpoint' },
+                [pscustomobject]@{ Pattern = '*su -c id*'; Label = 'root check checkpoint' }
+            )) {
+            $journalState = New-Root12ManagerState -Install $install
+            $journalCaseJournal = New-Root12Journal -Root $journalRoot -Instance $android12
+            $journalState.JournalLockPath = $journalCaseJournal.JournalPath
+            $journalState.JournalLockPattern = $journalCase.Pattern
+            try {
+                $journalFailure = Install-Android12Root -Instance $android12 -Manifest $manifest -Journal $journalCaseJournal `
+                    -Interactive $true -Confirmation 'Direct Install into system partition' -CacheRoot $assetCacheRoot `
+                    -Runner (New-Root12ManagerRunner -State $journalState)
+            }
+            finally {
+                Release-Root12JournalLock -State $journalState
+            }
+            Assert-Equal 'CriticalError' $journalFailure.Status "A journal write failure was not reported: $($journalCase.Label)"
+            Assert-Equal 'JOURNAL_WRITE_FAILED' $journalFailure.Data.Code "A journal write failure reported the wrong code: $($journalCase.Label)"
+            Assert-True ($journalFailure.Message -match '(?i)journal') "A journal write failure did not mention the journal: $($journalCase.Label)"
+        }
 
-        $deniedVerifyState = New-Root12ManagerState -Install $install
-        $deniedVerifyState.RootAllowed = $false
-        $deniedVerifyChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $deniedVerifyState)
-        Assert-Equal 'CriticalError' $deniedVerifyChecks.Status 'A denied root shell was accepted by the root checks.'
-        Assert-Equal 'ROOT_DENIED' $deniedVerifyChecks.Data.Code 'A denied root shell was not reported as a denial.'
+        $preLockedState = New-Root12ManagerState -Install $install
+        $preLockedJournal = New-Root12Journal -Root $journalRoot -Instance $android12
+        $preLockedState.JournalLock = [IO.File]::Open($preLockedJournal.JournalPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            $preLocked = Install-Android12Root -Instance $android12 -Manifest $manifest -Journal $preLockedJournal `
+                -Interactive $true -Confirmation 'Direct Install into system partition' -CacheRoot $assetCacheRoot `
+                -Runner (New-Root12ManagerRunner -State $preLockedState)
+        }
+        finally {
+            Release-Root12JournalLock -State $preLockedState
+        }
+        Assert-Equal 'CriticalError' $preLocked.Status 'A locked journal did not fail the workflow.'
+        Assert-Equal 'JOURNAL_WRITE_FAILED' $preLocked.Data.Code 'A locked journal reported the wrong code.'
+        Assert-Equal 0 @($preLockedState.Calls).Count 'A locked journal still reached the MuMu manager.'
+        Assert-Equal 'Running' $preLockedJournal.State 'An unjournalable failure changed the in-memory journal state.'
+
+        $cachedState = New-Root12ManagerState -Install $install
+        $cachedCase = Invoke-Root12Case -State $cachedState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition' -RequireCachedAsset
+        Assert-Equal 'Success' $cachedCase.Result.Status 'A cached verified asset was refused in the cached-only contract.'
+
+        $uncachedState = New-Root12ManagerState -Install $install
+        $uncachedCase = Invoke-Root12Case -State $uncachedState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot (Join-Path $root12Root 'empty cache') -Interactive $true `
+            -Confirmation 'Direct Install into system partition' -RequireCachedAsset
+        Assert-Root12Failure -Result $uncachedCase.Result -Journal $uncachedCase.Journal -Code 'ASSET_VERIFICATION_FAILED' -Message 'The cached-only contract downloaded a missing asset.'
+        Assert-Equal 0 @($uncachedState.Calls).Count 'The cached-only contract reached the MuMu manager without a verified asset.'
+        Assert-Equal $kitsuneAssetPath (Prepare-Android12Asset -Manifest $manifest -CacheRoot $assetCacheRoot).Data 'Prepare-Android12Asset did not return the verified cache path.'
 
         $downloadCacheRoot = Join-Path $root12Root 'download cache'
         $fetchState = @{ Calls = @() }
@@ -4007,6 +4430,39 @@ function Invoke-Root12Tests {
         $reused = Save-ToolkitAsset -Manifest $manifest -Id 'kitsune' -CacheRoot $downloadCacheRoot -Fetch $reusedFetch
         Assert-Equal 'Success' $reused.Status 'A verified cached asset was rejected.'
         Assert-Equal 0 $reusedFetchState.Calls 'A verified cached asset was downloaded again.'
+
+        $cachedOnlyState = @{ Calls = 0 }
+        $cachedOnlyFetch = {
+            param($Url, $Path)
+            $cachedOnlyState.Calls++
+            [IO.File]::WriteAllText($Path, 'kitsune apk fixture payload')
+        }.GetNewClosure()
+        $cachedOnly = Save-ToolkitAsset -Manifest $manifest -Id 'kitsune' -CacheRoot (Join-Path $root12Root 'empty cache') -Fetch $cachedOnlyFetch -RequireCached
+        Assert-Equal 'CriticalError' $cachedOnly.Status 'The cached-only asset contract downloaded a missing asset.'
+        Assert-Equal 0 $cachedOnlyState.Calls 'The cached-only asset contract reached the network fetch.'
+
+        $partialState = @{ Paths = @() }
+        $partialFetch = {
+            param($Url, $Path)
+            $partialState.Paths += ,([string]$Path)
+            [IO.File]::WriteAllText($Path, 'partial')
+        }.GetNewClosure()
+        $partialRoot = Join-Path $root12Root 'partial download cache'
+        $partialDownload = Save-ToolkitAsset -Manifest $manifest -Id 'kitsune' -CacheRoot $partialRoot -Fetch $partialFetch
+        Assert-Equal 'CriticalError' $partialDownload.Status 'A partial download was verified.'
+        Assert-Equal 1 @($partialState.Paths).Count 'A partial download was not attempted exactly once.'
+        Assert-True (-not [IO.File]::Exists([string]$partialState.Paths[0])) 'A failed download left its partial file behind.'
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath (Join-Path $partialRoot 'kitsune') -File -ErrorAction SilentlyContinue).Count 'A failed download left a file in the cache directory.'
+
+        $throwFetch = {
+            param($Url, $Path)
+            throw 'network unavailable'
+        }.GetNewClosure()
+        $throwRoot = Join-Path $root12Root 'failing download cache'
+        $throwDownload = Save-ToolkitAsset -Manifest $manifest -Id 'kitsune' -CacheRoot $throwRoot -Fetch $throwFetch
+        Assert-Equal 'CriticalError' $throwDownload.Status 'A failed fetch was reported as verified.'
+        Assert-True ($throwDownload.Message -match 'network unavailable') 'A failed fetch lost its reason.'
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath (Join-Path $throwRoot 'kitsune') -File -ErrorAction SilentlyContinue).Count 'A failed fetch left a file in the cache directory.'
 
         $tamperedDownloadCacheRoot = Join-Path $root12Root 'tampered download cache'
         $tamperedFetch = {
@@ -4038,6 +4494,45 @@ function Invoke-Root12Tests {
 
         $missingAsset = Save-ToolkitAsset -Manifest $manifest -Id 'hma' -CacheRoot $downloadCacheRoot -Fetch $goodFetch
         Assert-Equal 'CriticalError' $missingAsset.Status 'An asset outside the manifest was downloaded.'
+
+        $verifyState = New-Root12ManagerState -Install $install
+        $verifyChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $verifyState)
+        Assert-Equal 'Success' $verifyChecks.Status "The Android 12 root checks failed. $($verifyChecks.Message)"
+        Assert-Equal 'OK' $verifyChecks.Data.Code 'The Android 12 root checks reported an invalid code.'
+        Assert-Equal 'io.github.huskydg.magisk' $verifyChecks.Data.PackageName 'The Android 12 root checks reported the wrong package.'
+        Assert-Equal '31.0-kitsune' $verifyChecks.Data.VersionName 'The Android 12 root checks reported the wrong version name.'
+        Assert-Equal '31000' $verifyChecks.Data.VersionCode 'The Android 12 root checks reported the wrong version code.'
+        Assert-Equal 1 $verifyChecks.Data.DaemonCount 'The Android 12 root checks did not count exactly one daemon.'
+        Assert-Equal $true $verifyChecks.Data.RootVerified 'The Android 12 root checks did not verify the root shell.'
+        Assert-Equal 3 @($verifyState.Calls).Count 'The Android 12 root checks made an unexpected number of ADB requests.'
+        foreach ($verifyCall in $verifyState.Calls) {
+            $verifyArguments = [string[]]@($verifyCall)
+            Assert-Equal 5 $verifyArguments.Count 'A verification request carried more than one command element.'
+            Assert-Equal 'adb' $verifyArguments[0] 'A verification request is not an ADB request.'
+            Assert-Equal '-c' $verifyArguments[3] 'A verification request lost its ADB command flag.'
+            Assert-True (($verifyArguments -join ' ') -notmatch '&') 'An Android 12 ADB request was shell-interpolated.'
+        }
+        $verifyCommands = @($verifyState.Calls | ForEach-Object { [string]@($_)[4] })
+        Assert-True ($verifyCommands -ccontains ('shell dumpsys package ' + $verifyState.PackageName)) 'The package check is not one structured ADB command element.'
+        Assert-True ($verifyCommands -ccontains 'shell pidof magiskd') 'The daemon check is not one structured ADB command element.'
+        Assert-True ($verifyCommands -ccontains 'shell su -c id') 'The root check is not one structured ADB command element.'
+
+        $blankManagerState = New-Root12ManagerState -Install $install
+        $blankManagerChecks = Test-Android12Root -ManagerPath '   ' -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $blankManagerState)
+        Assert-Equal 'CriticalError' $blankManagerChecks.Status 'A blank manager was accepted for root verification.'
+        Assert-Equal 'MANAGER_UNAVAILABLE' $blankManagerChecks.Data.Code 'A blank manager was not reported as unavailable.'
+        Assert-Equal 0 @($blankManagerState.Calls).Count 'A blank manager reached the process runner.'
+
+        $negativeIndexState = New-Root12ManagerState -Install $install
+        $negativeIndexChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex -1 -Runner (New-Root12ManagerRunner -State $negativeIndexState)
+        Assert-Equal 'CriticalError' $negativeIndexChecks.Status 'A negative instance index was accepted for root verification.'
+        Assert-Equal 0 @($negativeIndexState.Calls).Count 'A negative instance index reached the process runner.'
+
+        $deniedVerifyState = New-Root12ManagerState -Install $install
+        $deniedVerifyState.RootAllowed = $false
+        $deniedVerifyChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $deniedVerifyState)
+        Assert-Equal 'CriticalError' $deniedVerifyChecks.Status 'A denied root shell was accepted by the root checks.'
+        Assert-Equal 'ROOT_DENIED' $deniedVerifyChecks.Data.Code 'A denied root shell was not reported as a denial.'
     }
     finally {
         if ($null -ne $bootAttemptsVariable) {

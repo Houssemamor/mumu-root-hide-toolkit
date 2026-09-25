@@ -254,7 +254,8 @@ function Save-ToolkitAsset {
         [object]$Manifest,
         [string]$Id,
         [string]$CacheRoot,
-        [scriptblock]$Fetch = $null
+        [scriptblock]$Fetch = $null,
+        [switch]$RequireCached
     )
 
     if ($null -eq $Manifest -or $null -eq $Manifest.PSObject.Properties['dependencies'] -or
@@ -267,6 +268,9 @@ function Save-ToolkitAsset {
         return $verified
     }
     if ($verified.Message -cne 'Asset is not available locally.') {
+        return $verified
+    }
+    if ($RequireCached) {
         return $verified
     }
 
