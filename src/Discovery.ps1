@@ -931,7 +931,8 @@ function Get-MuMuRootSetting {
     param(
         [string]$ManagerPath,
         [int]$Index,
-        [object]$InfoRecord
+        [object]$InfoRecord,
+        [scriptblock]$Runner = $null
     )
 
     $reportedValue = Get-ToolkitFirstProperty -InputObject $InfoRecord -PropertyNames @('root_permission', 'rootPermission', 'root_setting', 'rootSetting')
@@ -943,7 +944,7 @@ function Get-MuMuRootSetting {
         return ConvertTo-ToolkitBoolean -Value $reportedValue
     }
 
-    $result = Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('setting', '-v', [string]$Index, '-k', 'root_permission')
+    $result = Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('setting', '-v', [string]$Index, '-k', 'root_permission') -Runner $Runner
     if ($null -eq $result -or $result.ExitCode -ne 0) {
         return $null
     }

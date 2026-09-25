@@ -205,3 +205,152 @@ function Get-VerifiedAsset {
 
     return Get-ToolkitResult -Status 'Success' -Message 'Asset verified.' -Data $path
 }
+
+function Get-ToolkitAssetCacheRoot {
+    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        throw 'LOCALAPPDATA is not available.'
+    }
+
+    return [IO.Path]::Combine(
+        $env:LOCALAPPDATA,
+        'mumu-root-hide-toolkit',
+        'assets'
+    )
+}
+
+function Invoke-ToolkitAssetDownload {
+    param(
+        [string]$Url,
+        [string]$Path,
+        [long]$MaximumBytes
+    )
+
+    if (-not ([Net.ServicePointManager]::SecurityProtocol -band [Net.SecurityProtocolType]::Tls12)) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+    $webClient = New-Object Net.WebClient
+    try {
+        $webClient.Headers.Add('User-Agent', 'mumu-root-hide-toolkit')
+        $webClient.DownloadFile($Url, $Path)
+    }
+    finally {
+        $webClient.Dispose()
+    }
+
+    $length = 0
+    try {
+        $length = (New-Object IO.FileInfo($Path)).Length
+    }
+    catch {
+        throw 'The downloaded asset is unavailable.'
+    }
+    if ([long]$length -gt $MaximumBytes) {
+        throw 'The downloaded asset exceeded its pinned size.'
+    }
+}
+
+function Save-ToolkitAsset {
+    param(
+        [object]$Manifest,
+        [string]$Id,
+        [string]$CacheRoot,
+        [scriptblock]$Fetch = $null
+    )
+
+    if ($null -eq $Manifest -or $null -eq $Manifest.PSObject.Properties['dependencies'] -or
+        [string]::IsNullOrWhiteSpace($Id) -or [string]::IsNullOrWhiteSpace($CacheRoot)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset download input is invalid.'
+    }
+
+    $verified = Get-VerifiedAsset -Manifest $Manifest -Id $Id -CacheRoot $CacheRoot
+    if ($verified.Status -eq 'Success') {
+        return $verified
+    }
+    if ($verified.Message -cne 'Asset is not available locally.') {
+        return $verified
+    }
+
+    $matches = @($Manifest.dependencies | Where-Object {
+        $null -ne $_ -and
+        $null -ne $_.PSObject.Properties['id'] -and
+        [string]$_.id -ceq $Id
+    })
+    if ($matches.Count -ne 1) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset is not uniquely defined in the manifest.'
+    }
+    $dependency = $matches[0]
+    $urlProperty = $dependency.PSObject.Properties['url']
+    $nameProperty = $dependency.PSObject.Properties['assetName']
+    $sizeProperty = $dependency.PSObject.Properties['size']
+    if ($null -eq $urlProperty -or $urlProperty.Value -isnot [string] -or
+        $null -eq $nameProperty -or $nameProperty.Value -isnot [string] -or
+        $null -eq $sizeProperty -or ($sizeProperty.Value -isnot [int] -and $sizeProperty.Value -isnot [long])) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset download input is invalid.'
+    }
+    $url = [string]$urlProperty.Value
+    $assetName = [string]$nameProperty.Value
+    $expectedSize = [long]$sizeProperty.Value
+    if ($url -cnotmatch '^https://github\.com/[\x21-\x7e]+$' -or $expectedSize -le 0 -or
+        $assetName -ne [IO.Path]::GetFileName($assetName)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset download input is invalid.'
+    }
+
+    try {
+        $cacheRootPath = [IO.Path]::GetFullPath($CacheRoot)
+        $directory = Join-Path $cacheRootPath $Id
+        [void][IO.Directory]::CreateDirectory($directory)
+        $path = [IO.Path]::GetFullPath((Join-Path $directory $assetName))
+        $cachePrefix = $cacheRootPath.TrimEnd([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)) + [IO.Path]::DirectorySeparatorChar
+        if (-not $path.StartsWith($cachePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'Asset path is outside the cache root.'
+        }
+    }
+    catch {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The asset cache directory is unavailable.'
+    }
+
+    $partialPath = $path + '.' + [Guid]::NewGuid().ToString('N') + '.part'
+    $downloaded = $false
+    $failure = $null
+    try {
+        if ($null -ne $Fetch) {
+            & $Fetch $url $partialPath
+        }
+        else {
+            Invoke-ToolkitAssetDownload -Url $url -Path $partialPath -MaximumBytes $expectedSize
+        }
+        if (-not [IO.File]::Exists($partialPath)) {
+            throw 'The download produced no asset.'
+        }
+        [IO.File]::Move($partialPath, $path)
+        $downloaded = $true
+    }
+    catch {
+        $failure = Protect-ToolkitText ([string]$_.Exception.Message)
+    }
+    finally {
+        if ([IO.File]::Exists($partialPath)) {
+            try {
+                [IO.File]::Delete($partialPath)
+            }
+            catch {
+            }
+        }
+    }
+    if (-not $downloaded) {
+        if ([string]::IsNullOrWhiteSpace($failure)) {
+            $failure = 'The pinned asset could not be downloaded.'
+        }
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The pinned asset could not be downloaded: $failure"
+    }
+
+    $verified = Get-VerifiedAsset -Manifest $Manifest -Id $Id -CacheRoot $CacheRoot
+    if ($verified.Status -ne 'Success' -and $downloaded) {
+        try {
+            [IO.File]::Delete($path)
+        }
+        catch {
+        }
+    }
+    return $verified
+}
