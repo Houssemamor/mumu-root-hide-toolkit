@@ -17,7 +17,8 @@ The original `mumu-magisk-1click` project is credited in `NOTICE.md` and README 
 - use public MuMu command-line interfaces, official documentation, and independently designed tests;
 - download third-party dependencies from their official upstream sources at runtime;
 - avoid copying the original project's source, README prose, binaries, workflows, tests, icons, or other assets;
-- retain each downloaded dependency's own license and notices.
+- retain each downloaded dependency's own license and notices;
+- license the independently written toolkit code under MIT.
 
 The repository will not claim endorsement by the original author or MuMu.
 
