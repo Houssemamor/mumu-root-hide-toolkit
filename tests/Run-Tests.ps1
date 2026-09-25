@@ -3506,6 +3506,8 @@ function New-Root12ManagerState {
         IgnoreRootDisable = $false
         RootSettingExitCode = 0
         RootSettingQueryExitCode = 0
+        RootSettingQueryFailCount = 0
+        RootSettingQueries = 0
         RootSettingFailValue = ''
         RootSettingText = ''
         AdbFailPattern = ''
@@ -3626,9 +3628,16 @@ function New-Root12ManagerRunner {
                     $State.RootSettings[$index] = $requestedValue
                 }
             }
-            if ($State.RootSettingQueryExitCode -ne 0) {
-                return [pscustomobject]@{ ExitCode = $State.RootSettingQueryExitCode; Text = '{"error_code":1}' }
+            if ($State.RootSettingQueryExitCode -ne 0 -or
+                ($State.RootSettingQueryFailCount -gt 0 -and $State.RootSettingQueries -lt $State.RootSettingQueryFailCount)) {
+                $State.RootSettingQueries++
+                $queryExitCode = $State.RootSettingQueryExitCode
+                if ($queryExitCode -eq 0) {
+                    $queryExitCode = 1
+                }
+                return [pscustomobject]@{ ExitCode = $queryExitCode; Text = '{"error_code":1}' }
             }
+            $State.RootSettingQueries++
             if (-not [string]::IsNullOrEmpty([string]$State.RootSettingText)) {
                 return [pscustomobject]@{ ExitCode = 0; Text = $State.RootSettingText }
             }
@@ -3790,6 +3799,15 @@ function Invoke-Root12Tests {
     Assert-True (Test-Path -LiteralPath $root12ScriptPath -PathType Leaf) 'src/Root12.ps1 does not exist.'
     Assert-True ($null -ne (Get-Command 'Get-ToolkitAssetCacheRoot' -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitAssetCacheRoot is unavailable.'
     Assert-True ($null -ne (Get-Command 'Save-ToolkitAsset' -CommandType Function -ErrorAction SilentlyContinue)) 'Save-ToolkitAsset is unavailable.'
+    Assert-True ($null -ne (Get-Command 'New-Android12Recovery' -CommandType Function -ErrorAction SilentlyContinue)) 'New-Android12Recovery is unavailable.'
+    Assert-Throws { New-Android12Recovery -Step 'confirmation' -SourceIndex 3 } 'An Android 12 recovery record was built without a code.'
+    Assert-Throws { New-Android12Recovery -Code '' -Step 'confirmation' -SourceIndex 3 } 'An Android 12 recovery record was built with an empty code.'
+    Assert-Throws { New-Android12Recovery -Code '   ' -Step 'confirmation' -SourceIndex 3 } 'An Android 12 recovery record was built with a whitespace code.'
+    foreach ($codeCase in @('OK', 'USER_CONFIRMATION_REQUIRED', 'JOURNAL_WRITE_FAILED', 'VENDOR_ROOT_SETTING_UNREADABLE')) {
+        $codeRecord = New-Android12Recovery -Code $codeCase -Step 'verification' -SourceIndex 3 -CloneIndex 5 -CloneName 'Target clone'
+        Assert-Equal $codeCase $codeRecord.Code 'An Android 12 recovery record changed its code.'
+        Assert-True ($script:Root12Codes -ccontains $codeRecord.Code -or $codeRecord.Code -ceq 'OK') "An Android 12 recovery record used an undocumented code: $codeCase"
+    }
 
     $root12Source = [IO.File]::ReadAllText($root12ScriptPath)
     Assert-True ($root12Source -notmatch "'UNKNOWN'") 'The Android 12 source reports an UNKNOWN failure code.'
@@ -4083,6 +4101,29 @@ function Invoke-Root12Tests {
         Assert-Equal 'Success' $resumedCase.Result.Status "A resume of the recorded clone did not complete. $($resumedCase.Result.Message)"
         Assert-Equal $resumeState.CloneIndex $resumedCase.Result.Data.CloneIndex 'The resume reported the wrong clone.'
         Assert-Equal 1 @($resumeState.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'The resume created a second clone.'
+
+        $declinedFlow = New-Root12ManagerState -Install $install
+        $declinedFlowCase = Invoke-Root12Case -State $declinedFlow -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { 'no' }
+        Assert-Root12Failure -Result $declinedFlowCase.Result -Journal $declinedFlowCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'The declined interactive run was not reported as needing confirmation.'
+        Assert-True ($declinedFlowCase.Result.Data -is [Collections.IDictionary]) 'The failed result did not return the recovery record a caller holds.'
+        $resumedFlowCase = Invoke-Root12Case -State $declinedFlow -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition' `
+            -ResumeClone $declinedFlowCase.Result.Data
+        Assert-Equal 'Success' $resumedFlowCase.Result.Status "A resume with the recovery record of the declined call did not complete. $($resumedFlowCase.Result.Message)"
+        Assert-Equal $declinedFlow.CloneIndex $resumedFlowCase.Result.Data.CloneIndex 'The resume of a returned recovery record reported the wrong clone.'
+        Assert-Equal 1 @($declinedFlow.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'The resume of a returned recovery record created a second clone.'
+
+        $dictionaryRecordState = New-Root12VerifiedCloneState -Install $install -Instance $android12 -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot
+        $dictionaryRecordCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+            -Record (@{ CloneIndex = [int]$dictionaryRecordState.CloneIndex; CloneName = [string]$dictionaryRecordState.CloneName }) `
+            -Runner (New-Root12ManagerRunner -State $dictionaryRecordState)
+        Assert-Equal 'Success' $dictionaryRecordCheck.Status 'A recovery record expressed as a dictionary was refused.'
+        Assert-Equal $dictionaryRecordState.CloneIndex $dictionaryRecordCheck.Data.CloneIndex 'A dictionary recovery record resolved the wrong clone.'
+        $dictionaryMissingIndexCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+            -Record (@{ CloneName = 'Target clone' }) -Runner (New-Root12ManagerRunner -State $dictionaryRecordState)
+        Assert-Equal 'CriticalError' $dictionaryMissingIndexCheck.Status 'A dictionary recovery record without an index was accepted.'
+        Assert-Equal 'RESUME_RECORD_INVALID' $dictionaryMissingIndexCheck.Data.Code 'A dictionary recovery record without an index reported the wrong code.'
         $resumeJournal = Get-OperationJournal -Path $resumedCase.Journal.JournalPath
         $resumeText = ([string](@($resumeJournal.Checkpoints) | ForEach-Object { $_.Message }) -join ' ')
         Assert-True ($resumeText -match 'resumed') 'The resume was not recorded in the journal.'
@@ -4279,6 +4320,16 @@ function Invoke-Root12Tests {
         Assert-Root12Failure -Result $apkFailureCase.Result -Journal $apkFailureCase.Journal -Code 'APK_INSTALL_FAILED' -Message 'A failed APK install was accepted.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $apkFailureState.Calls -Pattern '*monkey*') 'A failed APK install still launched the Kitsune app.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $apkFailureState.Calls -Pattern '*pidof magiskd*') 'A failed APK install still verified the root daemon.'
+
+        $firstQueryState = New-Root12ManagerState -Install $install
+        $firstQueryState.RootSettingQueryFailCount = 1
+        $firstQueryCase = Invoke-Root12Case -State $firstQueryState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $firstQueryCase.Result -Journal $firstQueryCase.Journal -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Message 'An unreadable first vendor root readback was accepted.'
+        Assert-Equal $firstQueryState.CloneIndex $firstQueryCase.Result.Data.CloneIndex 'An unreadable first vendor root readback did not expose the clone.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $firstQueryState.Calls -Pattern '*root_permission*-val*true*') 'An unreadable first vendor root readback still enabled the vendor root.'
+        $firstQueryReopened = Get-OperationJournal -Path $firstQueryCase.Journal.JournalPath
+        Assert-True (@($firstQueryReopened.Checkpoints | Where-Object { $_.Level -ceq 'Error' }).Count -ge 1) 'An unreadable first vendor root readback recorded no Error checkpoint.'
 
         $ignoredEnableState = New-Root12ManagerState -Install $install
         $ignoredEnableState.IgnoreRootEnable = $true

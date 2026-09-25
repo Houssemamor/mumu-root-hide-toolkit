@@ -287,12 +287,12 @@ git commit -m "feat: add journaled recoverable errors"
 
 - [ ] **Step 1: Write failing discovery fixtures**
 
-Create temporary fixture roots such as `D:\Odd Path\MuMu Global`, `E:\å®‰è£…\MuMu`, and a Chinese user-data root. Assert that registry `InstallLocation`, process command lines, and fallback roots are considered; assert that an ambiguous list is rejected.
+Create temporary fixture roots such as `D:\Odd Path\MuMu Global`, `E:\安装\MuMu`, and a Chinese user-data root. Assert that registry `InstallLocation`, process command lines, and fallback roots are considered; assert that an ambiguous list is rejected.
 
 ```powershell
 $installs = Find-MuMuInstallations -Edition 'All' -RegistryRoots $fixtureRegistryRoots -ProcessSnapshot $fixtureProcesses -FallbackRoots $fixtureFallbackRoots
 Assert-True (@($installs | Where-Object { $_.InstallRoot -eq 'D:\Odd Path\MuMu Global' }).Count -eq 1) 'Spaced Global install was not discovered.'
-Assert-True (@($installs | Where-Object { $_.InstallRoot -eq 'E:\å®‰è£…\MuMu' }).Count -eq 1) 'Unicode Chinese install was not discovered.'
+Assert-True (@($installs | Where-Object { $_.InstallRoot -eq 'E:\安装\MuMu' }).Count -eq 1) 'Unicode Chinese install was not discovered.'
 $ambiguous = Resolve-SelectedInstance -Instances @($fixtureInstance0, $fixtureInstance1) -Selection $null
 Assert-True ($ambiguous.Status -eq 'CriticalError') 'Ambiguous instance selection was accepted.'
 ```
@@ -494,13 +494,14 @@ git commit -m "feat: add reversible Mumu ad suppression"
 - Modify: `tests/Run-Tests.ps1`
 
 **Interfaces:**
+- Produces `Install-Android12Root -Instance <object> -Manifest <object> -Journal <object> -Interactive <bool> [-Confirmation <string>] [-Runner <scriptblock>]` returning a structured result.
 - Produces `Install-Android12Root -Instance <object> -Manifest <object> -Journal <object> -Interactive <bool> [-Confirmation <string>] [-CacheRoot <string>] [-Runner <scriptblock>] [-Prompt <scriptblock>] [-ResumeClone <object>] [-RequireCachedAsset]` returning a structured result.
-  The extension parameters are optional and preserve the original signature: `-CacheRoot` defaults to the per-user dependency cache, `-Runner` injects the manager and ADB transport, `-Prompt` supplies the operator prompt used when `-Confirmation` is absent, `-ResumeClone` continues on a previously reported verified clone instead of cloning again, and `-RequireCachedAsset` forbids any network fetch so an elevated phase can never download a dependency.
+  The extension parameters are optional and preserve the original signature: `-CacheRoot` defaults to the per-user dependency cache, `-Runner` injects the manager and ADB transport, `-Prompt` supplies the operator prompt used when `-Confirmation` is absent, `-ResumeClone` continues on a previously reported verified clone instead of cloning again and accepts the recovery record a failed call returns, and `-RequireCachedAsset` forbids any network fetch so an elevated phase can never download a dependency.
 - Produces `Get-Android12KitsunePrompt` returning the exact text `Install -> Direct Install into system partition`.
 - Produces `Test-KitsuneConfirmation` accepting only `Direct Install into system partition`, and `Read-Android12KitsuneConfirmation` with the `$script:ToolkitKitsuneDefaultPrompt` seam for the operator prompt, defaulting to `Read-Host`.
 - Produces `Prepare-Android12Asset -Manifest <object> [-CacheRoot <string>] [-RequireCached] [-Fetch <scriptblock>]` so the controller can fetch and verify the pinned APK before any elevated phase.
 - Produces `Get-Android12RootSetting -ManagerPath <string> -Index <int>` returning the vendor root setting with a distinct code for every unsupported or malformed manager response shape.
-- Produces `Resolve-Android12Clone` and `Assert-Android12ResumeClone` so a successful clone with missing data, or a recorded clone that no longer matches, is refused before any further mutation.
+- Produces `Resolve-Android12Clone` and `Assert-Android12ResumeClone` so a successful clone with missing data, or a recorded clone that no longer matches, is refused before any further mutation. `-ResumeClone` accepts either the recovery record of a failed call or an equivalent object.
 - Produces `Format-Android12InstallCommand` building the single quoted `install -r "<path>"` command element for MuMuManager.
 - Produces `Test-Android12Root -ManagerPath <string> -InstanceIndex <int>` returning package, daemon, and root checks.
 

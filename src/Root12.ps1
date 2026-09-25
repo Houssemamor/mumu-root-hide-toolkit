@@ -71,6 +71,10 @@ function New-Android12Recovery {
         [object]$Checks = $null
     )
 
+    if ([string]::IsNullOrWhiteSpace($Code)) {
+        throw 'The Android 12 recovery code is required.'
+    }
+
     $record = @{
         Code = $Code
         Step = $Step
@@ -280,25 +284,24 @@ function Assert-Android12ResumeClone {
         [scriptblock]$Runner = $null
     )
 
-    if ($null -eq $Record -or $Record -is [Array] -or $Record -isnot [pscustomobject]) {
+    if ($null -eq $Record -or $Record -is [Array] -or ($Record -isnot [pscustomobject] -and $Record -isnot [Collections.IDictionary])) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The recorded recovery clone is invalid.' -Data (@{ Code = 'RESUME_RECORD_INVALID' })
     }
-    $indexProperty = $Record.PSObject.Properties['CloneIndex']
-    if ($null -eq $indexProperty -or
-        ($indexProperty.Value -isnot [string] -and $indexProperty.Value -isnot [int] -and $indexProperty.Value -isnot [long])) {
+    $reportedIndex = Get-Android12RecordField -Record $Record -Name 'CloneIndex'
+    if ($reportedIndex -isnot [string] -and $reportedIndex -isnot [int] -and $reportedIndex -isnot [long]) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The recorded recovery clone has no usable index.' -Data (@{ Code = 'RESUME_RECORD_INVALID' })
     }
     $cloneIndex = 0
-    if (-not [int]::TryParse([string]$indexProperty.Value, [ref]$cloneIndex) -or $cloneIndex -lt 0) {
+    if (-not [int]::TryParse([string]$reportedIndex, [ref]$cloneIndex) -or $cloneIndex -lt 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The recorded recovery clone index is invalid.' -Data (@{ Code = 'RESUME_RECORD_INVALID' })
     }
+    $reportedName = Get-Android12RecordField -Record $Record -Name 'CloneName'
     $expectedName = ''
-    $nameProperty = $Record.PSObject.Properties['CloneName']
-    if ($null -ne $nameProperty) {
-        if ($nameProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+    if ($null -ne $reportedName) {
+        if ($reportedName -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$reportedName)) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'The recorded recovery clone name is invalid.' -Data (@{ Code = 'RESUME_RECORD_INVALID' })
         }
-        $expectedName = [string]$nameProperty.Value
+        $expectedName = [string]$reportedName
     }
     $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
     $vms = ConvertTo-ToolkitFullPath -Path $VmsPath
@@ -587,6 +590,10 @@ function Install-Android12Root {
     }
 
     $previousRootSetting = Get-Android12RootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
+    if ($previousRootSetting.Status -ne 'Success') {
+        return New-Android12RootFailure -Journal $Journal -Message ('The clone vendor root setting could not be read before the temporary vendor root was enabled, so nothing was changed. ' + $previousRootSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-read' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
+    $previousRootValue = [bool]$previousRootSetting.Data.Value
     $enableRoot = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$cloneIndex), '-k', 'root_permission', '-val', 'true') -Runner $Runner
     if ($null -eq $enableRoot -or $enableRoot.ExitCode -ne 0) {
         return New-Android12RootFailure -Journal $Journal -Message 'The temporary vendor root could not be enabled on the clone.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_ENABLE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
@@ -600,7 +607,7 @@ function Install-Android12Root {
     }
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The temporary vendor root is enabled on the clone and is disabled again only after root verification.' -Data (@{
-                PreviousRootSetting = [string]$previousRootSetting.Data.Value
+                PreviousRootSetting = [string]$previousRootValue
                 RootSetting = 'true'
             })
     }
