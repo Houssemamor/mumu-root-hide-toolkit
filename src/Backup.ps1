@@ -65,6 +65,9 @@ function Backup-ChangedFile {
     if ($rootItem -isnot [IO.DirectoryInfo]) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Backup root is not a directory.'
     }
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Backup root is a reparse point such as a junction or symbolic link.'
+    }
 
     $sourcePath = $sourceItem.FullName
     $target = Join-Path $root $sourceItem.Name
@@ -148,6 +151,9 @@ function Restore-BackupFile {
         if ($propertyValue -isnot [string] -or [string]::IsNullOrWhiteSpace($propertyValue)) {
             return Get-ToolkitResult -Status 'CriticalError' -Message "Backup record $propertyName is invalid."
         }
+        if ($null -eq (ConvertTo-ToolkitFullPath -Path $propertyValue)) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message "Backup record $propertyName path is invalid."
+        }
     }
     $hashProperty = $BackupRecord.PSObject.Properties['Sha256']
     if ($hashProperty.Value -isnot [string] -or $hashProperty.Value -notmatch '^[0-9a-fA-F]{64}$') {
@@ -178,50 +184,64 @@ function Restore-BackupFile {
     }
 
     $sourcePath = ConvertTo-ToolkitFullPath -Path $BackupRecord.Source
-    $targetAttributes = [int][IO.FileAttributes]::Normal
+    if ($null -eq $sourcePath) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Backup record Source path is invalid.'
+    }
+    $originalAttributes = [int][IO.FileAttributes]::Normal
     $targetExists = $false
     if (Test-Path -LiteralPath $sourcePath) {
         $sourceItem = $null
         try {
-            $sourceItem = Assert-ToolkitRegularFile -Path $BackupRecord.Source -Label 'Restore target'
+            $sourceItem = Assert-ToolkitRegularFile -Path $sourcePath -Label 'Restore target'
         }
         catch {
             return Get-ToolkitResult -Status 'CriticalError' -Message (Protect-ToolkitText ([string]$_.Exception.Message))
         }
-        $targetAttributes = [int]$sourceItem.Attributes
+        $originalAttributes = [int]$sourceItem.Attributes
         $targetExists = $true
     }
-    $targetAttributes = $targetAttributes -band (-bnot [int][IO.FileAttributes]::ReadOnly)
-    $readOnlyAttributes = [IO.FileAttributes]($targetAttributes -bor [int][IO.FileAttributes]::ReadOnly)
+    $writableAttributes = [IO.FileAttributes]($originalAttributes -band (-bnot [int][IO.FileAttributes]::ReadOnly))
+    $recordedAttributes = if ($BackupRecord.ReadOnly) {
+        [IO.FileAttributes]([int]$writableAttributes -bor [int][IO.FileAttributes]::ReadOnly)
+    }
+    else {
+        $writableAttributes
+    }
+    $restoreOriginalAttributes = {
+        if (-not $targetExists -or -not [IO.File]::Exists($sourcePath)) {
+            return
+        }
+        try {
+            [IO.File]::SetAttributes($sourcePath, [IO.FileAttributes]$originalAttributes)
+        }
+        catch {
+        }
+    }
 
     try {
         if ($targetExists) {
-            [IO.File]::SetAttributes($sourcePath, [IO.FileAttributes]$targetAttributes)
+            [IO.File]::SetAttributes($sourcePath, $writableAttributes)
         }
         [IO.File]::Copy($backupPath, $sourcePath, $true)
     }
     catch {
         $restoreFailure = Protect-ToolkitText ([string]$_.Exception.Message)
-        if ($BackupRecord.ReadOnly) {
-            try {
-                [IO.File]::SetAttributes($sourcePath, $readOnlyAttributes)
-            }
-            catch {
-            }
-        }
+        & $restoreOriginalAttributes
         return Get-ToolkitResult -Status 'CriticalError' -Message "Backup restore failed: $restoreFailure"
     }
     if ($BackupRecord.ReadOnly) {
         try {
-            [IO.File]::SetAttributes($sourcePath, $readOnlyAttributes)
+            [IO.File]::SetAttributes($sourcePath, $recordedAttributes)
         }
         catch {
             $attributeFailure = Protect-ToolkitText ([string]$_.Exception.Message)
+            & $restoreOriginalAttributes
             return Get-ToolkitResult -Status 'CriticalError' -Message "Backup restore did not preserve the read-only state: $attributeFailure"
         }
     }
     $restoredHash = Get-ToolkitFileSha256 -Path $sourcePath
     if ($null -eq $restoredHash -or -not $restoredHash.Equals($expectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+        & $restoreOriginalAttributes
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Restored file hash does not match the backup record.'
     }
     return Get-ToolkitResult -Status 'Success' -Message 'File was restored from its backup.'
