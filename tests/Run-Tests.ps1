@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'All')]
+    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'All')]
     [string]$Suite = 'All'
 )
 
@@ -12,6 +12,8 @@ $manifestScriptPath = Join-Path $repoRoot 'src\Manifest.ps1'
 $manifestPath = Join-Path $repoRoot 'src\Manifest.json'
 $journalScriptPath = Join-Path $repoRoot 'src\Journal.ps1'
 $discoveryScriptPath = Join-Path $repoRoot 'src\Discovery.ps1'
+$elevationScriptPath = Join-Path $repoRoot 'src\Elevation.ps1'
+$backupScriptPath = Join-Path $repoRoot 'src\Backup.ps1'
 
 if (Test-Path -LiteralPath $commonPath -PathType Leaf) {
     . $commonPath
@@ -24,6 +26,12 @@ if (Test-Path -LiteralPath $journalScriptPath -PathType Leaf) {
 }
 if (Test-Path -LiteralPath $discoveryScriptPath -PathType Leaf) {
     . $discoveryScriptPath
+}
+if (Test-Path -LiteralPath $elevationScriptPath -PathType Leaf) {
+    . $elevationScriptPath
+}
+if (Test-Path -LiteralPath $backupScriptPath -PathType Leaf) {
+    . $backupScriptPath
 }
 
 function Assert-True {
@@ -1787,6 +1795,567 @@ function Invoke-DiscoveryTests {
     }
 }
 
+function New-SafetyInstallFixture {
+    param(
+        [string]$InstallRoot,
+        [int[]]$InstanceIndexes
+    )
+
+    $root = [IO.Path]::GetFullPath($InstallRoot)
+    $vms = Join-Path $root 'vms'
+    New-Item -ItemType Directory -Path $vms -Force | Out-Null
+    foreach ($instanceIndex in $InstanceIndexes) {
+        $instanceRoot = Join-Path $vms ([string]$instanceIndex)
+        New-Item -ItemType Directory -Path $instanceRoot -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $instanceRoot 'system.img'), ('instance ' + $instanceIndex + ' disk payload'))
+    }
+    $managerDirectory = Join-Path $root 'shell'
+    New-Item -ItemType Directory -Path $managerDirectory -Force | Out-Null
+    $managerPath = Join-Path $managerDirectory 'MuMuManager.exe'
+    [IO.File]::WriteAllText($managerPath, 'safety clone manager fixture')
+    return [pscustomobject]@{
+        InstallRoot = $root
+        VmsPath = [IO.Path]::GetFullPath($vms)
+        ManagerPath = [IO.Path]::GetFullPath($managerPath)
+    }
+}
+
+function New-SafetyManagerState {
+    param(
+        [string]$VmsPath,
+        [bool]$Running = $true
+    )
+
+    return @{
+        VmsPath = $VmsPath
+        Calls = @()
+        Instances = @(
+            [pscustomobject]@{ Index = 0; Name = 'Base'; IsMain = $true; Running = $false; Android = '12.0' },
+            [pscustomobject]@{ Index = 2; Name = 'Other'; IsMain = $false; Running = $false; Android = '12.0' },
+            [pscustomobject]@{ Index = 3; Name = 'Target'; IsMain = $false; Running = $Running; Android = '12.0' }
+        )
+        InfoExitCode = 0
+        ControlExitCode = 0
+        CloneExitCode = 0
+        ShutdownSettles = $true
+        CloneIndex = 4
+        CloneName = 'Target clone'
+        CloneAndroid = '12.0'
+        CloneCreatesDisk = $true
+    }
+}
+
+function New-SafetyManagerRunner {
+    param([hashtable]$State)
+
+    return {
+        param($ActualFilePath, $ActualArgumentList)
+        $State.Calls += ,@($ActualArgumentList)
+        $command = [string]$ActualArgumentList[0]
+        if ($command -eq 'info') {
+            if ($State.InfoExitCode -ne 0) {
+                return [pscustomobject]@{ ExitCode = $State.InfoExitCode; Text = '{"error_code":1}' }
+            }
+            $requested = [string]$ActualArgumentList[2]
+            $selected = @($State.Instances | Where-Object { $requested -eq 'all' -or [string]$_.Index -ceq $requested })
+            if ($selected.Count -eq 0) {
+                return [pscustomobject]@{ ExitCode = 1; Text = '{"error_code":1}' }
+            }
+            $records = @()
+            foreach ($selectedInstance in $selected) {
+                $records += [pscustomobject]@{
+                    index = [string]$selectedInstance.Index
+                    name = $selectedInstance.Name
+                    is_main = [string]$selectedInstance.IsMain
+                    is_process_started = [string]$selectedInstance.Running
+                    android_version = $selectedInstance.Android
+                }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Text = (ConvertTo-Json -InputObject @($records) -Depth 4 -Compress) }
+        }
+        if ($command -eq 'control') {
+            if ($State.ControlExitCode -ne 0) {
+                return [pscustomobject]@{ ExitCode = $State.ControlExitCode; Text = '{"error_code":1}' }
+            }
+            if ($State.ShutdownSettles) {
+                foreach ($controlInstance in $State.Instances) {
+                    if ([string]$controlInstance.Index -ceq [string]$ActualArgumentList[2]) {
+                        $controlInstance.Running = $false
+                    }
+                }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Text = '{"error_code":0}' }
+        }
+        if ($command -eq 'clone') {
+            if ($State.CloneExitCode -ne 0) {
+                return [pscustomobject]@{ ExitCode = $State.CloneExitCode; Text = '{"error_code":1}' }
+            }
+            $cloneRoot = Join-Path $State.VmsPath ([string]$State.CloneIndex)
+            New-Item -ItemType Directory -Path $cloneRoot -Force | Out-Null
+            if ($State.CloneCreatesDisk) {
+                [IO.File]::WriteAllText((Join-Path $cloneRoot 'system.img'), 'clone disk payload')
+            }
+            $State.Instances = @($State.Instances) + [pscustomobject]@{
+                Index = [int]$State.CloneIndex
+                Name = $State.CloneName
+                IsMain = $false
+                Running = $false
+                Android = $State.CloneAndroid
+            }
+            return [pscustomobject]@{ ExitCode = 0; Text = '{"error_code":0}' }
+        }
+        return [pscustomobject]@{ ExitCode = 1; Text = '{"error_code":1}' }
+    }.GetNewClosure()
+}
+
+function New-SafetyCloneJournal {
+    param(
+        [string]$Root,
+        [object]$Instance
+    )
+
+    return New-OperationJournal -Root $Root -Operation 'Root12' -Instance $Instance
+}
+
+function Assert-SafetyFailedClone {
+    param(
+        [object]$Result,
+        [object]$Journal,
+        [string]$Message
+    )
+
+    Assert-Equal 'CriticalError' $Result.Status $Message
+    Assert-Equal 'Failed' $Journal.State "$Message The failure was not journaled."
+    $reopened = Get-OperationJournal -Path $Journal.JournalPath
+    Assert-Equal 'Failed' $reopened.State "$Message The failure was not persisted."
+    Assert-Equal 'CriticalError' $reopened.Result.Status "$Message The persisted result status is invalid."
+    Assert-True ($reopened.Result.Message -ceq $Result.Message) "$Message The persisted message changed."
+    Assert-True (@($reopened.Checkpoints).Count -ge 1) "$Message No failure checkpoint was recorded."
+}
+
+function Invoke-SafetyTests {
+    foreach ($commandName in @('Test-ToolkitAdministrator', 'Invoke-ElevatedToolkitAction', 'New-InstanceClone', 'Backup-ChangedFile', 'Restore-BackupFile')) {
+        Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Safety command is unavailable: $commandName"
+    }
+    Assert-True (Test-Path -LiteralPath $elevationScriptPath -PathType Leaf) 'src/Elevation.ps1 does not exist.'
+    Assert-True (Test-Path -LiteralPath $backupScriptPath -PathType Leaf) 'src/Backup.ps1 does not exist.'
+
+    $preflight = Test-ToolkitAdministrator
+    Assert-True ($preflight -is [bool]) 'Administrator preflight did not return a boolean.'
+
+    $elevationSource = [IO.File]::ReadAllText($elevationScriptPath)
+    $backupSource = [IO.File]::ReadAllText($backupScriptPath)
+    Assert-True ($elevationSource -match 'Start-Process') 'Elevation does not launch a direct child process.'
+    Assert-True ($elevationSource -match "'RunAs'") 'Elevation does not use the runas shell verb.'
+    foreach ($forbidden in @(
+            'schtasks',
+            'ScheduledTask',
+            'Unregister-ScheduledTask',
+            'EnableLUA',
+            'ConsentPromptBehavior',
+            'Set-MpPreference',
+            'takeown',
+            'icacls',
+            'Set-Acl',
+            'Get-Acl',
+            'Set-ItemProperty',
+            'Set-ExecutionPolicy',
+            'ExecutionPolicy Bypass',
+            'Invoke-Expression',
+            'ScriptBlock]::Create',
+            'Add-Type',
+            'DownloadString',
+            'Invoke-WebRequest',
+            'Invoke-RestMethod',
+            'New-Service'
+        )) {
+        Assert-True ($elevationSource -notmatch [regex]::Escape($forbidden)) "Elevation source uses a forbidden construct: $forbidden"
+    }
+    foreach ($forbidden in @('icacls', 'Set-Acl', 'Get-Acl', 'takeown', 'Set-ItemProperty', 'Set-ExecutionPolicy', 'Invoke-Expression', 'ScriptBlock]::Create', 'Add-Type', 'DownloadString', 'Invoke-WebRequest')) {
+        Assert-True ($backupSource -notmatch [regex]::Escape($forbidden)) "Backup source uses a forbidden construct: $forbidden"
+    }
+
+    $fakeScript = Join-Path $testRoot 'elevated child action.ps1'
+    [IO.File]::WriteAllText($fakeScript, 'exit 0')
+    $elevationState = @{ Calls = @() }
+    $fakeDeniedRunner = {
+        param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+        $elevationState.Calls += ,@([pscustomobject]@{
+                FilePath = $ActualFilePath
+                Arguments = $ActualArgumentList
+                Verb = $ActualVerb
+            })
+        throw (New-Object ComponentModel.Win32Exception 1223)
+    }.GetNewClosure()
+
+    $denied = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'Denied') -Runner $fakeDeniedRunner
+    Assert-True ($denied.Status -eq 'CriticalError') 'Denied UAC elevation was treated as success.'
+    Assert-True ($denied.Message -match '(?i)denied|cancelled') 'Denied UAC elevation did not report a permission error.'
+
+    $elevationCall = @($elevationState.Calls)[0]
+    Assert-Equal 'powershell.exe' ([IO.Path]::GetFileName($elevationCall.FilePath)) 'Elevation did not launch PowerShell directly.'
+    Assert-Equal 'RunAs' $elevationCall.Verb 'Elevation did not request the direct UAC runas verb.'
+    $elevationArguments = [string[]]@($elevationCall.Arguments)
+    Assert-True ($elevationArguments -ccontains '-NoProfile') 'Elevated child was launched without -NoProfile.'
+    $executionPolicyIndex = [array]::IndexOf($elevationArguments, '-ExecutionPolicy')
+    Assert-True ($executionPolicyIndex -ge 0) 'Elevated child was launched without -ExecutionPolicy.'
+    Assert-Equal 'RemoteSigned' $elevationArguments[$executionPolicyIndex + 1] 'Elevated child execution policy is invalid.'
+    $entryIndex = [array]::IndexOf($elevationArguments, '-File')
+    Assert-True ($entryIndex -ge 0) 'Elevated child was launched without a file entry point.'
+    Assert-True ([string]::Equals($elevationArguments[$entryIndex + 1], [IO.Path]::GetFullPath($elevationScriptPath), [StringComparison]::OrdinalIgnoreCase)) 'Elevated child did not use the toolkit elevation entry point.'
+    $payloadIndex = [array]::IndexOf($elevationArguments, '-ChildAction')
+    Assert-True ($payloadIndex -ge 0) 'Elevated child did not receive a structured child action payload.'
+    $payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($elevationArguments[$payloadIndex + 1]))
+    $payload = $payloadJson | ConvertFrom-Json
+    Assert-Equal $fakeScript $payload.Action 'Elevated child payload changed the action path.'
+    Assert-Equal '-Fixture|Denied' (@($payload.Arguments) -join '|') 'Elevated child payload changed the argument array.'
+
+    $nonElevatedRunner = {
+        param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+        [pscustomobject]@{ ExitCode = 1223; Text = '' }
+    }
+    $nonElevated = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'NotElevated') -Runner $nonElevatedRunner
+    Assert-Equal 'CriticalError' $nonElevated.Status 'A non-elevated child was treated as success.'
+    Assert-True ($nonElevated.Message -match '(?i)administrator') 'Non-elevated child did not report an elevation verification failure.'
+    Assert-Equal $false $nonElevated.Data.Elevated 'Non-elevated child was reported as elevated.'
+
+    $successRunner = {
+        param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+        [pscustomobject]@{ ExitCode = 0; Text = '' }
+    }
+    $elevated = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'Granted') -Runner $successRunner
+    Assert-Equal 'Success' $elevated.Status 'A verified elevated child action was rejected.'
+    Assert-Equal 0 $elevated.Data.ExitCode 'Elevated child exit code was not preserved.'
+    Assert-Equal $true $elevated.Data.Elevated 'Verified elevated child was not reported as elevated.'
+    Assert-Equal ($preflight) $elevated.Data.AlreadyElevated 'The caller token preflight was not reported.'
+
+    $failureRunner = {
+        param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+        [pscustomobject]@{ ExitCode = 3; Text = '' }
+    }
+    $failedAction = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'Failed') -Runner $failureRunner
+    Assert-Equal 'CriticalError' $failedAction.Status 'A failed elevated child action was treated as success.'
+    Assert-Equal 3 $failedAction.Data.ExitCode 'Failed elevated child exit code was not preserved.'
+
+    $emptyRunnerState = @{ Count = 0 }
+    $unreachableRunner = {
+        param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+        $emptyRunnerState.Count++
+        [pscustomobject]@{ ExitCode = 0; Text = '' }
+    }.GetNewClosure()
+    $blankScript = Invoke-ElevatedToolkitAction -ScriptPath '   ' -Arguments @() -Runner $unreachableRunner
+    Assert-Equal 'CriticalError' $blankScript.Status 'A blank elevated action path was accepted.'
+    $missingScript = Invoke-ElevatedToolkitAction -ScriptPath (Join-Path $testRoot 'missing action.ps1') -Arguments @() -Runner $unreachableRunner
+    Assert-Equal 'CriticalError' $missingScript.Status 'A missing elevated action path was accepted.'
+    $nonScriptAction = Join-Path $testRoot 'not-a-script.txt'
+    [IO.File]::WriteAllText($nonScriptAction, 'fixture')
+    $wrongTypeScript = Invoke-ElevatedToolkitAction -ScriptPath $nonScriptAction -Arguments @() -Runner $unreachableRunner
+    Assert-Equal 'CriticalError' $wrongTypeScript.Status 'A non-PowerShell elevated action was accepted.'
+    $actionDirectory = Join-Path $testRoot 'action directory.ps1'
+    New-Item -ItemType Directory -Path $actionDirectory -Force | Out-Null
+    $directoryScript = Invoke-ElevatedToolkitAction -ScriptPath $actionDirectory -Arguments @() -Runner $unreachableRunner
+    Assert-Equal 'CriticalError' $directoryScript.Status 'An elevated action directory was accepted.'
+    Assert-Equal 0 $emptyRunnerState.Count 'An invalid elevated action request reached the process runner.'
+
+    $childActionScript = Join-Path $testRoot 'child gate action.ps1'
+    $childMarkerPath = Join-Path $testRoot 'child gate marker.txt'
+    [IO.File]::WriteAllText($childActionScript, ("[IO.File]::WriteAllText('" + $childMarkerPath.Replace("'", "''") + "', 'ran')"))
+    $childArgumentList = @(New-ToolkitElevatedArgumentList -ScriptPath $childActionScript -Arguments @('-Fixture', 'Child'))
+    $childResult = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $childArgumentList
+    if ($preflight) {
+        Assert-Equal 0 $childResult.ExitCode 'The elevated child gate rejected an elevated parent.'
+        Assert-True ([IO.File]::Exists($childMarkerPath)) 'The elevated child did not run the action script.'
+    }
+    else {
+        Assert-Equal 1223 $childResult.ExitCode 'The non-elevated child gate did not return the elevation failure code.'
+        Assert-True (-not [IO.File]::Exists($childMarkerPath)) 'The non-elevated child gate ran the action script.'
+    }
+    if ([IO.File]::Exists($childMarkerPath)) {
+        [IO.File]::Delete($childMarkerPath)
+    }
+    $childArgumentList = @(New-ToolkitElevatedArgumentList -ScriptPath $childActionScript -Arguments @('-Fixture', 'Child'))
+    $childTextArgumentList = [string[]]@($childArgumentList)
+    $childTextArgumentList[$childTextArgumentList.Length - 1] = 'not-base64'
+    $childCorrupt = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $childTextArgumentList
+    Assert-True ($childCorrupt.ExitCode -ne 0) 'A corrupt child payload returned success.'
+    Assert-True (-not [IO.File]::Exists($childMarkerPath)) 'A corrupt child payload ran the action script.'
+
+    $cloneRoot = Join-Path $testRoot 'clone fixtures'
+    $cloneFixture = New-SafetyInstallFixture -InstallRoot (Join-Path $cloneRoot 'MuMu Global') -InstanceIndexes @(0, 2, 3)
+    $cloneJournalRoot = Join-Path $cloneRoot 'journal'
+    New-Item -ItemType Directory -Path $cloneJournalRoot -Force | Out-Null
+    $fixtureInstance = [pscustomobject]@{
+        Index = 3
+        Name = 'Target'
+        AndroidVersion = '12.0'
+        Install = [pscustomobject]@{
+            Edition = 'Global'
+            InstallRoot = $cloneFixture.InstallRoot
+            VmsPath = $cloneFixture.VmsPath
+            ManagerPath = $cloneFixture.ManagerPath
+            Source = 'Process'
+        }
+        Running = $true
+        RootSetting = $false
+        Eligible = $true
+        IneligibleReason = $null
+    }
+    $fixtureManager = $cloneFixture.ManagerPath
+
+    $cloneState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $fakeFailingCloneRunner = New-SafetyManagerRunner -State $cloneState
+    $cloneState.CloneCreatesDisk = $false
+    $fixtureJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $clone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $fixtureJournal -Runner $fakeFailingCloneRunner
+    Assert-True ($clone.Status -eq 'CriticalError') 'Unverified clone was accepted.'
+    Assert-SafetyFailedClone -Result $clone -Journal $fixtureJournal -Message 'A clone that does not boot was accepted.'
+
+    $runningState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $runningRunner = New-SafetyManagerRunner -State $runningState
+    $runningJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $runningClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $runningJournal -Runner $runningRunner
+    $cloneCommands = @($runningState.Calls | ForEach-Object { @($_) -join '|' })
+    Assert-Equal 'Success' $runningClone.Status 'A verified clone of a running instance was rejected.'
+    Assert-True ($cloneCommands -contains 'control|-v|3|shutdown') 'A running instance was not stopped before the clone.'
+    Assert-True ((@($cloneCommands).IndexOf('control|-v|3|shutdown')) -lt (@($cloneCommands).IndexOf('clone|-v|3|-n|1'))) 'The clone was invoked before the shutdown request.'
+    Assert-True ($cloneCommands -contains 'clone|-v|3|-n|1') 'The clone command was not issued with structured arguments.'
+    Assert-Equal 4 $runningClone.Data.CloneIndex 'The clone index was not identified.'
+    Assert-Equal 3 $runningClone.Data.SourceIndex 'The source instance index changed.'
+    Assert-Equal 'Target clone' $runningClone.Data.CloneName 'The verified clone name is invalid.'
+    Assert-Equal '12.0' $runningClone.Data.AndroidVersion 'The verified clone Android version is invalid.'
+    Assert-Equal $true $runningClone.Data.BootReady 'The verified clone was not reported as boot ready.'
+    Assert-True ($runningClone.Data.DiskBytes -gt 0) 'The verified clone disk size is invalid.'
+    Assert-Equal ([IO.Path]::GetFullPath((Join-Path $cloneFixture.VmsPath '4'))) $runningClone.Data.VmsPath 'The verified clone VMS root is invalid.'
+    $reopenedCloneJournal = Get-OperationJournal -Path $runningJournal.JournalPath
+    Assert-Equal 'Running' $reopenedCloneJournal.State 'A verified clone closed the operation journal.'
+    $cloneCheckpoint = @($reopenedCloneJournal.Checkpoints)[-1]
+    Assert-Equal 4 $cloneCheckpoint.Data.CloneIndex 'The clone index was not recorded in the journal.'
+    Assert-Equal $false $runningState.Instances[2].Running 'The source instance was not left stopped after the clone.'
+    $cloneInstanceState = @($runningState.Instances | Where-Object { $_.Index -eq 4 })
+    Assert-Equal 1 $cloneInstanceState.Count 'The fake manager did not report the clone instance.'
+    Assert-Equal $false $cloneInstanceState[0].Running 'The clone was not left in a stopped state.'
+
+    $stoppedState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath -Running $false
+    $stoppedRunner = New-SafetyManagerRunner -State $stoppedState
+    $stoppedJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $stoppedClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $stoppedJournal -Runner $stoppedRunner
+    $stoppedCommands = @($stoppedState.Calls | ForEach-Object { @($_) -join '|' })
+    Assert-Equal 'Success' $stoppedClone.Status 'A verified clone of a stopped instance was rejected.'
+    Assert-True (-not ($stoppedCommands -contains 'control|-v|3|shutdown')) 'A stopped instance issued a redundant shutdown request.'
+
+    $unstableState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $unstableState.ShutdownSettles = $false
+    $unstableRunner = New-SafetyManagerRunner -State $unstableState
+    $unstableJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $unstableClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $unstableJournal -Runner $unstableRunner
+    $unstableCommands = @($unstableState.Calls | ForEach-Object { @($_) -join '|' })
+    Assert-True ($unstableClone.Status -eq 'CriticalError') 'A clone of an instance that never stopped was accepted.'
+    Assert-True (-not ($unstableCommands -contains 'clone|-v|3|-n|1')) 'The clone ran without a stable stopped state.'
+    Assert-SafetyFailedClone -Result $unstableClone -Journal $unstableJournal -Message 'An instance without a stable stopped state was cloned.'
+
+    $androidState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $androidState.CloneAndroid = '15.0'
+    $androidRunner = New-SafetyManagerRunner -State $androidState
+    $androidJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $androidClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $androidJournal -Runner $androidRunner
+    Assert-True ($androidClone.Status -eq 'CriticalError') 'A clone with the wrong Android version was accepted.'
+    Assert-True ($androidClone.Message -match '(?i)android') 'The Android version failure did not name the field.'
+    Assert-SafetyFailedClone -Result $androidClone -Journal $androidJournal -Message 'A clone with the wrong Android version was accepted.'
+
+    $collisionState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $collisionState.CloneName = 'Other'
+    $collisionRunner = New-SafetyManagerRunner -State $collisionState
+    $collisionJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $collisionClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $collisionJournal -Runner $collisionRunner
+    Assert-True ($collisionClone.Status -eq 'CriticalError') 'A clone with a colliding name was accepted.'
+    Assert-True ($collisionClone.Message -match '(?i)name') 'The clone name collision failure did not name the field.'
+    Assert-SafetyFailedClone -Result $collisionClone -Journal $collisionJournal -Message 'A clone with a colliding name was accepted.'
+
+    $noIndexState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $noIndexState.CloneIndex = 3
+    $noIndexRunner = New-SafetyManagerRunner -State $noIndexState
+    $noIndexJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $noIndexClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $noIndexJournal -Runner $noIndexRunner
+    Assert-True ($noIndexClone.Status -eq 'CriticalError') 'A clone that reused the source index was accepted.'
+    Assert-SafetyFailedClone -Result $noIndexClone -Journal $noIndexJournal -Message 'A clone that reused the source index was accepted.'
+
+    $cloneFailureState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $cloneFailureState.CloneExitCode = 1
+    $cloneFailureRunner = New-SafetyManagerRunner -State $cloneFailureState
+    $cloneFailureJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $cloneFailure = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $cloneFailureJournal -Runner $cloneFailureRunner
+    Assert-True ($cloneFailure.Status -eq 'CriticalError') 'A failed manager clone command was treated as success.'
+    Assert-SafetyFailedClone -Result $cloneFailure -Journal $cloneFailureJournal -Message 'A failed manager clone command was treated as success.'
+
+    $unknownState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath
+    $unknownState.Instances[2].Running = 'unknown'
+    $unknownRunner = New-SafetyManagerRunner -State $unknownState
+    $unknownJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $unknownClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $unknownJournal -Runner $unknownRunner
+    Assert-True ($unknownClone.Status -eq 'CriticalError') 'An unknown source running state was cloned.'
+    Assert-True ($unknownClone.Message -match '(?i)running') 'The unknown running state failure did not name the field.'
+
+    $unreachableCloneState = @{ Count = 0 }
+    $unreachableCloneRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+        $unreachableCloneState.Count++
+        [pscustomobject]@{ ExitCode = 0; Text = '' }
+    }.GetNewClosure()
+    $unreachableJournal = New-SafetyCloneJournal -Root $cloneJournalRoot -Instance $fixtureInstance
+    $unrelatedManager = Join-Path $cloneRoot 'unrelated tool.exe'
+    [IO.File]::WriteAllText($unrelatedManager, 'unrelated fixture')
+    $unrelatedManagerClone = New-InstanceClone -ManagerPath $unrelatedManager -Instance $fixtureInstance -Journal $unreachableJournal -Runner $unreachableCloneRunner
+    Assert-Equal 'CriticalError' $unrelatedManagerClone.Status 'An unrelated executable was accepted as the clone manager.'
+    $missingManagerClone = New-InstanceClone -ManagerPath (Join-Path $cloneRoot 'shell\MuMuManager.exe') -Instance $fixtureInstance -Journal $unreachableJournal -Runner $unreachableCloneRunner
+    Assert-Equal 'CriticalError' $missingManagerClone.Status 'A missing clone manager was accepted.'
+    $invalidInstance = [pscustomobject]@{ Index = 'not-an-index'; Name = 'Target'; AndroidVersion = '12.0'; Install = $fixtureInstance.Install }
+    $invalidInstanceClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $invalidInstance -Journal $unreachableJournal -Runner $unreachableCloneRunner
+    Assert-Equal 'CriticalError' $invalidInstanceClone.Status 'An invalid source instance was accepted.'
+    $missingVmsInstance = [pscustomobject]@{ Index = 3; Name = 'Target'; AndroidVersion = '12.0'; Install = [pscustomobject]@{ Edition = 'Global'; InstallRoot = $fixtureInstance.Install.InstallRoot; ManagerPath = $fixtureManager; Source = 'Process' } }
+    $missingVmsClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $missingVmsInstance -Journal $unreachableJournal -Runner $unreachableCloneRunner
+    Assert-Equal 'CriticalError' $missingVmsClone.Status 'A source instance without a VMS path was accepted.'
+    $nullJournalClone = New-InstanceClone -ManagerPath $fixtureManager -Instance $fixtureInstance -Journal $null -Runner $unreachableCloneRunner
+    Assert-Equal 'CriticalError' $nullJournalClone.Status 'A clone without a journal was accepted.'
+    Assert-Equal 0 $unreachableCloneState.Count 'An invalid clone request reached the process runner.'
+
+    $backupBase = Join-Path $testRoot 'backups'
+    New-Item -ItemType Directory -Path $backupBase -Force | Out-Null
+    $backupRoot = Join-Path $backupBase ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-root12')
+    New-Item -ItemType Directory -Path $backupRoot | Out-Null
+    $mutatedDirectory = Join-Path $testRoot 'mutated files'
+    New-Item -ItemType Directory -Path $mutatedDirectory -Force | Out-Null
+    $configPath = Join-Path $mutatedDirectory 'campaign.json'
+    [IO.File]::WriteAllText($configPath, '{"ad":true}')
+    $backup = Backup-ChangedFile -Path $configPath -BackupRoot $backupRoot
+    Assert-Equal 'Success' $backup.Status 'A changed file was not backed up.'
+    $backupRecord = $backup.Data
+    $recordProperties = @($backupRecord.PSObject.Properties | ForEach-Object { $_.Name })
+    Assert-Equal 5 $recordProperties.Count 'Backup record property count is invalid.'
+    foreach ($recordProperty in @('Source', 'Backup', 'Sha256', 'ReadOnly', 'Length')) {
+        Assert-True ($recordProperties -ccontains $recordProperty) "Backup record is missing a property: $recordProperty"
+    }
+    Assert-Equal $configPath $backupRecord.Source 'Backup record source is invalid.'
+    Assert-Equal 'campaign.json' ([IO.Path]::GetFileName($backupRecord.Backup)) 'Backup file name is invalid.'
+    Assert-True ($backupRecord.Backup.StartsWith($backupRoot, [StringComparison]::OrdinalIgnoreCase)) 'Backup escaped the per-operation backup root.'
+    Assert-Equal (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash $backupRecord.Sha256 'Backup record hash does not match the source.'
+    Assert-Equal (Get-Item -LiteralPath $configPath).Length $backupRecord.Length 'Backup record length does not match the source.'
+    Assert-Equal $false $backupRecord.ReadOnly 'A writable source was recorded as read-only.'
+    Assert-Equal '{"ad":true}' ([IO.File]::ReadAllText($backupRecord.Backup)) 'Backup bytes do not match the source.'
+
+    $readOnlyPath = Join-Path $mutatedDirectory 'locked.json'
+    [IO.File]::WriteAllText($readOnlyPath, '{"locked":true}')
+    $readOnlyItem = Get-Item -LiteralPath $readOnlyPath
+    $readOnlyItem.IsReadOnly = $true
+    $readOnlyBackup = Backup-ChangedFile -Path $readOnlyPath -BackupRoot $backupRoot
+    Assert-Equal 'Success' $readOnlyBackup.Status 'A read-only file was not backed up.'
+    Assert-Equal $true $readOnlyBackup.Data.ReadOnly 'The original read-only state was not recorded.'
+    Assert-Equal $false (Get-Item -LiteralPath $readOnlyBackup.Data.Backup).IsReadOnly 'The backup copy is not owner-readable.'
+    Assert-Equal $true (Get-Item -LiteralPath $readOnlyPath).IsReadOnly 'Backing up a read-only source changed its read-only state.'
+
+    $duplicateBackup = Backup-ChangedFile -Path $configPath -BackupRoot $backupRoot
+    Assert-Equal 'CriticalError' $duplicateBackup.Status 'A duplicate backup record was accepted.'
+    Assert-True ($duplicateBackup.Message -match '(?i)exists|duplicate') 'The duplicate backup failure did not explain the collision.'
+    Assert-Equal '{"ad":true}' ([IO.File]::ReadAllText($backupRecord.Backup)) 'A refused duplicate backup overwrote the existing backup.'
+
+    $missingSourceBackup = Backup-ChangedFile -Path (Join-Path $mutatedDirectory 'missing.json') -BackupRoot $backupRoot
+    Assert-Equal 'CriticalError' $missingSourceBackup.Status 'A missing backup source was accepted.'
+    $directorySourceBackup = Backup-ChangedFile -Path $mutatedDirectory -BackupRoot $backupRoot
+    Assert-Equal 'CriticalError' $directorySourceBackup.Status 'A directory backup source was accepted.'
+    $vmsRootSourceBackup = Backup-ChangedFile -Path $cloneFixture.VmsPath -BackupRoot $backupRoot
+    Assert-Equal 'CriticalError' $vmsRootSourceBackup.Status 'A VMS instance directory was accepted as a backup source.'
+    $missingRootBackup = Backup-ChangedFile -Path $configPath -BackupRoot (Join-Path $backupBase 'missing root')
+    Assert-Equal 'CriticalError' $missingRootBackup.Status 'A missing backup root was accepted.'
+    $blankRootBackup = Backup-ChangedFile -Path $configPath -BackupRoot '   '
+    Assert-Equal 'CriticalError' $blankRootBackup.Status 'A blank backup root was accepted.'
+    $blankSourceBackup = Backup-ChangedFile -Path '   ' -BackupRoot $backupRoot
+    Assert-Equal 'CriticalError' $blankSourceBackup.Status 'A blank backup source was accepted.'
+    $rootFileBackup = Backup-ChangedFile -Path $configPath -BackupRoot $configPath
+    Assert-Equal 'CriticalError' $rootFileBackup.Status 'A file was accepted as the backup root.'
+    Assert-Equal 2 @([IO.Directory]::GetFiles($backupRoot)).Count 'A refused backup request created a file.'
+
+    $readOnlyTarget = Get-Item -LiteralPath $readOnlyPath
+    $readOnlyTarget.IsReadOnly = $false
+    [IO.File]::WriteAllText($readOnlyPath, '{"locked":false}')
+    $readOnlyRestore = Restore-BackupFile -BackupRecord $readOnlyBackup.Data
+    Assert-Equal 'Success' $readOnlyRestore.Status 'A read-only backup was not restored.'
+    Assert-Equal '{"locked":true}' ([IO.File]::ReadAllText($readOnlyPath)) 'The read-only restore changed the file bytes.'
+    Assert-Equal $true (Get-Item -LiteralPath $readOnlyPath).IsReadOnly 'The original read-only state was not preserved.'
+    Assert-True ([IO.File]::Exists($readOnlyBackup.Data.Backup)) 'The restore deleted the only original backup.'
+
+    [IO.File]::WriteAllText($configPath, '{"ad":false}')
+    $restore = Restore-BackupFile -BackupRecord $backupRecord
+    Assert-Equal 'Success' $restore.Status 'A changed file was not restored.'
+    Assert-Equal '{"ad":true}' ([IO.File]::ReadAllText($configPath)) 'The restored bytes do not match the backup.'
+    Assert-True ([IO.File]::Exists($backupRecord.Backup)) 'The restore deleted the only original backup.'
+
+    $tamperedRoot = Join-Path $backupBase ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ') + '-tampered')
+    New-Item -ItemType Directory -Path $tamperedRoot | Out-Null
+    $tamperedSource = Join-Path $mutatedDirectory 'tampered.json'
+    [IO.File]::WriteAllText($tamperedSource, 'original bytes')
+    $tamperedBackup = Backup-ChangedFile -Path $tamperedSource -BackupRoot $tamperedRoot
+    Assert-Equal 'Success' $tamperedBackup.Status 'The tamper fixture was not backed up.'
+    [IO.File]::WriteAllText($tamperedSource, 'mutated bytes')
+    [IO.File]::WriteAllText($tamperedBackup.Data.Backup, 'ORIGINAL bytes')
+    Assert-Equal $tamperedBackup.Data.Length ([IO.FileInfo]$tamperedBackup.Data.Backup).Length 'The tamper fixture is not the same length as the source.'
+    $hashMismatch = Restore-BackupFile -BackupRecord $tamperedBackup.Data
+    Assert-Equal 'CriticalError' $hashMismatch.Status 'A backup hash mismatch was accepted.'
+    Assert-True ($hashMismatch.Message -match '(?i)hash') 'The backup hash failure did not name the hash.'
+    Assert-Equal 'mutated bytes' ([IO.File]::ReadAllText($tamperedSource)) 'A failed hash verification changed the source file.'
+
+    $lengthSource = Join-Path $mutatedDirectory 'length.json'
+    [IO.File]::WriteAllText($lengthSource, 'twelve bytes')
+    $lengthBackup = Backup-ChangedFile -Path $lengthSource -BackupRoot $tamperedRoot
+    Assert-Equal 'Success' $lengthBackup.Status 'The length fixture was not backed up.'
+    [IO.File]::WriteAllText($lengthSource, 'mutated now!')
+    [IO.File]::WriteAllText($lengthBackup.Data.Backup, 'short')
+    $lengthMismatch = Restore-BackupFile -BackupRecord $lengthBackup.Data
+    Assert-Equal 'CriticalError' $lengthMismatch.Status 'A backup length mismatch was accepted.'
+    Assert-True ($lengthMismatch.Message -match '(?i)length') 'The backup length failure did not name the length.'
+    Assert-Equal 'mutated now!' ([IO.File]::ReadAllText($lengthSource)) 'A failed length verification changed the source file.'
+    [IO.File]::Delete($lengthBackup.Data.Backup)
+    $missingBackupRestore = Restore-BackupFile -BackupRecord $lengthBackup.Data
+    Assert-Equal 'CriticalError' $missingBackupRestore.Status 'A missing backup file was accepted.'
+    Assert-Equal 'mutated now!' ([IO.File]::ReadAllText($lengthSource)) 'A missing backup file changed the source file.'
+
+    $deletedSource = Join-Path $mutatedDirectory 'deleted.json'
+    [IO.File]::WriteAllText($deletedSource, 'recover me')
+    $deletedBackup = Backup-ChangedFile -Path $deletedSource -BackupRoot $backupRoot
+    Assert-Equal 'Success' $deletedBackup.Status 'The deletion fixture was not backed up.'
+    [IO.File]::Delete($deletedSource)
+    $deletedRestore = Restore-BackupFile -BackupRecord $deletedBackup.Data
+    Assert-Equal 'Success' $deletedRestore.Status 'A deleted file was not recovered from its backup.'
+    Assert-Equal 'recover me' ([IO.File]::ReadAllText($deletedSource)) 'The recovered bytes do not match the backup.'
+
+    $invalidRecords = @(
+        [pscustomobject]@{ Label = 'null'; Record = $null },
+        [pscustomobject]@{ Label = 'array'; Record = @($backupRecord) },
+        [pscustomobject]@{ Label = 'string'; Record = 'invalid' },
+        [pscustomobject]@{ Label = 'missing property'; Record = [pscustomobject]@{ Source = $configPath; Backup = $backupRecord.Backup; Sha256 = $backupRecord.Sha256; ReadOnly = $false } },
+        [pscustomobject]@{ Label = 'extra property'; Record = [pscustomobject]@{ Source = $configPath; Backup = $backupRecord.Backup; Sha256 = $backupRecord.Sha256; ReadOnly = $false; Length = $backupRecord.Length; Extra = 'invalid' } },
+        [pscustomobject]@{ Label = 'bad hash'; Record = [pscustomobject]@{ Source = $configPath; Backup = $backupRecord.Backup; Sha256 = 'not-a-hash'; ReadOnly = $false; Length = $backupRecord.Length } },
+        [pscustomobject]@{ Label = 'bad read-only'; Record = [pscustomobject]@{ Source = $configPath; Backup = $backupRecord.Backup; Sha256 = $backupRecord.Sha256; ReadOnly = 'maybe'; Length = $backupRecord.Length } },
+        [pscustomobject]@{ Label = 'bad length'; Record = [pscustomobject]@{ Source = $configPath; Backup = $backupRecord.Backup; Sha256 = $backupRecord.Sha256; ReadOnly = $false; Length = 'twelve' } },
+        [pscustomobject]@{ Label = 'blank source'; Record = [pscustomobject]@{ Source = '   '; Backup = $backupRecord.Backup; Sha256 = $backupRecord.Sha256; ReadOnly = $false; Length = $backupRecord.Length } },
+        [pscustomobject]@{ Label = 'blank backup'; Record = [pscustomobject]@{ Source = $configPath; Backup = '   '; Sha256 = $backupRecord.Sha256; ReadOnly = $false; Length = $backupRecord.Length } }
+    )
+    foreach ($invalidRecord in $invalidRecords) {
+        $invalidRestore = Restore-BackupFile -BackupRecord $invalidRecord.Record
+        Assert-Equal 'CriticalError' $invalidRestore.Status "An invalid backup record was accepted: $($invalidRecord.Label)"
+    }
+    $directoryTarget = Join-Path $mutatedDirectory 'target dir'
+    New-Item -ItemType Directory -Path $directoryTarget -Force | Out-Null
+    $directoryTargetRecord = [pscustomobject]@{
+        Source = $directoryTarget
+        Backup = $backupRecord.Backup
+        Sha256 = $backupRecord.Sha256
+        ReadOnly = $false
+        Length = $backupRecord.Length
+    }
+    $directoryTargetRestore = Restore-BackupFile -BackupRecord $directoryTargetRecord
+    Assert-Equal 'CriticalError' $directoryTargetRestore.Status 'A restore over a directory was accepted.'
+    Assert-True (Test-Path -LiteralPath $directoryTarget -PathType Container) 'A refused restore replaced a directory with a file.'
+}
+
 function Invoke-CommonTests {
     Assert-True ($null -ne (Get-Command Get-ToolkitLogPath -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitLogPath is unavailable.'
     $logRoot = Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit\logs'
@@ -1816,6 +2385,9 @@ try {
         'Discovery' {
             Invoke-DiscoveryTests
         }
+        'Safety' {
+            Invoke-SafetyTests
+        }
         'All' {
             Invoke-ManifestTests
             Invoke-AssetTests
@@ -1823,6 +2395,7 @@ try {
             Invoke-ProcessTests
             Invoke-JournalTests
             Invoke-DiscoveryTests
+            Invoke-SafetyTests
             Invoke-CommonTests
         }
     }
