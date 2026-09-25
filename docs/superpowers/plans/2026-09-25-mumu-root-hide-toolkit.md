@@ -500,7 +500,7 @@ git commit -m "feat: add reversible Mumu ad suppression"
 - Produces `Get-Android12KitsunePrompt` returning the exact text `Install -> Direct Install into system partition`.
 - Produces `Test-KitsuneConfirmation` accepting only `Direct Install into system partition`, and `Read-Android12KitsuneConfirmation` with the `$script:ToolkitKitsuneDefaultPrompt` seam for the operator prompt, defaulting to `Read-Host`.
 - Produces `Prepare-Android12Asset -Manifest <object> [-CacheRoot <string>] [-RequireCached] [-Fetch <scriptblock>]` so the controller can fetch and verify the pinned APK before any elevated phase.
-- Produces `Get-Android12RootSetting -ManagerPath <string> -Index <int>` returning the vendor root setting with a distinct code for every unsupported or malformed manager response shape.
+- Produces `Get-ToolkitRootSetting -ManagerPath <string> -Index <int>` in `src/Verification.ps1`, shared with the Android 15 flow, returning the vendor root setting with a distinct code for every unsupported or malformed manager response shape, including `INDEX_MISMATCH` when the response names another instance.
 - Produces `Resolve-Android12Clone` and `Assert-Android12ResumeClone` so a successful clone with missing data, or a recorded clone that no longer matches, is refused before any further mutation. `-ResumeClone` accepts either the recovery record of a failed call or an equivalent object.
 - Produces `Format-Android12InstallCommand` building the single quoted `install -r "<path>"` command element for MuMuManager.
 - Produces `Test-Android12Root -ManagerPath <string> -InstanceIndex <int>` returning package, daemon, and root checks.
@@ -581,8 +581,9 @@ git commit -m "feat: add guided Android 12 Kitsune rooting"
 - Modify: `tests/Run-Tests.ps1`
 
 **Interfaces:**
-- Produces `Enable-Android15Root -Instance <object> -Journal <object> [-Runner <scriptblock>]` returning the root-toggle and cold-boot result.
-- Produces `Test-Android15Root -ManagerPath <string> -InstanceIndex <int>` returning `RootPermission`, `KernelSU`, `RootShell`, and `KitsuneAbsent` fields.
+- Produces `Enable-Android15Root -Instance <object> -Journal <object> [-Confirmed] [-Runner <scriptblock>]` returning the root-toggle and cold-boot result. `-Confirmed` is an explicit switch: without it the call returns `USER_CONFIRMATION_REQUIRED` before any manager or clone mutation, and the controller collects that confirmation explicitly rather than auto-confirming.
+- Produces `Test-Android15Root -ManagerPath <string> -InstanceIndex <int> [-Runner <scriptblock>]` returning `RootPermission`, `KernelSU`, `RootShell`, and `KitsuneAbsent` fields.
+- Consumes the shared read-only primitives in `src/Verification.ps1`: `Invoke-ToolkitManagerAdb`, `Wait-ToolkitBootCompleted`, `Get-ToolkitRootSetting`, `Get-ToolkitPackageVersion`, `Get-ToolkitRootShellStatus`, and `New-ToolkitRootFailure`. Both root workflows use them, so the ADB request shape, the boot wait, the vendor root reader, the package identity rule, and the failure closer exist once.
 
 - [ ] **Step 1: Write failing Android 15 tests**
 
@@ -621,7 +622,7 @@ function Enable-Android15Root {
 
 - [ ] **Step 4: Add negative and idempotency tests**
 
-Cover already-enabled root, missing root toggle, failed boot, absent KernelSU, denied root shell, and an Android 15 instance with an existing unrelated Kitsune package. The function must report `AlreadyApplied` only when verification passes.
+Cover already-enabled root, missing root toggle, failed boot, absent KernelSU, a near-name KernelSU package, a denied root shell, an ADB transport failure that is not a root-shell denial, an unfiltered package list that returns a usage or error string, a vendor root setting that names another instance, and an Android 15 instance with an existing unrelated Kitsune package. The function must report `AlreadyApplied` only when verification passes, must reject an unconfirmed call with `USER_CONFIRMATION_REQUIRED` before any manager call, and must issue the bare `shell pm list packages` request rather than an unverified filtered form.
 
 - [ ] **Step 5: Run tests and commit**
 

@@ -11,8 +11,6 @@ $script:ToolkitKitsuneDefaultPrompt = {
 
     return Read-Android12KitsuneConfirmation -PromptText $PromptText
 }
-$script:ToolkitBootPollAttempts = 30
-$script:ToolkitBootPollDelaySeconds = 3
 
 function Get-Android12KitsunePrompt {
     return $script:ToolkitKitsunePrompt
@@ -37,18 +35,6 @@ function Read-Android12KitsuneConfirmation {
     catch {
         return ''
     }
-}
-
-function Invoke-Android12Adb {
-    param(
-        [string]$ManagerPath,
-        [int]$InstanceIndex,
-        [Parameter(Mandatory = $true)]
-        [string]$Command,
-        [scriptblock]$Runner = $null
-    )
-
-    return Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('adb', '-v', ([string]$InstanceIndex), '-c', $Command) -Runner $Runner
 }
 
 function Format-Android12InstallCommand {
@@ -95,35 +81,6 @@ function New-Android12Recovery {
     return $record
 }
 
-function New-Android12RootFailure {
-    param(
-        [object]$Journal,
-        [string]$Message,
-        [object]$Data = $null
-    )
-
-    $message = Protect-ToolkitText $Message
-    if ([string]::IsNullOrWhiteSpace($message)) {
-        $message = 'The Android 12 root workflow failed.'
-    }
-    $result = Get-ToolkitResult -Status 'CriticalError' -Message $message -Data $Data
-    $journalState = $null
-    if ($null -ne $Journal -and $null -ne $Journal.PSObject -and $null -ne $Journal.PSObject.Properties['State']) {
-        $journalState = $Journal.State
-    }
-    if ($journalState -ne 'Running') {
-        return $result
-    }
-    try {
-        Write-JournalEvent -Journal $Journal -Level 'Error' -Message $message -Data $Data
-        Fail-OperationJournal -Journal $Journal -Result $result
-    }
-    catch {
-        return Get-ToolkitResult -Status 'CriticalError' -Message ($message + ' The failure could not be journaled.') -Data $Data
-    }
-    return $result
-}
-
 function Prepare-Android12Asset {
     param(
         [object]$Manifest,
@@ -153,72 +110,6 @@ function Prepare-Android12Asset {
         return Get-ToolkitResult -Status 'CriticalError' -Message ('The pinned Kitsune asset was not verified. ' + $asset.Message) -Data (@{ Code = 'ASSET_VERIFICATION_FAILED' })
     }
     return Get-ToolkitResult -Status 'Success' -Message 'The pinned Kitsune asset is verified in the dependency cache.' -Data ([string]$asset.Data)
-}
-
-function Get-Android12RootSetting {
-    param(
-        [string]$ManagerPath,
-        [int]$Index,
-        [scriptblock]$Runner = $null
-    )
-
-    $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
-    if ($null -eq $manager -or $Index -lt 0) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting manager is invalid.' -Data (@{ Code = 'MANAGER_UNAVAILABLE' })
-    }
-
-    $result = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$Index), '-k', 'root_permission') -Runner $Runner
-    if ($null -eq $result -or $result.ExitCode -ne 0) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The MuMu manager did not report the vendor root setting.' -Data (@{ Code = 'MANAGER_FAILED' })
-    }
-    $text = [string]$result.Text
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting response is empty.' -Data (@{ Code = 'MANAGER_JSON_INVALID' })
-    }
-    try {
-        $parsed = $text | ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting response is not valid JSON.' -Data (@{ Code = 'MANAGER_JSON_INVALID' })
-    }
-    if ($null -eq $parsed -or $parsed -is [string] -or $parsed -is [ValueType]) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting response has an unsupported shape.' -Data (@{ Code = 'SHAPE_UNSUPPORTED' })
-    }
-    if ($parsed -is [Array]) {
-        $records = @($parsed)
-        if ($records.Count -ne 1) {
-            return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting response does not describe exactly one instance.' -Data (@{ Code = 'SHAPE_UNSUPPORTED' })
-        }
-        $record = $records[0]
-    }
-    else {
-        $record = $parsed
-    }
-    if ($null -eq $record -or $record -isnot [pscustomobject]) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting response has an unsupported shape.' -Data (@{ Code = 'SHAPE_UNSUPPORTED' })
-    }
-
-    $errorCode = Get-ToolkitFirstProperty -InputObject $record -PropertyNames @('error_code', 'errcode')
-    if ($null -ne $errorCode -and [string]$errorCode -notin @('0', 'False', 'false')) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The MuMu manager reported an error for the vendor root setting.' -Data (@{ Code = 'MANAGER_ERROR' })
-    }
-    $indexProperty = $record.PSObject.Properties['index']
-    if ($null -ne $indexProperty) {
-        $reportedIndex = 0
-        if (-not [int]::TryParse([string]$indexProperty.Value, [ref]$reportedIndex) -or $reportedIndex -ne $Index) {
-            return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting describes a different instance.' -Data (@{ Code = 'INDEX_MISMATCH' })
-        }
-    }
-
-    $reportedValue = Get-ToolkitFirstProperty -InputObject $record -PropertyNames @('root_permission', 'rootPermission', 'root_setting', 'rootSetting', 'value')
-    if ($null -eq $reportedValue) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting response carries no supported root setting field.' -Data (@{ Code = 'SHAPE_UNSUPPORTED' })
-    }
-    $value = ConvertTo-ToolkitBoolean -Value $reportedValue
-    if ($null -eq $value) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting value is not a supported boolean.' -Data (@{ Code = 'VALUE_INVALID' })
-    }
-    return Get-ToolkitResult -Status 'Success' -Message 'The vendor root setting was read.' -Data (@{ Code = 'OK'; Index = $Index; Value = [bool]$value })
 }
 
 function Get-Android12RecordField {
@@ -251,23 +142,23 @@ function Resolve-Android12Clone {
 
     if ($null -eq $CloneResult -or $CloneResult -is [Array] -or $CloneResult -isnot [pscustomobject] -or
         $null -eq $CloneResult.PSObject.Properties['Data']) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The MuMu manager reported a clone without a verified clone record.' -Data (@{ Code = 'CLONE_UNVERIFIED' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The MuMu manager reported a clone without a verified clone record.' -Data (@{ Code = 'CLONE_UNVERIFIED' })
     }
     $data = $CloneResult.Data
     if ($null -eq $data -or $data -is [Array] -or ($data -isnot [pscustomobject] -and $data -isnot [Collections.IDictionary])) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The MuMu manager reported a clone without a verified clone record.' -Data (@{ Code = 'CLONE_UNVERIFIED' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The MuMu manager reported a clone without a verified clone record.' -Data (@{ Code = 'CLONE_UNVERIFIED' })
     }
     $reportedIndex = Get-Android12RecordField -Record $data -Name 'CloneIndex'
     $cloneIndex = 0
     if ($reportedIndex -isnot [string] -and $reportedIndex -isnot [int] -and $reportedIndex -isnot [long]) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The verified clone index is invalid.' -Data (@{ Code = 'CLONE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified clone index is invalid.' -Data (@{ Code = 'CLONE_INVALID' })
     }
     if (-not [int]::TryParse([string]$reportedIndex, [ref]$cloneIndex) -or $cloneIndex -lt 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The verified clone index is invalid.' -Data (@{ Code = 'CLONE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified clone index is invalid.' -Data (@{ Code = 'CLONE_INVALID' })
     }
     $reportedName = Get-Android12RecordField -Record $data -Name 'CloneName'
     if ($reportedName -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$reportedName)) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The verified clone name is invalid.' -Data (@{ Code = 'CLONE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified clone name is invalid.' -Data (@{ Code = 'CLONE_INVALID' })
     }
     return Get-ToolkitResult -Status 'Success' -Message 'The verified clone record is usable.' -Data (@{
             Code = 'OK'
@@ -368,25 +259,23 @@ function Test-Android12Root {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The Android 12 root verification manager is invalid.' -Data (@{ Code = 'MANAGER_UNAVAILABLE' })
     }
 
-    $packageCall = Invoke-Android12Adb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command ('shell dumpsys package ' + $script:ToolkitKitsunePackageName) -Runner $Runner
+    $packageCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command ('shell dumpsys package ' + $script:ToolkitKitsunePackageName) -Runner $Runner
     if ($null -eq $packageCall -or $packageCall.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune package query failed.' -Data (@{ Code = 'ADB_FAILED' })
     }
-    $packageText = [string]$packageCall.Text
-    $nameMatch = [regex]::Match($packageText, '(?m)^\s*versionName=(\S+)')
-    $codeMatch = [regex]::Match($packageText, '(?m)^\s*versionCode=(\d+)\b')
-    if (-not $nameMatch.Success -or -not $codeMatch.Success) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message "The Kitsune package $script:ToolkitKitsunePackageName is not installed." -Data (@{
+    $packageFields = Get-ToolkitPackageVersion -Text ([string]$packageCall.Text) -PackageName $script:ToolkitKitsunePackageName
+    if ($null -eq $packageFields) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The Kitsune package $script:ToolkitKitsunePackageName is not installed." -Data @{
                 Code = 'PACKAGE_MISSING'
                 PackageName = $script:ToolkitKitsunePackageName
                 VersionName = ''
                 VersionCode = ''
                 DaemonCount = 0
                 RootVerified = $false
-            })
+            }
     }
-    $versionName = $nameMatch.Groups[1].Value
-    $versionCode = $codeMatch.Groups[1].Value
+    $versionName = [string]$packageFields.VersionName
+    $versionCode = [string]$packageFields.VersionCode
     if ($versionName -cne $script:ToolkitKitsuneVersionName -or $versionCode -cne $script:ToolkitKitsuneVersionCode) {
         return Get-ToolkitResult -Status 'CriticalError' -Message "The installed package is not the pinned Kitsune release $script:ToolkitKitsuneVersionName." -Data (@{
                 Code = 'PACKAGE_VERSION_MISMATCH'
@@ -398,7 +287,7 @@ function Test-Android12Root {
             })
     }
 
-    $daemonCall = Invoke-Android12Adb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell pidof magiskd' -Runner $Runner
+    $daemonCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell pidof magiskd' -Runner $Runner
     if ($null -eq $daemonCall -or $daemonCall.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED' })
     }
@@ -424,17 +313,17 @@ function Test-Android12Root {
             })
     }
 
-    $rootCall = Invoke-Android12Adb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
-    $rootVerified = ($null -ne $rootCall -and $rootCall.ExitCode -eq 0 -and ([string]$rootCall.Text) -match '(?m)uid=0\(')
-    if (-not $rootVerified) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root shell did not return a root identity.' -Data (@{
-                Code = 'ROOT_DENIED'
+    $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
+    $rootShell = Get-ToolkitRootShellStatus -Call $rootCall
+    if ($rootShell.Status -ne 'Success') {
+        return Get-ToolkitResult -Status 'CriticalError' -Message ('The Kitsune root shell could not be verified. ' + $rootShell.Message) -Data @{
+                Code = [string]$rootShell.Data.Code
                 PackageName = $script:ToolkitKitsunePackageName
                 VersionName = $versionName
                 VersionCode = $versionCode
                 DaemonCount = $daemonPids.Count
                 RootVerified = $false
-            })
+            }
     }
 
     return Get-ToolkitResult -Status 'Success' -Message 'The Android 12 Kitsune root is verified.' -Data (@{
@@ -445,25 +334,6 @@ function Test-Android12Root {
             DaemonCount = $daemonPids.Count
             RootVerified = $true
         })
-}
-
-function Wait-Android12BootCompleted {
-    param(
-        [string]$ManagerPath,
-        [int]$InstanceIndex,
-        [scriptblock]$Runner = $null
-    )
-
-    for ($attempt = 1; $attempt -le $script:ToolkitBootPollAttempts; $attempt++) {
-        $probe = Invoke-Android12Adb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command 'shell getprop sys.boot_completed' -Runner $Runner
-        if ($null -ne $probe -and $probe.ExitCode -eq 0 -and ([string]$probe.Text).Trim() -ceq '1') {
-            return $true
-        }
-        if ($attempt -lt $script:ToolkitBootPollAttempts) {
-            Start-Sleep -Seconds $script:ToolkitBootPollDelaySeconds
-        }
-    }
-    return $false
 }
 
 function Install-Android12Root {
@@ -486,20 +356,20 @@ function Install-Android12Root {
         Assert-OperationJournal $Journal
     }
     catch {
-        return New-Android12RootFailure -Journal $null -Message 'The Android 12 root journal is invalid.' -Data (@{ Code = 'JOURNAL_INVALID' })
+        return New-ToolkitRootFailure -Journal $null -Message 'The Android 12 root journal is invalid.' -Data (@{ Code = 'JOURNAL_INVALID' })
     }
 
     if ($null -eq $Instance -or $Instance -is [Array] -or $Instance -isnot [pscustomobject]) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
     }
     $indexProperty = $Instance.PSObject.Properties['Index']
     if ($null -eq $indexProperty -or
         ($indexProperty.Value -isnot [string] -and $indexProperty.Value -isnot [int] -and $indexProperty.Value -isnot [long])) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
     }
     $sourceIndex = 0
     if (-not [int]::TryParse([string]$indexProperty.Value, [ref]$sourceIndex) -or $sourceIndex -lt 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
     }
 
     $versionProperty = $Instance.PSObject.Properties['AndroidVersion']
@@ -508,7 +378,7 @@ function Install-Android12Root {
         $sourceVersion = ConvertTo-ToolkitAndroidVersion -Value $versionProperty.Value
     }
     if ($sourceVersion -cne '12.0') {
-        return New-Android12RootFailure -Journal $Journal -Message 'Android 12 root requires an Android 12 instance. Android 15 instances use the built-in KernelSU workflow.' -Data (@{
+        return New-ToolkitRootFailure -Journal $Journal -Message 'Android 12 root requires an Android 12 instance. Android 15 instances use the built-in KernelSU workflow.' -Data (@{
                 Code = 'ANDROID_VERSION_UNSUPPORTED'
                 AndroidVersion = [string]$sourceVersion
             })
@@ -516,7 +386,7 @@ function Install-Android12Root {
 
     $installProperty = $Instance.PSObject.Properties['Install']
     if ($null -eq $installProperty -or $null -eq $installProperty.Value -or $installProperty.Value -isnot [pscustomobject]) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The selected instance is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
     }
     $installRootProperty = $installProperty.Value.PSObject.Properties['InstallRoot']
     $installManagerProperty = $installProperty.Value.PSObject.Properties['ManagerPath']
@@ -524,37 +394,37 @@ function Install-Android12Root {
     if ($null -eq $installRootProperty -or $installRootProperty.Value -isnot [string] -or
         $null -eq $installManagerProperty -or $installManagerProperty.Value -isnot [string] -or
         $null -eq $installVmsProperty -or $installVmsProperty.Value -isnot [string]) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The selected instance install is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The selected instance install is invalid.' -Data (@{ Code = 'INSTANCE_INVALID' })
     }
     $installRoot = ConvertTo-ToolkitFullPath -Path $installRootProperty.Value
     $manager = ConvertTo-ToolkitFullPath -Path $installManagerProperty.Value
     $vmsPath = ConvertTo-ToolkitFullPath -Path $installVmsProperty.Value
     if ($null -eq $manager -or $null -eq $installRoot -or
         -not (Test-ToolkitManagerFile -Path $manager -InstallRoot $installRoot)) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The MuMu manager is not a valid manager inside the selected install root.' -Data (@{ Code = 'MANAGER_UNAVAILABLE' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The MuMu manager is not a valid manager inside the selected install root.' -Data (@{ Code = 'MANAGER_UNAVAILABLE' })
     }
     if ($null -eq $vmsPath -or -not (Test-Path -LiteralPath $vmsPath -PathType Container)) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The selected instance VMS path is unavailable.' -Data (@{ Code = 'INSTANCE_INVALID' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The selected instance VMS path is unavailable.' -Data (@{ Code = 'INSTANCE_INVALID' })
     }
 
     $asset = Prepare-Android12Asset -Manifest $Manifest -CacheRoot $CacheRoot -RequireCached:$RequireCachedAsset
     if ($asset.Status -ne 'Success') {
-        return New-Android12RootFailure -Journal $Journal -Message $asset.Message -Data $asset.Data
+        return New-ToolkitRootFailure -Journal $Journal -Message $asset.Message -Data $asset.Data
     }
     $installCommand = Format-Android12InstallCommand -Path ([string]$asset.Data)
     if ($installCommand.Status -ne 'Success') {
-        return New-Android12RootFailure -Journal $Journal -Message $installCommand.Message -Data $installCommand.Data
+        return New-ToolkitRootFailure -Journal $Journal -Message $installCommand.Message -Data $installCommand.Data
     }
     $apkInstallCommand = [string]$installCommand.Data
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The pinned Kitsune asset was verified by size and SHA-256 before any instance change.' -Data (@{ Asset = [string]$asset.Data })
     }
     catch {
-        return New-Android12RootFailure -Journal $Journal -Message 'The verified Kitsune asset could not be journaled.' -Data (@{ Code = 'JOURNAL_WRITE_FAILED' })
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Kitsune asset could not be journaled.' -Data (@{ Code = 'JOURNAL_WRITE_FAILED' })
     }
 
     if (-not $Interactive) {
-        return New-Android12RootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: The Kitsune install into the system partition must be confirmed by the operator, and only ' + $script:ToolkitKitsunePrompt + ' is accepted. No instance was changed.') -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
+        return New-ToolkitRootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: The Kitsune install into the system partition must be confirmed by the operator, and only ' + $script:ToolkitKitsunePrompt + ' is accepted. No instance was changed.') -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
     }
 
     $cloneIndex = -1
@@ -562,7 +432,7 @@ function Install-Android12Root {
     if ($null -ne $ResumeClone) {
         $resumeCheck = Assert-Android12ResumeClone -ManagerPath $manager -VmsPath $vmsPath -Record $ResumeClone -Runner $Runner
         if ($resumeCheck.Status -ne 'Success') {
-            return New-Android12RootFailure -Journal $Journal -Message $resumeCheck.Message -Data (New-Android12Recovery -Code ([string]$resumeCheck.Data.Code) -Step 'resume' -SourceIndex $sourceIndex -CloneIndex ([int](Get-Android12RecordField -Record $resumeCheck.Data -Name 'CloneIndex')) -CloneName ([string](Get-Android12RecordField -Record $resumeCheck.Data -Name 'CloneName')))
+            return New-ToolkitRootFailure -Journal $Journal -Message $resumeCheck.Message -Data (New-Android12Recovery -Code ([string]$resumeCheck.Data.Code) -Step 'resume' -SourceIndex $sourceIndex -CloneIndex ([int](Get-Android12RecordField -Record $resumeCheck.Data -Name 'CloneIndex')) -CloneName ([string](Get-Android12RecordField -Record $resumeCheck.Data -Name 'CloneName')))
         }
         $cloneIndex = [int]$resumeCheck.Data.CloneIndex
         $cloneName = [string]$resumeCheck.Data.CloneName
@@ -572,7 +442,7 @@ function Install-Android12Root {
         $clone = New-InstanceClone -ManagerPath $manager -Instance $Instance -Journal $Journal -Runner $Runner
         if ($null -eq $clone -or $clone -isnot [pscustomobject] -or $null -eq $clone.PSObject.Properties['Status'] -or
             [string]$clone.Status -ne 'Success') {
-            return New-Android12RootFailure -Journal $Journal -Message 'The MuMu manager did not report a verified instance clone.' -Data (@{ Code = 'CLONE_UNVERIFIED' })
+            return New-ToolkitRootFailure -Journal $Journal -Message 'The MuMu manager did not report a verified instance clone.' -Data (@{ Code = 'CLONE_UNVERIFIED' })
         }
         $resolvedClone = Resolve-Android12Clone -CloneResult $clone -Journal $Journal
         if ($resolvedClone.Status -ne 'Success') {
@@ -586,24 +456,24 @@ function Install-Android12Root {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message $resumeMessage -Data (New-Android12Recovery -Code 'OK' -Step 'clone' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     catch {
-        return New-Android12RootFailure -Journal $Journal -Message 'The verified clone could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'clone' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified clone could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'clone' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
-    $previousRootSetting = Get-Android12RootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
+    $previousRootSetting = Get-ToolkitRootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
     if ($previousRootSetting.Status -ne 'Success') {
-        return New-Android12RootFailure -Journal $Journal -Message ('The clone vendor root setting could not be read before the temporary vendor root was enabled, so nothing was changed. ' + $previousRootSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-read' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The clone vendor root setting could not be read before the temporary vendor root was enabled, so nothing was changed. ' + $previousRootSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-read' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     $previousRootValue = [bool]$previousRootSetting.Data.Value
     $enableRoot = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$cloneIndex), '-k', 'root_permission', '-val', 'true') -Runner $Runner
     if ($null -eq $enableRoot -or $enableRoot.ExitCode -ne 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The temporary vendor root could not be enabled on the clone.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_ENABLE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The temporary vendor root could not be enabled on the clone.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_ENABLE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
-    $enabledSetting = Get-Android12RootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
+    $enabledSetting = Get-ToolkitRootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
     if ($enabledSetting.Status -ne 'Success') {
-        return New-Android12RootFailure -Journal $Journal -Message ('The clone did not report a readable vendor root setting after the change. ' + $enabledSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The clone did not report a readable vendor root setting after the change. ' + $enabledSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     if ($enabledSetting.Data.Value -ne $true) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The clone did not report the enabled vendor root after the change.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_NOT_ENABLED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not report the enabled vendor root after the change.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_NOT_ENABLED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The temporary vendor root is enabled on the clone and is disabled again only after root verification.' -Data (@{
@@ -612,23 +482,23 @@ function Install-Android12Root {
             })
     }
     catch {
-        return New-Android12RootFailure -Journal $Journal -Message 'The enabled vendor root could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The enabled vendor root could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
-    $apkInstall = Invoke-Android12Adb -ManagerPath $manager -InstanceIndex $cloneIndex -Command $apkInstallCommand -Runner $Runner
+    $apkInstall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $cloneIndex -Command $apkInstallCommand -Runner $Runner
     if ($null -eq $apkInstall -or $apkInstall.ExitCode -ne 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The verified Kitsune APK was not installed on the clone.' -Data (New-Android12Recovery -Code 'APK_INSTALL_FAILED' -Step 'apk-install' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Kitsune APK was not installed on the clone.' -Data (New-Android12Recovery -Code 'APK_INSTALL_FAILED' -Step 'apk-install' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The verified Kitsune APK was installed on the clone.' -Data (@{ Command = $apkInstallCommand })
     }
     catch {
-        return New-Android12RootFailure -Journal $Journal -Message 'The installed Kitsune APK could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'apk-install' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The installed Kitsune APK could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'apk-install' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
-    $apkLaunch = Invoke-Android12Adb -ManagerPath $manager -InstanceIndex $cloneIndex -Command $script:ToolkitKitsuneLaunchCommand -Runner $Runner
+    $apkLaunch = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $cloneIndex -Command $script:ToolkitKitsuneLaunchCommand -Runner $Runner
     if ($null -eq $apkLaunch -or $apkLaunch.ExitCode -ne 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The installed Kitsune app did not start on the clone. Open it from the emulator and repeat the guided install.' -Data (New-Android12Recovery -Code 'APK_LAUNCH_FAILED' -Step 'apk-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The installed Kitsune app did not start on the clone. Open it from the emulator and repeat the guided install.' -Data (New-Android12Recovery -Code 'APK_LAUNCH_FAILED' -Step 'apk-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
     $promptText = $script:ToolkitKitsunePrompt + ' ' + $script:ToolkitKitsuneRejection
@@ -640,7 +510,7 @@ function Install-Android12Root {
             })
     }
     catch {
-        return New-Android12RootFailure -Journal $Journal -Message 'The Kitsune system-partition instruction could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'confirmation' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The Kitsune system-partition instruction could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'confirmation' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
     $answer = $Confirmation
@@ -657,22 +527,22 @@ function Install-Android12Root {
         }
     }
     if (-not (Test-KitsuneConfirmation -Confirmation $answer)) {
-        return New-Android12RootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: Only ' + $script:ToolkitKitsuneChoice + ' is accepted, and it was not confirmed. The cold boot, the root verification, and the vendor root change were not started. Boot the reported clone to recover, then resume this workflow on that clone.') -Data (New-Android12Recovery -Code 'USER_CONFIRMATION_REQUIRED' -Step 'confirmation' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: Only ' + $script:ToolkitKitsuneChoice + ' is accepted, and it was not confirmed. The cold boot, the root verification, and the vendor root change were not started. Boot the reported clone to recover, then resume this workflow on that clone.') -Data (New-Android12Recovery -Code 'USER_CONFIRMATION_REQUIRED' -Step 'confirmation' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
     $shutdown = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('control', '-v', ([string]$cloneIndex), 'shutdown') -Runner $Runner
     if ($null -eq $shutdown -or $shutdown.ExitCode -ne 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The clone did not accept the cold-boot shutdown request.' -Data (New-Android12Recovery -Code 'BOOT_CONTROL_FAILED' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not accept the cold-boot shutdown request.' -Data (New-Android12Recovery -Code 'BOOT_CONTROL_FAILED' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     if (-not (Wait-MuMuInstanceStopped -ManagerPath $manager -Index $cloneIndex -Runner $Runner)) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The clone did not reach a stable stopped state before the cold boot.' -Data (New-Android12Recovery -Code 'STOP_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not reach a stable stopped state before the cold boot.' -Data (New-Android12Recovery -Code 'STOP_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     $launch = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('control', '-v', ([string]$cloneIndex), 'launch') -Runner $Runner
     if ($null -eq $launch -or $launch.ExitCode -ne 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The clone did not accept the cold-boot launch request.' -Data (New-Android12Recovery -Code 'BOOT_CONTROL_FAILED' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not accept the cold-boot launch request.' -Data (New-Android12Recovery -Code 'BOOT_CONTROL_FAILED' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
-    if (-not (Wait-Android12BootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner)) {
-        return New-Android12RootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 after $($script:ToolkitBootPollAttempts) checks. The Kitsune root state is unknown and the vendor root was left enabled." -Data (New-Android12Recovery -Code 'BOOT_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    if (-not (Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner)) {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 after $($script:ToolkitBootPollAttempts) checks. The Kitsune root state is unknown and the vendor root was left enabled." -Data (New-Android12Recovery -Code 'BOOT_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
     $checks = Test-Android12Root -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner
@@ -680,22 +550,22 @@ function Install-Android12Root {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The Android 12 package, root daemon, and root shell checks were recorded.' -Data $checks.Data
     }
     catch {
-        return New-Android12RootFailure -Journal $Journal -Message 'The Android 12 root checks could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The Android 12 root checks could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     if ($checks.Status -ne 'Success') {
-        return New-Android12RootFailure -Journal $Journal -Message ('The Android 12 root is not verified, so the temporary vendor root was left enabled. ' + $checks.Message) -Data (New-Android12Recovery -Code ([string]$checks.Data.Code) -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The Android 12 root is not verified, so the temporary vendor root was left enabled. ' + $checks.Message) -Data (New-Android12Recovery -Code ([string]$checks.Data.Code) -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
     }
 
     $disableRoot = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$cloneIndex), '-k', 'root_permission', '-val', 'false') -Runner $Runner
     if ($null -eq $disableRoot -or $disableRoot.ExitCode -ne 0) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The Kitsune root is verified, but the temporary vendor root could not be disabled on the clone.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_DISABLE_FAILED' -Step 'vendor-root-disable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The Kitsune root is verified, but the temporary vendor root could not be disabled on the clone.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_DISABLE_FAILED' -Step 'vendor-root-disable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
     }
-    $finalSetting = Get-Android12RootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
+    $finalSetting = Get-ToolkitRootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
     if ($finalSetting.Status -ne 'Success') {
-        return New-Android12RootFailure -Journal $Journal -Message ('The Kitsune root is verified, but the clone vendor root setting is no longer readable. ' + $finalSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-disable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The Kitsune root is verified, but the clone vendor root setting is no longer readable. ' + $finalSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-disable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
     }
     if ($finalSetting.Data.Value -ne $false) {
-        return New-Android12RootFailure -Journal $Journal -Message 'The Kitsune root is verified, but the clone still reports the enabled vendor root.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_NOT_DISABLED' -Step 'vendor-root-disable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The Kitsune root is verified, but the clone still reports the enabled vendor root.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_NOT_DISABLED' -Step 'vendor-root-disable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
     }
 
     $successData = New-Android12Recovery -Code 'OK' -Step 'complete' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data
@@ -706,7 +576,7 @@ function Install-Android12Root {
         Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Success' -Message $successMessage -Data $successData)
     }
     catch {
-        return New-Android12RootFailure -Journal $Journal -Message 'The verified Android 12 root could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'complete' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Android 12 root could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'complete' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
     }
     return Get-ToolkitResult -Status 'Success' -Message $successMessage -Data $successData
 }

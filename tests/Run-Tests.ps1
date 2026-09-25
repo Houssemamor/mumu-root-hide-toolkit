@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Ads', 'Root12', 'Root15', 'All')]
+    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Ads', 'Root12', 'Root15', 'Verification', 'All')]
     [string]$Suite = 'All'
 )
 
@@ -15,6 +15,7 @@ $discoveryScriptPath = Join-Path $repoRoot 'src\Discovery.ps1'
 $elevationScriptPath = Join-Path $repoRoot 'src\Elevation.ps1'
 $backupScriptPath = Join-Path $repoRoot 'src\Backup.ps1'
 $adsScriptPath = Join-Path $repoRoot 'src\Ads.ps1'
+$verificationScriptPath = Join-Path $repoRoot 'src\Verification.ps1'
 $root12ScriptPath = Join-Path $repoRoot 'src\Root12.ps1'
 $root15ScriptPath = Join-Path $repoRoot 'src\Root15.ps1'
 
@@ -38,6 +39,9 @@ if (Test-Path -LiteralPath $backupScriptPath -PathType Leaf) {
 }
 if (Test-Path -LiteralPath $adsScriptPath -PathType Leaf) {
     . $adsScriptPath
+}
+if (Test-Path -LiteralPath $verificationScriptPath -PathType Leaf) {
+    . $verificationScriptPath
 }
 if (Test-Path -LiteralPath $root12ScriptPath -PathType Leaf) {
     . $root12ScriptPath
@@ -3515,6 +3519,7 @@ function New-Root12ManagerState {
         RootSettingFailValue = ''
         RootSettingText = ''
         AdbFailPattern = ''
+        AdbThrowPattern = ''
         AdbFailExitCode = 1
         ControlFailPattern = ''
         ControlFailExitCode = 1
@@ -3524,6 +3529,7 @@ function New-Root12ManagerState {
         BootReadyPolls = 1
         PackageInstalled = $true
         PackageName = 'io.github.huskydg.magisk'
+        PackageHeaderName = ''
         LaunchCommand = 'shell monkey -p io.github.huskydg.magisk -c android.intent.category.LAUNCHER 1'
         VersionName = '31.0-kitsune'
         VersionCode = '31000'
@@ -3654,6 +3660,9 @@ function New-Root12ManagerRunner {
         if ($command -eq 'adb') {
             $index = $arguments[2]
             $request = [string]$arguments[4]
+            if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbThrowPattern) -and $request -like $State.AdbThrowPattern) {
+                throw 'adb transport failure'
+            }
             if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbFailPattern) -and $request -like $State.AdbFailPattern) {
                 return [pscustomobject]@{ ExitCode = $State.AdbFailExitCode; Text = 'adb: fixture failure' }
             }
@@ -3683,9 +3692,10 @@ function New-Root12ManagerRunner {
                 if (-not $State.PackageInstalled) {
                     return [pscustomobject]@{ ExitCode = 0; Text = ('Unable to find package: ' + $State.PackageName + '.') }
                 }
+                $headerName = if ([string]::IsNullOrWhiteSpace([string]$State.PackageHeaderName)) { [string]$State.PackageName } else { [string]$State.PackageHeaderName }
                 return [pscustomobject]@{
                     ExitCode = 0
-                    Text = ('Packages:' + [Environment]::NewLine + '    versionCode=' + $State.VersionCode + ' minSdk=26' + [Environment]::NewLine + '    versionName=' + $State.VersionName)
+                    Text = ('Package [' + $headerName + '] (a1b2c3):' + [Environment]::NewLine + '    versionCode=' + $State.VersionCode + ' minSdk=26' + [Environment]::NewLine + '    versionName=' + $State.VersionName)
                 }
             }
             if ($request -ceq 'shell pidof magiskd') {
@@ -3797,7 +3807,7 @@ function Assert-Root12Failure {
 }
 
 function Invoke-Root12Tests {
-    foreach ($commandName in @('Install-Android12Root', 'Get-Android12KitsunePrompt', 'Test-KitsuneConfirmation', 'Test-Android12Root', 'Read-Android12KitsuneConfirmation', 'Prepare-Android12Asset', 'Resolve-Android12Clone', 'Assert-Android12ResumeClone', 'Get-Android12RootSetting', 'Format-Android12InstallCommand')) {
+    foreach ($commandName in @('Install-Android12Root', 'Get-Android12KitsunePrompt', 'Test-KitsuneConfirmation', 'Test-Android12Root', 'Read-Android12KitsuneConfirmation', 'Prepare-Android12Asset', 'Resolve-Android12Clone', 'Assert-Android12ResumeClone', 'Get-ToolkitRootSetting', 'Format-Android12InstallCommand')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Android 12 command is unavailable: $commandName"
     }
     Assert-True (Test-Path -LiteralPath $root12ScriptPath -PathType Leaf) 'src/Root12.ps1 does not exist.'
@@ -4270,6 +4280,20 @@ function Invoke-Root12Tests {
             Assert-Equal -1 (Get-Root12CallIndex -Calls $versionState.Calls -Pattern '*root_permission*-val*false*') "An unpinned Kitsune version disabled the temporary vendor root: $($versionCase.Label)."
         }
 
+        foreach ($nearNameCase in @(
+                [pscustomobject]@{ Header = 'io.github.huskydg.magisk.beta'; Label = 'a near-name package' },
+                [pscustomobject]@{ Header = 'io.github.huskydg.magiskx'; Label = 'a longer package name' },
+                [pscustomobject]@{ Header = 'io.github.huskydg'; Label = 'a shorter package name' }
+            )) {
+            $nearNameState = New-Root12ManagerState -Install $install
+            $nearNameState.PackageHeaderName = $nearNameCase.Header
+            $nearNameFailure = Invoke-Root12Case -State $nearNameState -Instance $android12 -Manifest $manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Root12Failure -Result $nearNameFailure.Result -Journal $nearNameFailure.Journal -Code 'PACKAGE_MISSING' -Message "The Android 12 package check accepted $($nearNameCase.Label) as the Kitsune package."
+            Assert-Equal '' $nearNameFailure.Result.Data.VersionName "The Android 12 package check recorded a version from $($nearNameCase.Label)."
+            Assert-Equal -1 (Get-Root12CallIndex -Calls $nearNameState.Calls -Pattern '*root_permission*-val*false*') "A near-name package disabled the temporary vendor root: $($nearNameCase.Label)."
+        }
+
         foreach ($daemonCase in @(
                 [pscustomobject]@{ Pids = ''; Code = 'DAEMON_ABSENT' },
                 [pscustomobject]@{ Pids = '   '; Code = 'DAEMON_ABSENT' },
@@ -4380,7 +4404,7 @@ function Invoke-Root12Tests {
             )) {
             $shapeState = New-Root12ManagerState -Install $install
             $shapeState.RootSettingText = $settingShape.Text
-            $shapeCheck = Get-Android12RootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $shapeState)
+            $shapeCheck = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $shapeState)
             Assert-Equal 'Success' $shapeCheck.Status "A documented manager setting shape was refused: $($settingShape.Label)"
             Assert-Equal $settingShape.Value $shapeCheck.Data.Value "A documented manager setting shape returned the wrong value: $($settingShape.Label)"
         }
@@ -4398,16 +4422,16 @@ function Invoke-Root12Tests {
             )) {
             $defectState = New-Root12ManagerState -Install $install
             $defectState.RootSettingText = $settingDefect.Text
-            $defectCheck = Get-Android12RootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $defectState)
+            $defectCheck = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $defectState)
             Assert-Equal 'CriticalError' $defectCheck.Status "A defective manager setting response was accepted: $($settingDefect.Code)"
             Assert-Equal $settingDefect.Code $defectCheck.Data.Code "A defective manager setting response reported the wrong code: $($settingDefect.Code)"
         }
         $settingManagerFailureState = New-Root12ManagerState -Install $install
         $settingManagerFailureState.RootSettingQueryExitCode = 1
-        $settingManagerFailureCheck = Get-Android12RootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $settingManagerFailureState)
+        $settingManagerFailureCheck = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner (New-Root12ManagerRunner -State $settingManagerFailureState)
         Assert-Equal 'CriticalError' $settingManagerFailureCheck.Status 'A failed manager setting query was accepted.'
         Assert-Equal 'MANAGER_FAILED' $settingManagerFailureCheck.Data.Code 'A failed manager setting query reported the wrong code.'
-        $blankSettingManager = Get-Android12RootSetting -ManagerPath '   ' -Index 7 -Runner (New-Root12ManagerRunner -State (New-Root12ManagerState -Install $install))
+        $blankSettingManager = Get-ToolkitRootSetting -ManagerPath '   ' -Index 7 -Runner (New-Root12ManagerRunner -State (New-Root12ManagerState -Install $install))
         Assert-Equal 'CriticalError' $blankSettingManager.Status 'A blank manager was accepted for a setting query.'
         Assert-Equal 'MANAGER_UNAVAILABLE' $blankSettingManager.Data.Code 'A blank manager reported the wrong setting code.'
 
@@ -4588,6 +4612,12 @@ function Invoke-Root12Tests {
         $deniedVerifyChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $deniedVerifyState)
         Assert-Equal 'CriticalError' $deniedVerifyChecks.Status 'A denied root shell was accepted by the root checks.'
         Assert-Equal 'ROOT_DENIED' $deniedVerifyChecks.Data.Code 'A denied root shell was not reported as a denial.'
+        $transportVerifyState = New-Root12ManagerState -Install $install
+        $transportVerifyState.AdbThrowPattern = '*su -c id*'
+        $transportVerifyChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root12ManagerRunner -State $transportVerifyState)
+        Assert-Equal 'CriticalError' $transportVerifyChecks.Status 'A root shell query that could not be executed was accepted.'
+        Assert-Equal 'ADB_FAILED' $transportVerifyChecks.Data.Code 'A root shell query that could not be executed was reported as a root denial.'
+        Assert-Equal $false $transportVerifyChecks.Data.RootVerified 'A root shell query that could not be executed was reported as verified.'
     }
     finally {
         if ($null -ne $bootAttemptsVariable) {
@@ -4605,6 +4635,7 @@ $script:Root15Codes = @(
     'JOURNAL_INVALID',
     'JOURNAL_WRITE_FAILED',
     'MANAGER_UNAVAILABLE',
+    'USER_CONFIRMATION_REQUIRED',
     'CLONE_UNVERIFIED',
     'ROOT_SETTING_UNREADABLE',
     'ROOT_TOGGLE_FAILED',
@@ -4671,17 +4702,22 @@ function New-Root15ManagerState {
         RootSettingExitCode = 0
         RootSettingQueryExitCode = 0
         RootSettingText = ''
+        RootSettingIndex = ''
         IgnoreRootEnable = $false
         ControlFailPattern = ''
         AdbFailPattern = ''
+        AdbThrowPattern = ''
+        AdbBlankFailPattern = ''
         BootPolls = @{}
         BootReadyPolls = 1
         KernelSUPackage = $script:Root15KernelSUPackage
         KitsunePackage = $script:Root15KitsunePackage
         KernelSUInstalled = $true
+        KernelSUHeaderName = ''
         KernelSUVersionName = '3.2.5'
         KernelSUVersionCode = '30205'
         KitsuneInstalled = $false
+        PackageListText = ''
         RelatedPackageName = ''
         RootAllowed = $true
         RootShellText = 'uid=0(root) gid=0(root) groups=0(root)'
@@ -4784,6 +4820,13 @@ function New-Root15ManagerRunner {
             if (-not [string]::IsNullOrEmpty([string]$State.RootSettingText)) {
                 return [pscustomobject]@{ ExitCode = 0; Text = $State.RootSettingText }
             }
+            if (-not [string]::IsNullOrWhiteSpace([string]$State.RootSettingIndex)) {
+                $current = $false
+                if ($State.RootSettings.ContainsKey($index)) {
+                    $current = [bool]$State.RootSettings[$index]
+                }
+                return [pscustomobject]@{ ExitCode = 0; Text = ('{"index":"' + [string]$State.RootSettingIndex + '","root_permission":"' + $(if ($current) { 'true' } else { 'false' }) + '"}') }
+            }
             $current = $false
             if ($State.RootSettings.ContainsKey($index)) {
                 $current = [bool]$State.RootSettings[$index]
@@ -4793,6 +4836,12 @@ function New-Root15ManagerRunner {
         if ($command -eq 'adb') {
             $index = $arguments[2]
             $request = [string]$arguments[4]
+            if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbThrowPattern) -and $request -like $State.AdbThrowPattern) {
+                throw 'adb transport failure'
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbBlankFailPattern) -and $request -like $State.AdbBlankFailPattern) {
+                return [pscustomobject]@{ ExitCode = 1; Text = '' }
+            }
             if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbFailPattern) -and $request -like $State.AdbFailPattern) {
                 return [pscustomobject]@{ ExitCode = 1; Text = 'adb: fixture failure' }
             }
@@ -4812,12 +4861,16 @@ function New-Root15ManagerRunner {
                 if (-not $State.KernelSUInstalled) {
                     return [pscustomobject]@{ ExitCode = 0; Text = ('Unable to find package: ' + $State.KernelSUPackage + '.') }
                 }
+                $headerName = if ([string]::IsNullOrWhiteSpace([string]$State.KernelSUHeaderName)) { [string]$State.KernelSUPackage } else { [string]$State.KernelSUHeaderName }
                 return [pscustomobject]@{
                     ExitCode = 0
-                    Text = ('Packages:' + [Environment]::NewLine + '    versionCode=' + $State.KernelSUVersionCode + ' minSdk=28' + [Environment]::NewLine + '    versionName=' + $State.KernelSUVersionName)
+                    Text = ('Package [' + $headerName + '] (a1b2c3):' + [Environment]::NewLine + '    versionCode=' + $State.KernelSUVersionCode + ' minSdk=28' + [Environment]::NewLine + '    versionName=' + $State.KernelSUVersionName)
                 }
             }
-            if ($request -ceq ('shell pm list packages ' + $State.KitsunePackage)) {
+            if ($request -ceq 'shell pm list packages') {
+                if (-not [string]::IsNullOrEmpty([string]$State.PackageListText)) {
+                    return [pscustomobject]@{ ExitCode = 0; Text = $State.PackageListText }
+                }
                 $lines = @()
                 if ($State.KitsuneInstalled) {
                     $lines += ('package:' + $State.KitsunePackage)
@@ -4843,11 +4896,12 @@ function Invoke-Root15Case {
     param(
         [hashtable]$State,
         [object]$Instance,
-        [string]$JournalRoot
+        [string]$JournalRoot,
+        [bool]$Confirmed = $true
     )
 
     $journal = New-Root15Journal -Root $JournalRoot -Instance $Instance
-    $result = Enable-Android15Root -Instance $Instance -Journal $journal -Runner (New-Root15ManagerRunner -State $State)
+    $result = Enable-Android15Root -Instance $Instance -Journal $journal -Confirmed:$Confirmed -Runner (New-Root15ManagerRunner -State $State)
     [pscustomobject]@{
         Result = $result
         Journal = $journal
@@ -4907,6 +4961,12 @@ function Invoke-Root15Tests {
     Assert-Equal $script:ToolkitKitsunePackageName $script:Root15KitsunePackage 'The Android 15 flow does not use the same Kitsune package name as the Android 12 flow.'
     Assert-Equal 'me.weishu.kernelsu' $script:Root15KernelSUPackage 'The Android 15 flow does not verify the built-in KernelSU package.'
 
+    $enableCommand = Get-Command Enable-Android15Root -CommandType Function
+    Assert-True ($enableCommand.Parameters.ContainsKey('Confirmed')) 'Enable-Android15Root has no explicit confirmation parameter.'
+    $confirmedParameter = @($enableCommand.Parameters['Confirmed'].Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] })
+    Assert-Equal 1 $confirmedParameter.Count 'The confirmation parameter metadata is invalid.'
+    Assert-True ($enableCommand.Parameters['Confirmed'].ParameterType -eq [switch]) 'The confirmation parameter is not an explicit switch.'
+
     $root15Source = [IO.File]::ReadAllText($root15ScriptPath)
     Assert-True ($root15Source -notmatch "'UNKNOWN'") 'The Android 15 source reports an UNKNOWN failure code.'
     foreach ($forbidden in @(
@@ -4934,9 +4994,17 @@ function Invoke-Root15Tests {
             'Get-VerifiedAsset',
             'Get-ToolkitAssetCacheRoot',
             'Install-Android12Root',
-            'Get-ToolkitManifest'
+            'Get-ToolkitManifest',
+            'pm list packages io',
+            'function Invoke-Android15Adb',
+            'function Wait-Android15BootCompleted',
+            'function Get-Android15RootSetting',
+            'function New-Android15RootFailure'
         )) {
         Assert-True ($root15Source -notmatch [regex]::Escape($forbidden)) "Android 15 source uses a forbidden construct: $forbidden"
+    }
+    foreach ($sharedPrimitive in @('Invoke-ToolkitManagerAdb', 'Wait-ToolkitBootCompleted', 'Get-ToolkitRootSetting', 'Get-ToolkitPackageVersion', 'New-ToolkitRootFailure')) {
+        Assert-True ($root15Source -match [regex]::Escape($sharedPrimitive)) "The Android 15 flow does not use the shared primitive: $sharedPrimitive"
     }
     $hypervisorPattern = '(?i)hyper-?v|virtual\s*machine\s*platform|vmmservice|memory\s*integrity|credential\s*guard|device\s*guard|exploit\s*protection'
     Assert-True ($root15Source -notmatch $hypervisorPattern) 'The Android 15 source mentions a Hyper-V, VBS, or memory integrity control.'
@@ -4952,20 +5020,43 @@ function Invoke-Root15Tests {
         $android12 = New-Root15InstanceFixture -Install $install -AndroidVersion '12.0'
         $android15 = New-Root15InstanceFixture -Install $install -AndroidVersion '15.0'
 
-        $android12State = New-Root15ManagerState -Install $install
-        $android12Case = Invoke-Root15Case -State $android12State -Instance $android12 -JournalRoot $journalRoot
-        Assert-True ($android12Case.Result.Status -eq 'CriticalError') 'Android 12 was sent to Android 15 root flow.'
-        Assert-True ($null -ne $android12Case.Result.Data) 'The Android 12 rejection carried no recovery data.'
-        Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $android12Case.Result.Data.Code 'Android 12 was not rejected as an unsupported Android version.'
-        Assert-Equal 0 @($android12State.Calls).Count 'An Android 12 instance reached the MuMu manager.'
-        Assert-Equal 'Failed' $android12Case.Journal.State 'The Android 12 rejection was not journaled.'
+        foreach ($unsupportedVersion in @('11.0', '12.0', '13.0', '14.0', '15.1')) {
+            $unsupportedVersionState = New-Root15ManagerState -Install $install
+            $unsupportedVersionCase = Invoke-Root15Case -State $unsupportedVersionState `
+                -Instance (New-Root15InstanceFixture -Install $install -AndroidVersion $unsupportedVersion) -JournalRoot $journalRoot
+            Assert-Equal 'CriticalError' $unsupportedVersionCase.Result.Status "An Android $unsupportedVersion instance was accepted by the Android 15 workflow."
+            Assert-True ($null -ne $unsupportedVersionCase.Result.Data) "The Android $unsupportedVersion rejection carried no recovery data."
+            Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $unsupportedVersionCase.Result.Data.Code "Android $unsupportedVersion was not rejected as an unsupported Android version."
+            Assert-Equal 0 @($unsupportedVersionState.Calls).Count "An Android $unsupportedVersion instance reached the MuMu manager."
+            Assert-Equal 'Failed' $unsupportedVersionCase.Journal.State "The Android $unsupportedVersion rejection was not journaled."
+            Assert-True ($unsupportedVersionCase.Result.Message -notmatch '(?i)android 12|kitsune|magisk') "The Android $unsupportedVersion rejection pointed the operator at another workflow."
+        }
 
-        $unsupportedState = New-Root15ManagerState -Install $install
-        $unsupportedCase = Invoke-Root15Case -State $unsupportedState -Instance (New-Root15InstanceFixture -Install $install -AndroidVersion '11.0') -JournalRoot $journalRoot
-        Assert-Equal 'CriticalError' $unsupportedCase.Result.Status 'An Android 11 instance was accepted by the Android 15 workflow.'
-        Assert-True ($null -ne $unsupportedCase.Result.Data) 'The Android 11 rejection carried no recovery data.'
-        Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $unsupportedCase.Result.Data.Code 'Android 11 was not rejected as an unsupported Android version.'
-        Assert-Equal 0 @($unsupportedState.Calls).Count 'An Android 11 instance reached the MuMu manager.'
+        $missingVersionState = New-Root15ManagerState -Install $install
+        $missingVersionInstance = New-Root15InstanceFixture -Install $install -AndroidVersion '15.0'
+        $missingVersionInstance.PSObject.Properties.Remove('AndroidVersion')
+        $missingVersionCase = Invoke-Root15Case -State $missingVersionState -Instance $missingVersionInstance -JournalRoot $journalRoot
+        Assert-Equal 'CriticalError' $missingVersionCase.Result.Status 'An instance without an Android version was accepted.'
+        Assert-True ($null -ne $missingVersionCase.Result.Data) 'The missing Android version rejection carried no recovery data.'
+        Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $missingVersionCase.Result.Data.Code 'An instance without an Android version was not rejected.'
+        Assert-Equal 0 @($missingVersionState.Calls).Count 'An instance without an Android version reached the MuMu manager.'
+        Assert-True ($missingVersionCase.Result.Message -notmatch '(?i)android 12|kitsune|magisk') 'The missing Android version rejection pointed the operator at another workflow.'
+
+        $unconfirmedState = New-Root15ManagerState -Install $install
+        $unconfirmedCase = Invoke-Root15Case -State $unconfirmedState -Instance $android15 -JournalRoot $journalRoot -Confirmed $false
+        Assert-Root15Failure -Result $unconfirmedCase.Result -Journal $unconfirmedCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'An unconfirmed Android 15 root request was accepted.'
+        Assert-True ($unconfirmedCase.Result.Message -match 'USER_CONFIRMATION_REQUIRED') 'The unconfirmed failure did not report USER_CONFIRMATION_REQUIRED.'
+        Assert-Equal 0 @($unconfirmedState.Calls).Count 'An unconfirmed Android 15 root request reached the MuMu manager.'
+        $unconfirmedDirectState = New-Root15ManagerState -Install $install
+        $unconfirmedDirectJournal = New-Root15Journal -Root $journalRoot -Instance $android15
+        $unconfirmedDirect = Enable-Android15Root -Instance $android15 -Journal $unconfirmedDirectJournal -Runner (New-Root15ManagerRunner -State $unconfirmedDirectState)
+        Assert-Equal 'CriticalError' $unconfirmedDirect.Status 'An Android 15 root request without the confirmation parameter was accepted.'
+        Assert-Equal 'USER_CONFIRMATION_REQUIRED' $unconfirmedDirect.Data.Code 'An absent confirmation parameter reported the wrong code.'
+        Assert-Equal 0 @($unconfirmedDirectState.Calls).Count 'An absent confirmation parameter reached the MuMu manager.'
+        $confirmedButInvalidState = New-Root15ManagerState -Install $install
+        $confirmedButInvalid = Enable-Android15Root -Instance $android12 -Journal (New-Root15Journal -Root $journalRoot -Instance $android12) -Confirmed -Runner (New-Root15ManagerRunner -State $confirmedButInvalidState)
+        Assert-Equal 'ANDROID_VERSION_UNSUPPORTED' $confirmedButInvalid.Data.Code 'A confirmed Android 12 request skipped the Android version check.'
+        Assert-Equal 0 @($confirmedButInvalidState.Calls).Count 'A confirmed Android 12 request reached the MuMu manager.'
 
         $missingVersionState = New-Root15ManagerState -Install $install
         $missingVersionInstance = New-Root15InstanceFixture -Install $install -AndroidVersion '15.0'
@@ -5053,7 +5144,7 @@ function Invoke-Root15Tests {
         $bootCall = Get-Root15CallIndex -Calls $successState.Calls -Pattern '*getprop sys.boot_completed*'
         $kernelCall = Get-Root15CallIndex -Calls $successState.Calls -Pattern ('*dumpsys package ' + $script:Root15KernelSUPackage + '*')
         $rootShellCall = Get-Root15CallIndex -Calls $successState.Calls -Pattern '*su -c id*'
-        $kitsuneCall = Get-Root15CallIndex -Calls $successState.Calls -Pattern ('*pm list packages ' + $script:Root15KitsunePackage + '*')
+        $kitsuneCall = Get-Root15CallIndex -Calls $successState.Calls -Pattern '*pm list packages*'
         Assert-True ($enableCall -ge 0) 'The Android 15 workflow did not enable the vendor root.'
         Assert-True ($launchCall -gt $enableCall) 'The Android 15 workflow did not cold-boot after enabling the vendor root.'
         Assert-True ($bootCall -gt $launchCall) 'The Android 15 workflow did not wait for Android readiness after the cold boot.'
@@ -5091,32 +5182,11 @@ function Invoke-Root15Tests {
         Assert-True ($recordedCallText -notmatch '(?i)kitsune') 'Android 15 flow downloaded Kitsune.'
         Assert-Equal 0 @(Get-Root15Calls -State $successState -Pattern '*install -r*').Count 'Android 15 flow installed Kitsune.'
         Assert-Equal 0 @(Get-Root15Calls -State $successState -Pattern '*monkey*').Count 'Android 15 flow launched a root manager application.'
-
-        $downloadState = @{ Calls = 0 }
-        $downloadFetch = {
-            param($Url, $Path)
-            $downloadState.Calls++
-            [IO.File]::WriteAllText($Path, 'kitsune apk fixture payload')
-        }.GetNewClosure()
-        $downloadRoot = Join-Path $root15Root 'root15 download cache'
-        $kituneAssetPath = Join-Path $root15Root 'app-release.apk'
-        [IO.File]::WriteAllText($kituneAssetPath, 'kitsune apk fixture payload')
-        $kituneManifest = [pscustomobject]@{
-            dependencies = @(
-                [pscustomobject]@{
-                    id = 'kitsune'
-                    version = 'v31.0-25fa2159'
-                    assetName = 'app-release.apk'
-                    url = 'https://github.com/Jordan231111/KitsuneMagisk/releases/download/v31.0-25fa2159/app-release.apk'
-                    size = [long](Get-Item -LiteralPath $kituneAssetPath).Length
-                    sha256 = (Get-FileHash -LiteralPath $kituneAssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
-                }
-            )
-        }
-        $nullDownload = Save-ToolkitAsset -Manifest $kituneManifest -Id 'kitsune' -CacheRoot $downloadRoot -Fetch $downloadFetch
-        Assert-Equal 'Success' $nullDownload.Status 'The Kitsune asset fixture was not usable.'
-        Assert-Equal 1 $downloadState.Calls 'The Kitsune asset fixture did not download exactly once.'
-        Assert-True ($recordedCallText -notmatch [regex]::Escape($downloadRoot)) 'The Android 15 flow reached the Kitsune dependency cache.'
+        $packageListCalls = @(Get-Root15Calls -State $successState -Pattern 'adb*-c shell pm list packages*')
+        Assert-Equal 1 $packageListCalls.Count 'The Android 15 flow did not issue exactly one bare package list request.'
+        $packageListArguments = [string[]]@($packageListCalls[0])
+        Assert-Equal 5 $packageListArguments.Count 'The package list request carried an unexpected argument count.'
+        Assert-Equal 'shell pm list packages' $packageListArguments[4] 'The package list request is not the bare unfiltered command.'
 
         $alreadyState = New-Root15ManagerState -Install $install
         $alreadyState.CloneRootSetting = $true
@@ -5168,6 +5238,36 @@ function Invoke-Root15Tests {
         $invalidSettingCase = Invoke-Root15Case -State $invalidSettingState -Instance $android15 -JournalRoot $journalRoot
         Assert-Root15Failure -Result $invalidSettingCase.Result -Journal $invalidSettingCase.Journal -Code 'ROOT_SETTING_UNREADABLE' -Message 'An unusable vendor root setting value was accepted.'
 
+        $foreignSettingState = New-Root15ManagerState -Install $install
+        $foreignSettingState.RootSettingIndex = '9'
+        $foreignSettingCase = Invoke-Root15Case -State $foreignSettingState -Instance $android15 -JournalRoot $journalRoot
+        Assert-Root15Failure -Result $foreignSettingCase.Result -Journal $foreignSettingCase.Journal -Code 'ROOT_SETTING_UNREADABLE' -Message 'A vendor root setting that described another instance was accepted.'
+        Assert-Equal -1 (Get-Root15CallIndex -Calls $foreignSettingState.Calls -Pattern 'setting*-val*') 'A vendor root setting for another instance was trusted for a write.'
+        Assert-Equal -1 (Get-Root15CallIndex -Calls $foreignSettingState.Calls -Pattern 'control*-v*launch*') 'A vendor root setting for another instance was trusted before a cold boot.'
+        Assert-Equal -1 (Get-Root15CallIndex -Calls $foreignSettingState.Calls -Pattern 'adb*') 'A vendor root setting for another instance was trusted before a verification.'
+
+        $foreignSettingVerifiedState = New-Root15ManagerState -Install $install
+        $foreignSettingVerifiedState.RootSettings[[string]$foreignSettingVerifiedState.CloneIndex] = $true
+        $foreignSettingVerifiedState.RootSettingIndex = '9'
+        $foreignSettingVerified = Test-Android15Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root15ManagerRunner -State $foreignSettingVerifiedState)
+        Assert-Equal 'CriticalError' $foreignSettingVerified.Status 'The Android 15 root checks accepted a vendor root setting for another instance.'
+        Assert-Equal 'ROOT_SETTING_UNREADABLE' $foreignSettingVerified.Data.Code 'A vendor root setting for another instance reported the wrong code.'
+        Assert-Equal $false $foreignSettingVerified.Data.RootPermission 'A vendor root setting for another instance was reported as verified.'
+        Assert-Equal 0 @(Get-Root15Calls -State $foreignSettingVerifiedState -Pattern 'adb*').Count 'A vendor root setting for another instance still issued an ADB request.'
+
+        $matchingIndexState = New-Root15ManagerState -Install $install
+        $matchingIndexState.RootSettings[[string]$matchingIndexState.CloneIndex] = $true
+        $matchingIndexState.RootSettingIndex = [string]$matchingIndexState.CloneIndex
+        $matchingIndex = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index $matchingIndexState.CloneIndex -Runner (New-Root15ManagerRunner -State $matchingIndexState)
+        Assert-Equal 'Success' $matchingIndex.Status 'A vendor root setting that named the requested instance was refused.'
+        Assert-Equal $true $matchingIndex.Data.Value 'A matching vendor root setting reported the wrong value.'
+
+        $foreignIndexState = New-Root15ManagerState -Install $install
+        $foreignIndexState.RootSettingIndex = '9'
+        $foreignIndex = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index $foreignIndexState.CloneIndex -Runner (New-Root15ManagerRunner -State $foreignIndexState)
+        Assert-Equal 'CriticalError' $foreignIndex.Status 'The shared vendor root reader accepted a response naming another instance.'
+        Assert-Equal 'INDEX_MISMATCH' $foreignIndex.Data.Code 'The shared vendor root reader reported the wrong code for another instance.'
+
         $toggleFailureState = New-Root15ManagerState -Install $install
         $toggleFailureState.RootSettingExitCode = 1
         $toggleFailureCase = Invoke-Root15Case -State $toggleFailureState -Instance $android15 -JournalRoot $journalRoot
@@ -5217,6 +5317,41 @@ function Invoke-Root15Tests {
         Assert-Equal 'Success' $relatedPackageCase.Result.Status "An unrelated package name was reported as Kitsune. $($relatedPackageCase.Result.Message)"
         Assert-Equal $true $relatedPackageCase.Result.Data.KitsuneAbsent 'An unrelated package name was reported as an installed Kitsune package.'
 
+        $relatedSuffixState = New-Root15ManagerState -Install $install
+        $relatedSuffixState.RelatedPackageName = 'io.github.huskydg.magiskx'
+        $relatedSuffixCase = Invoke-Root15Case -State $relatedSuffixState -Instance $android15 -JournalRoot $journalRoot
+        Assert-Equal 'Success' $relatedSuffixCase.Result.Status 'A package name sharing the Kitsune prefix was reported as Kitsune.'
+        $relatedPrefixState = New-Root15ManagerState -Install $install
+        $relatedPrefixState.RelatedPackageName = 'io.github.huskydg'
+        $relatedPrefixCase = Invoke-Root15Case -State $relatedPrefixState -Instance $android15 -JournalRoot $journalRoot
+        Assert-Equal 'Success' $relatedPrefixCase.Result.Status 'A package name contained in the Kitsune package was reported as Kitsune.'
+
+        foreach ($unusableList in @(
+                [pscustomobject]@{ Text = 'Usage: pm list packages [FILTER]'; Label = 'a usage string' },
+                [pscustomobject]@{ Text = 'Error: unknown command'; Label = 'an error string' },
+                [pscustomobject]@{ Text = ('package:com.android.settings' + [Environment]::NewLine + 'Usage: pm list packages [FILTER]'); Label = 'a mixed list and usage string' },
+                [pscustomobject]@{ Text = ('package:com.android.settings' + [Environment]::NewLine + 'package: ' + [char]0); Label = 'a malformed package line' }
+            )) {
+            $unusableListState = New-Root15ManagerState -Install $install
+            $unusableListState.PackageListText = $unusableList.Text
+            $unusableListCase = Invoke-Root15Case -State $unusableListState -Instance $android15 -JournalRoot $journalRoot
+            Assert-Root15Failure -Result $unusableListCase.Result -Journal $unusableListCase.Journal -Code 'ADB_FAILED' -Message "A Kitsune absence check accepted $($unusableList.Label)."
+            Assert-Equal $false $unusableListCase.Result.Data.KitsuneAbsent "A Kitsune absence check reported absence from $($unusableList.Label)."
+        }
+
+        foreach ($nearKernelSU in @(
+                [pscustomobject]@{ Header = 'me.weishu.kernelsu.beta'; Label = 'a longer package name' },
+                [pscustomobject]@{ Header = 'me.weishu.kernelsux'; Label = 'a longer package name suffix' },
+                [pscustomobject]@{ Header = 'me.weishu'; Label = 'a shorter package name' }
+            )) {
+            $nearKernelSUState = New-Root15ManagerState -Install $install
+            $nearKernelSUState.KernelSUHeaderName = $nearKernelSU.Header
+            $nearKernelSUCase = Invoke-Root15Case -State $nearKernelSUState -Instance $android15 -JournalRoot $journalRoot
+            Assert-Root15Failure -Result $nearKernelSUCase.Result -Journal $nearKernelSUCase.Journal -Code 'KERNELSU_ABSENT' -Message "The built-in KernelSU check accepted $($nearKernelSU.Label) as the KernelSU package."
+            Assert-Equal $false $nearKernelSUCase.Result.Data.KernelSU "The built-in KernelSU check reported $($nearKernelSU.Label) as verified."
+            Assert-Equal '' $nearKernelSUCase.Result.Data.KernelSUVersion "The built-in KernelSU check recorded a version from $($nearKernelSU.Label)."
+        }
+
         foreach ($adbFailureCase in @(
                 [pscustomobject]@{ Pattern = '*dumpsys package*'; Code = 'ADB_FAILED'; Label = 'the KernelSU package query' },
                 [pscustomobject]@{ Pattern = '*pm list packages*'; Code = 'ADB_FAILED'; Label = 'the Kitsune package query' },
@@ -5228,6 +5363,23 @@ function Invoke-Root15Tests {
             Assert-Root15Failure -Result $adbFailureCase15.Result -Journal $adbFailureCase15.Journal -Code $adbFailureCase.Code -Message "A failed ADB request was accepted: $($adbFailureCase.Label)."
         }
 
+        foreach ($transportCase in @(
+                [pscustomobject]@{ Knob = 'AdbThrowPattern'; Value = '*su -c id*'; Label = 'a root shell query that could not be executed' },
+                [pscustomobject]@{ Knob = 'AdbThrowPattern'; Value = '*dumpsys package*'; Label = 'a KernelSU query that could not be executed' },
+                [pscustomobject]@{ Knob = 'AdbThrowPattern'; Value = '*pm list packages*'; Label = 'a package list query that could not be executed' },
+                [pscustomobject]@{ Knob = 'AdbBlankFailPattern'; Value = '*su -c id*'; Label = 'a root shell query that returned no guest output' }
+            )) {
+            $transportState = New-Root15ManagerState -Install $install
+            $transportState.($transportCase.Knob) = $transportCase.Value
+            $transportCase15 = Invoke-Root15Case -State $transportState -Instance $android15 -JournalRoot $journalRoot
+            Assert-Root15Failure -Result $transportCase15.Result -Journal $transportCase15.Journal -Code 'ADB_FAILED' -Message "An ADB transport failure was misreported: $($transportCase.Label)."
+        }
+
+        $blankShellState = New-Root15ManagerState -Install $install
+        $blankShellState.RootShellText = '   '
+        $blankShellCase = Invoke-Root15Case -State $blankShellState -Instance $android15 -JournalRoot $journalRoot
+        Assert-Root15Failure -Result $blankShellCase.Result -Journal $blankShellCase.Journal -Code 'ROOT_DENIED' -Message 'A root shell that reported nothing was accepted.'
+
         foreach ($journalCase in @(
                 [pscustomobject]@{ Pattern = 'setting*-val*true*'; Label = 'vendor root checkpoint' },
                 [pscustomobject]@{ Pattern = 'control*-v*launch*'; Label = 'cold boot checkpoint' },
@@ -5238,7 +5390,7 @@ function Invoke-Root15Tests {
             $journalState.JournalLockPath = $journalCase15Journal.JournalPath
             $journalState.JournalLockPattern = $journalCase.Pattern
             try {
-                $journalCase15 = Enable-Android15Root -Instance $android15 -Journal $journalCase15Journal -Runner (New-Root15ManagerRunner -State $journalState)
+                $journalCase15 = Enable-Android15Root -Instance $android15 -Journal $journalCase15Journal -Confirmed -Runner (New-Root15ManagerRunner -State $journalState)
             }
             finally {
                 Release-Root15JournalLock -State $journalState
@@ -5252,7 +5404,7 @@ function Invoke-Root15Tests {
         $preLockedJournal = New-Root15Journal -Root $journalRoot -Instance $android15
         $preLockedState.JournalLock = [IO.File]::Open($preLockedJournal.JournalPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         try {
-            $preLocked = Enable-Android15Root -Instance $android15 -Journal $preLockedJournal -Runner (New-Root15ManagerRunner -State $preLockedState)
+            $preLocked = Enable-Android15Root -Instance $android15 -Journal $preLockedJournal -Confirmed -Runner (New-Root15ManagerRunner -State $preLockedState)
         }
         finally {
             Release-Root15JournalLock -State $preLockedState
@@ -5339,6 +5491,214 @@ function Invoke-Root15Tests {
     }
 }
 
+function Invoke-VerificationTests {
+    foreach ($commandName in @('Invoke-ToolkitManagerAdb', 'Wait-ToolkitBootCompleted', 'Get-ToolkitRootSetting', 'Get-ToolkitPackageVersion', 'Get-ToolkitRootShellStatus', 'New-ToolkitRootFailure')) {
+        Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Shared verification command is unavailable: $commandName"
+    }
+    Assert-True (Test-Path -LiteralPath $verificationScriptPath -PathType Leaf) 'src/Verification.ps1 does not exist.'
+    Assert-True (Test-Path -LiteralPath $root12ScriptPath -PathType Leaf) 'src/Root12.ps1 does not exist.'
+    Assert-True (Test-Path -LiteralPath $root15ScriptPath -PathType Leaf) 'src/Root15.ps1 does not exist.'
+
+    $verificationSource = [IO.File]::ReadAllText($verificationScriptPath)
+    Assert-True ($verificationSource -notmatch "'UNKNOWN'") 'The shared verification source reports an UNKNOWN failure code.'
+    foreach ($forbidden in @(
+            'Invoke-Expression',
+            'ScriptBlock]::Create',
+            'Add-Type',
+            'Start-Process',
+            'Invoke-WebRequest',
+            'Invoke-RestMethod',
+            'WebClient',
+            'schtasks',
+            'Set-ExecutionPolicy',
+            'icacls',
+            'Set-Acl',
+            'New-NetFirewallRule',
+            'Set-NetFirewallProfile',
+            'EnableLUA',
+            'Set-MpPreference',
+            'Disable-WindowsOptionalFeature',
+            'Enable-WindowsOptionalFeature',
+            'bcdedit',
+            'vmmservice',
+            'hypervisorlaunchtype'
+        )) {
+        Assert-True ($verificationSource -notmatch [regex]::Escape($forbidden)) "Shared verification source uses a forbidden construct: $forbidden"
+    }
+    Assert-True ($verificationSource -notmatch '(?i)hyper-?v|memory\s*integrity|exploit\s*protection|credential\s*guard') 'The shared verification source mentions a Hyper-V, VBS, or memory integrity control.'
+
+    $root12Source = [IO.File]::ReadAllText($root12ScriptPath)
+    foreach ($removedHelper in @('function Invoke-Android12Adb', 'function Wait-Android12BootCompleted', 'function Get-Android12RootSetting', 'function New-Android12RootFailure', 'ToolkitBootPollAttempts =', 'ToolkitBootPollDelaySeconds =')) {
+        Assert-True ($root12Source -notmatch [regex]::Escape($removedHelper)) "The Android 12 flow still defines its own copy: $removedHelper"
+    }
+    $root15Source = [IO.File]::ReadAllText($root15ScriptPath)
+    foreach ($removedHelper in @('ToolkitBootPollAttempts =', 'ToolkitBootPollDelaySeconds =')) {
+        Assert-True ($root15Source -notmatch [regex]::Escape($removedHelper)) "The Android 15 flow still defines its own copy: $removedHelper"
+    }
+    foreach ($sharedPrimitive in @('Invoke-ToolkitManagerAdb', 'Wait-ToolkitBootCompleted', 'Get-ToolkitRootSetting', 'Get-ToolkitPackageVersion', 'New-ToolkitRootFailure')) {
+        Assert-True ($root12Source -match [regex]::Escape($sharedPrimitive)) "The Android 12 flow does not use the shared primitive: $sharedPrimitive"
+    }
+
+    $sharedState = @{
+        Calls = @()
+        Polls = 0
+        SettingText = '{"root_permission":"true"}'
+    }
+    $recordingRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+        $sharedState.Calls += ,@($ActualArgumentList)
+        [pscustomobject]@{ ExitCode = 0; Text = 'ok' }
+    }.GetNewClosure()
+    $adbResult = Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Command 'shell getprop sys.boot_completed' -Runner $recordingRunner
+    Assert-Equal 0 $adbResult.ExitCode 'The shared ADB helper did not return the runner result.'
+    Assert-Equal 1 $sharedState.Calls.Count 'The shared ADB helper issued an unexpected number of requests.'
+    $adbArguments = [string[]]@($sharedState.Calls[0])
+    Assert-Equal 5 $adbArguments.Count 'The shared ADB helper carried an unexpected argument count.'
+    Assert-Equal 'adb' $adbArguments[0] 'The shared ADB helper did not issue an ADB request.'
+    Assert-Equal '-v' $adbArguments[1] 'The shared ADB helper lost the instance flag.'
+    Assert-Equal '7' $adbArguments[2] 'The shared ADB helper lost the instance index.'
+    Assert-Equal '-c' $adbArguments[3] 'The shared ADB helper lost its command flag.'
+    Assert-Equal 'shell getprop sys.boot_completed' $adbArguments[4] 'The shared ADB helper changed the command element.'
+
+    $bootAttemptsVariable = Get-Variable -Name 'ToolkitBootPollAttempts' -Scope Script -ErrorAction SilentlyContinue
+    $bootDelayVariable = Get-Variable -Name 'ToolkitBootPollDelaySeconds' -Scope Script -ErrorAction SilentlyContinue
+    $script:ToolkitBootPollAttempts = 2
+    $script:ToolkitBootPollDelaySeconds = 0
+    try {
+        $readyRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            [pscustomobject]@{ ExitCode = 0; Text = '1' }
+        }.GetNewClosure()
+        Assert-True (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $readyRunner) 'The shared boot wait did not report a ready instance.'
+        $notReadyRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            $sharedState.Polls++
+            [pscustomobject]@{ ExitCode = 0; Text = '0' }
+        }.GetNewClosure()
+        $sharedState.Polls = 0
+        Assert-True (-not (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $notReadyRunner)) 'The shared boot wait reported a ready instance that never booted.'
+        Assert-Equal 2 $sharedState.Polls 'The shared boot wait did not stop at its poll bound.'
+        $throwingRunner = { param($ActualFilePath, $ActualArgumentList) throw 'transport failure' }.GetNewClosure()
+        Assert-True (-not (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $throwingRunner)) 'The shared boot wait reported a ready instance whose transport failed.'
+    }
+    finally {
+        if ($null -ne $bootAttemptsVariable) {
+            $script:ToolkitBootPollAttempts = $bootAttemptsVariable.Value
+        }
+        if ($null -ne $bootDelayVariable) {
+            $script:ToolkitBootPollDelaySeconds = $bootDelayVariable.Value
+        }
+    }
+
+    $packageText = 'Package [me.weishu.kernelsu] (a1b2c3):' + [Environment]::NewLine + '    versionCode=30205 minSdk=28' + [Environment]::NewLine + '    versionName=3.2.5'
+    $packageFields = Get-ToolkitPackageVersion -Text $packageText -PackageName 'me.weishu.kernelsu'
+    Assert-True ($null -ne $packageFields) 'The shared package reader refused an exact package header.'
+    Assert-Equal '3.2.5' $packageFields.VersionName 'The shared package reader reported the wrong version name.'
+    Assert-Equal '30205' $packageFields.VersionCode 'The shared package reader reported the wrong version code.'
+    foreach ($nearName in @('me.weishu.kernelsu.beta', 'me.weishu.kernelsux', 'me.weishu', 'io.github.huskydg.magisk', 'me.weishu.kernelsu2')) {
+        Assert-True ($null -eq (Get-ToolkitPackageVersion -Text $packageText -PackageName $nearName)) "The shared package reader accepted a different package as $nearName."
+    }
+    Assert-True ($null -eq (Get-ToolkitPackageVersion -Text ('Unable to find package: me.weishu.kernelsu.') -PackageName 'me.weishu.kernelsu')) 'The shared package reader accepted an absent package.'
+    Assert-True ($null -eq (Get-ToolkitPackageVersion -Text '' -PackageName 'me.weishu.kernelsu')) 'The shared package reader accepted empty output.'
+    $headerlessText = 'Packages:' + [Environment]::NewLine + '    versionName=3.2.5'
+    Assert-True ($null -eq (Get-ToolkitPackageVersion -Text $headerlessText -PackageName 'me.weishu.kernelsu')) 'The shared package reader accepted version fields with no package header.'
+    $versionlessText = 'Package [me.weishu.kernelsu] (a1b2c3):' + [Environment]::NewLine + '    versionCode=30205 minSdk=28'
+    $versionlessFields = Get-ToolkitPackageVersion -Text $versionlessText -PackageName 'me.weishu.kernelsu'
+    Assert-True ($null -ne $versionlessFields) 'The shared package reader refused an installed package with no version name.'
+    Assert-Equal '' $versionlessFields.VersionName 'The shared package reader invented a version name.'
+    $trailingNameText = 'Package [me.weishu.kernelsu.beta] (a1b2c3):' + [Environment]::NewLine + '    versionName=3.2.5'
+    Assert-True ($null -eq (Get-ToolkitPackageVersion -Text $trailingNameText -PackageName 'me.weishu.kernelsu')) 'The shared package reader matched a near-name header.'
+
+    $rootShellCases = @(
+        [pscustomobject]@{ Call = $null; Code = 'ADB_FAILED'; Status = 'CriticalError'; Label = 'no call at all' },
+        [pscustomobject]@{ Call = ([pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: fixture' }); Code = 'ADB_FAILED'; Status = 'CriticalError'; Label = 'a call that could not be launched' },
+        [pscustomobject]@{ Call = ([pscustomobject]@{ ExitCode = 1; Text = '   ' }); Code = 'ADB_FAILED'; Status = 'CriticalError'; Label = 'a failing call with no guest output' },
+        [pscustomobject]@{ Call = ([pscustomobject]@{ ExitCode = 1; Text = '/system/bin/sh: su: not found' }); Code = 'ROOT_DENIED'; Status = 'CriticalError'; Label = 'a guest refusal' },
+        [pscustomobject]@{ Call = ([pscustomobject]@{ ExitCode = 0; Text = 'uid=2000(shell) gid=2000(shell) groups=2000(shell)' }); Code = 'ROOT_DENIED'; Status = 'CriticalError'; Label = 'a non-root identity' },
+        [pscustomobject]@{ Call = ([pscustomobject]@{ ExitCode = 0; Text = '   ' }); Code = 'ROOT_DENIED'; Status = 'CriticalError'; Label = 'a successful call with no identity' },
+        [pscustomobject]@{ Call = ([pscustomobject]@{ ExitCode = 0; Text = 'uid=0(root) gid=0(root) groups=0(root)' }); Code = 'OK'; Status = 'Success'; Label = 'a root identity' }
+    )
+    foreach ($rootShellCase in $rootShellCases) {
+        $rootShellResult = Get-ToolkitRootShellStatus -Call $rootShellCase.Call
+        Assert-Equal $rootShellCase.Status $rootShellResult.Status "The shared root shell reader returned the wrong status for $($rootShellCase.Label)."
+        Assert-Equal $rootShellCase.Code $rootShellResult.Data.Code "The shared root shell reader reported the wrong code for $($rootShellCase.Label)."
+    }
+
+    $root15Root = Join-Path $testRoot 'shared verification fixtures'
+    $journalRoot = Join-Path $root15Root 'journals'
+    $install = New-Root12InstallFixture -InstallRoot (Join-Path $root15Root 'MuMu Global') -SourceIndex 3
+
+    $sharedState.SettingText = '{"root_permission":"true"}'
+    $settingRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+        [pscustomobject]@{ ExitCode = 0; Text = $sharedState.SettingText }
+    }.GetNewClosure()
+    foreach ($shape in @(
+            [pscustomobject]@{ Text = '{"root_permission":"true"}'; Value = $true; Label = 'a string value' },
+            [pscustomobject]@{ Text = '{"root_permission":true}'; Value = $true; Label = 'a boolean value' },
+            [pscustomobject]@{ Text = '[{"root_permission":"true"}]'; Value = $true; Label = 'a one-element array' },
+            [pscustomobject]@{ Text = '{"value":1}'; Value = $true; Label = 'a numeric value' },
+            [pscustomobject]@{ Text = '{"root_setting":"false"}'; Value = $false; Label = 'a root_setting field' },
+            [pscustomobject]@{ Text = '{"index":"7","value":"true"}'; Value = $true; Label = 'an index and a value' }
+        )) {
+        $sharedState.SettingText = $shape.Text
+        $shapeResult = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner $settingRunner
+        Assert-Equal 'Success' $shapeResult.Status "The shared vendor root reader refused $($shape.Label)."
+        Assert-Equal $shape.Value $shapeResult.Data.Value "The shared vendor root reader reported the wrong value for $($shape.Label)."
+    }
+    foreach ($defect in @(
+            [pscustomobject]@{ Text = ''; Code = 'MANAGER_JSON_INVALID'; Label = 'empty output' },
+            [pscustomobject]@{ Text = '   '; Code = 'MANAGER_JSON_INVALID'; Label = 'whitespace output' },
+            [pscustomobject]@{ Text = 'not json'; Code = 'MANAGER_JSON_INVALID'; Label = 'non-JSON output' },
+            [pscustomobject]@{ Text = '{"error_code":1}'; Code = 'MANAGER_ERROR'; Label = 'a manager error' },
+            [pscustomobject]@{ Text = '[]'; Code = 'SHAPE_UNSUPPORTED'; Label = 'an empty array' },
+            [pscustomobject]@{ Text = '[{"root_permission":"true"},{"root_permission":"false"}]'; Code = 'SHAPE_UNSUPPORTED'; Label = 'a two-element array' },
+            [pscustomobject]@{ Text = '"true"'; Code = 'SHAPE_UNSUPPORTED'; Label = 'a scalar' },
+            [pscustomobject]@{ Text = '{"error_code":0,"unexpected":"value"}'; Code = 'SHAPE_UNSUPPORTED'; Label = 'no supported field' },
+            [pscustomobject]@{ Text = '{"root_permission":"maybe"}'; Code = 'VALUE_INVALID'; Label = 'an unusable value' },
+            [pscustomobject]@{ Text = '{"index":"9","value":"true"}'; Code = 'INDEX_MISMATCH'; Label = 'another instance' }
+        )) {
+        $sharedState.SettingText = $defect.Text
+        $defectResult = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index 7 -Runner $settingRunner
+        Assert-Equal 'CriticalError' $defectResult.Status "The shared vendor root reader accepted $($defect.Label)."
+        Assert-Equal $defect.Code $defectResult.Data.Code "The shared vendor root reader reported the wrong code for $($defect.Label)."
+    }
+    $blankManagerResult = Get-ToolkitRootSetting -ManagerPath '   ' -Index 7 -Runner $settingRunner
+    Assert-Equal 'CriticalError' $blankManagerResult.Status 'The shared vendor root reader accepted a blank manager.'
+    Assert-Equal 'MANAGER_UNAVAILABLE' $blankManagerResult.Data.Code 'The shared vendor root reader reported the wrong code for a blank manager.'
+    $negativeIndexResult = Get-ToolkitRootSetting -ManagerPath $install.ManagerPath -Index -1 -Runner $settingRunner
+    Assert-Equal 'CriticalError' $negativeIndexResult.Status 'The shared vendor root reader accepted a negative index.'
+    Assert-Equal 'MANAGER_UNAVAILABLE' $negativeIndexResult.Data.Code 'The shared vendor root reader reported the wrong code for a negative index.'
+
+    $failureJournalRoot = Join-Path $root15Root 'failure journals'
+    $runningJournal = New-OperationJournal -Root $failureJournalRoot -Operation 'Shared' -Instance ([pscustomobject]@{ Index = 3 })
+    $failedState = @{ Code = 'TEST'; Sequence = 0 }
+    $failureResult = New-ToolkitRootFailure -Journal $runningJournal -Message 'shared failure fixture' -Data $failedState
+    Assert-Equal 'CriticalError' $failureResult.Status 'The shared failure helper did not return a critical error.'
+    Assert-Equal 'shared failure fixture' $failureResult.Message 'The shared failure helper changed the reason.'
+    Assert-True ($failureResult.Data -is [Collections.IDictionary]) 'The shared failure helper dropped the recovery data.'
+    Assert-Equal 'Failed' $runningJournal.State 'The shared failure helper did not close a running journal.'
+    $reopenedFailure = Get-OperationJournal -Path $runningJournal.JournalPath
+    Assert-Equal 'Failed' $reopenedFailure.State 'The shared failure helper did not persist the failed state.'
+    Assert-Equal 'TEST' $reopenedFailure.Result.Data.Code 'The shared failure helper did not persist the recovery code.'
+    Assert-True (@($reopenedFailure.Checkpoints).Count -ge 1) 'The shared failure helper recorded no checkpoint.'
+    $secondFailure = New-ToolkitRootFailure -Journal $runningJournal -Message 'second shared failure fixture' -Data $failedState
+    Assert-Equal 'second shared failure fixture' $secondFailure.Message 'The shared failure helper changed a reason for a closed journal.'
+    Assert-Equal 'Failed' $runningJournal.State 'The shared failure helper reopened a closed journal.'
+    $nullJournalFailure = New-ToolkitRootFailure -Journal $null -Message 'third shared failure fixture' -Data $failedState
+    Assert-Equal 'CriticalError' $nullJournalFailure.Status 'The shared failure helper did not report a failure without a journal.'
+    $blankFailure = New-ToolkitRootFailure -Journal $null -Message '   ' -Data $failedState
+    Assert-Equal 'CriticalError' $blankFailure.Status 'The shared failure helper accepted a blank reason.'
+    Assert-True (-not [string]::IsNullOrWhiteSpace($blankFailure.Message)) 'The shared failure helper returned no reason for a blank message.'
+    $blankData = @{ Code = 'TEST'; Sequence = 1 }
+    $blankDataFailure = New-ToolkitRootFailure -Journal $null -Message 'fourth shared failure fixture' -Data $blankData
+    Assert-True ($blankDataFailure.Data -is [Collections.IDictionary]) 'The shared failure helper returned no recovery data.'
+    Assert-Equal 'TEST' $blankDataFailure.Data.Code 'The shared failure helper changed the recovery code.'
+    $nullDataFailure = New-ToolkitRootFailure -Journal $null -Message 'fifth shared failure fixture'
+    Assert-True ($null -eq $nullDataFailure.Data) 'The shared failure helper invented recovery data for a failure without any.'
+    Assert-Equal 0 $failedState.Sequence 'The shared failure helper shared a mutable recovery record between calls.'
+}
+
 function Invoke-CommonTests {
     Assert-True ($null -ne (Get-Command Get-ToolkitLogPath -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitLogPath is unavailable.'
     $logRoot = Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit\logs'
@@ -5380,6 +5740,9 @@ try {
         'Root15' {
             Invoke-Root15Tests
         }
+        'Verification' {
+            Invoke-VerificationTests
+        }
         'All' {
             Invoke-ManifestTests
             Invoke-AssetTests
@@ -5389,6 +5752,7 @@ try {
             Invoke-DiscoveryTests
             Invoke-SafetyTests
             Invoke-AdsTests
+            Invoke-VerificationTests
             Invoke-Root12Tests
             Invoke-Root15Tests
             Invoke-CommonTests
