@@ -901,6 +901,73 @@ function New-DiscoveryManagerFixture {
     return [IO.Path]::GetFullPath($managerPath)
 }
 
+function Get-DiscoveryResultStatus {
+    param([object]$Result)
+
+    if ($null -ne $Result -and $null -ne $Result.PSObject.Properties['Status']) {
+        return [string]$Result.Status
+    }
+    return 'Accepted'
+}
+
+function Invoke-DiscoveryCall {
+    param([scriptblock]$Action)
+
+    try {
+        return & $Action
+    }
+    catch {
+        return [pscustomobject]@{
+            Status = 'Thrown'
+            Message = $_.Exception.Message
+        }
+    }
+}
+
+function Assert-DiscoveryInstallRejected {
+    param(
+        [object]$Install,
+        [string]$ManagerPath,
+        [string]$ArgumentsPath,
+        [string]$Label
+    )
+
+    if ([IO.File]::Exists($ArgumentsPath)) {
+        [IO.File]::Delete($ArgumentsPath)
+    }
+    $result = Invoke-DiscoveryCall { Get-MuMuInstances -Install $Install -ManagerPath $ManagerPath }
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $result) "Malformed Install field was accepted: $Label"
+    Assert-True (-not [IO.File]::Exists($ArgumentsPath)) "Malformed Install field reached the process runner: $Label"
+}
+
+function Invoke-DiscoveryManagerCase {
+    param(
+        [string]$Name,
+        [string]$InfoJson,
+        [string]$SettingJson = '{"root_permission":"false"}',
+        [string]$Edition = 'Global'
+    )
+
+    $root = Join-Path $testRoot ('discovery negative\' + $Name)
+    $vms = Join-Path $root 'vms'
+    New-Item -ItemType Directory -Path $vms -Force | Out-Null
+    $manager = New-DiscoveryManagerFixture -InstallRoot $root -InfoJson $InfoJson -SettingJson $SettingJson
+    $install = [pscustomobject]@{
+        Edition = $Edition
+        InstallRoot = [IO.Path]::GetFullPath($root)
+        VmsPath = [IO.Path]::GetFullPath($vms)
+        ManagerPath = $manager
+        Source = 'Process'
+    }
+    $result = @(Get-MuMuInstances -Install $install -ManagerPath $manager)
+    [pscustomobject]@{
+        Result = $result
+        Install = $install
+        ManagerPath = $manager
+        ArgumentsPath = Join-Path (Split-Path -Parent $manager) 'args.log'
+    }
+}
+
 function Invoke-DiscoveryTests {
     foreach ($commandName in @('Find-MuMuInstallations', 'Get-MuMuInstances', 'Resolve-SelectedInstance')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Discovery command is unavailable: $commandName"
@@ -908,21 +975,35 @@ function Invoke-DiscoveryTests {
 
     $discoveryRoot = Join-Path $testRoot 'discovery fixtures'
     New-Item -ItemType Directory -Path $discoveryRoot | Out-Null
+    $previousAppData = $env:APPDATA
+    $fixtureProfileRoot = Join-Path $testRoot 'fixture profile'
+    $env:APPDATA = Join-Path $fixtureProfileRoot 'empty'
+    New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
     $globalRoot = Join-Path $discoveryRoot 'Odd Path\MuMu Global'
     $globalVms = Join-Path $globalRoot 'vms'
     $globalFixture = New-DiscoveryInstallFixture -InstallRoot $globalRoot -VmsPath $globalVms
+    $registryChineseRoot = Join-Path $discoveryRoot 'Registry Chinese\MuMuPlayer'
+    $registryChineseVms = Join-Path $registryChineseRoot 'vms'
+    $registryChineseFixture = New-DiscoveryInstallFixture -InstallRoot $registryChineseRoot -VmsPath $registryChineseVms
+    $unrelatedRegistryRoot = Join-Path $discoveryRoot 'Unrelated Product'
+    $unrelatedRegistryVms = Join-Path $unrelatedRegistryRoot 'vms'
+    New-Item -ItemType Directory -Path $unrelatedRegistryRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $unrelatedRegistryVms -Force | Out-Null
+    $unrelatedRegistryManager = Join-Path $unrelatedRegistryRoot 'helper.exe'
+    [IO.File]::WriteAllText($unrelatedRegistryManager, 'unrelated registry fixture')
     $globalRelocatedVms = Join-Path $discoveryRoot 'relocated global\vms'
     New-Item -ItemType Directory -Path $globalRelocatedVms -Force | Out-Null
     $globalRelocatedManager = Join-Path $globalRoot 'nx_main\MuMuManager.exe'
     New-Item -ItemType Directory -Path (Split-Path -Parent $globalRelocatedManager) -Force | Out-Null
     [IO.File]::WriteAllText($globalRelocatedManager, 'relocated discovery fixture')
+    [IO.File]::Delete($globalFixture.ManagerPath)
     $unicodeFolder = ([string][char]0x5B89) + ([string][char]0x88C5)
     $processRoot = Join-Path $discoveryRoot (Join-Path 'Relocated' (Join-Path $unicodeFolder 'MuMu'))
     $processVmsTarget = Join-Path $discoveryRoot 'user data\MuMuPlayer\vms'
     $processFixture = New-DiscoveryInstallFixture -InstallRoot $processRoot -VmsPath $processVmsTarget
     $processVmsLink = Join-Path $discoveryRoot 'vms-junction'
     New-Item -ItemType Junction -Path $processVmsLink -Target $processFixture.VmsPath | Out-Null
-    $fallbackRoot = Join-Path $discoveryRoot 'Fallback\MuMu'
+    $fallbackRoot = Join-Path $discoveryRoot 'Fallback\MuMuPlayer'
     $fallbackVms = Join-Path $fallbackRoot 'nx_device\12.0\vms'
     $fallbackFixture = New-DiscoveryInstallFixture -InstallRoot $fallbackRoot -VmsPath $fallbackVms
     $outsideRoot = Join-Path $discoveryRoot 'outside'
@@ -933,9 +1014,66 @@ function Invoke-DiscoveryTests {
         [pscustomobject]@{
             Root = 'FixtureRegistry:\Global'
             DisplayName = 'MuMu Global'
+            Publisher = 'NetEase'
             InstallLocation = $registryInstallLocation
             Edition = 'Global'
+            VmsPath = $globalFixture.VmsPath
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\Chinese'
+            DisplayName = 'MuMuPlayer'
+            Publisher = 'NetEase'
+            InstallLocation = $registryChineseFixture.InstallRoot
+            Edition = 'Chinese'
+            VmsPath = $registryChineseVms
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\Unrelated'
+            DisplayName = 'Unrelated Product'
+            Publisher = 'Unrelated Publisher'
+            InstallLocation = $unrelatedRegistryRoot
+            Edition = ''
+            VmsPath = $unrelatedRegistryVms
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\EditionConflict'
+            DisplayName = 'MuMu Global'
+            Publisher = 'NetEase'
+            InstallLocation = $globalFixture.InstallRoot
+            Edition = 'Chinese'
+            VmsPath = $globalFixture.VmsPath
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\InvalidEdition'
+            DisplayName = 'MuMu Global'
+            Publisher = 'NetEase'
+            InstallLocation = $globalFixture.InstallRoot
+            Edition = 'global'
+            VmsPath = $globalFixture.VmsPath
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\StaleVms'
+            DisplayName = 'MuMu Global'
+            Publisher = 'NetEase'
+            InstallLocation = $globalFixture.InstallRoot
+            Edition = 'Global'
             VmsPath = $staleVmsPath
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\SameSourceA'
+            DisplayName = 'MuMu Global'
+            Publisher = 'NetEase'
+            InstallLocation = $globalFixture.InstallRoot
+            Edition = 'Global'
+            VmsPath = $globalFixture.VmsPath
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\SameSourceB'
+            DisplayName = 'MuMu Global'
+            Publisher = 'NetEase'
+            InstallLocation = $globalFixture.InstallRoot
+            Edition = 'Global'
+            VmsPath = $globalRelocatedVms
         }
     )
 
@@ -958,16 +1096,16 @@ function Invoke-DiscoveryTests {
             ExecutablePath = $processFixture.ManagerPath
             CommandLine = '"' + $processFixture.ManagerPath + '" --vms_path "' + $processVmsLink + '"'
             InstallRoot = $processFixture.InstallRoot
-        },
-        [pscustomobject]@{
-            ExecutablePath = $outsideFixture.ManagerPath
-            CommandLine = '"' + $outsideFixture.ManagerPath + '"'
-            InstallRoot = $globalFixture.InstallRoot
+            Edition = 'Chinese'
         }
     )
     $fallbackRoots = @($fallbackFixture.InstallRoot)
     $installs = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots $registryRoots -ProcessSnapshot $processSnapshot -FallbackRoots $fallbackRoots)
-    Assert-Equal 3 $installs.Count 'Discovery did not deduplicate installation sources.'
+    $installFailure = Get-DiscoveryResultStatus $installs[0]
+    if ($installFailure -eq 'CriticalError') {
+        $installFailure += ': ' + $installs[0].Message
+    }
+    Assert-Equal 3 $installs.Count "Discovery did not deduplicate installation sources. $installFailure"
     $globalInstall = @($installs | Where-Object { $_.InstallRoot -eq $globalFixture.InstallRoot })
     $processInstall = @($installs | Where-Object { $_.InstallRoot -eq $processFixture.InstallRoot })
     $fallbackInstall = @($installs | Where-Object { $_.InstallRoot -eq $fallbackFixture.InstallRoot })
@@ -990,6 +1128,129 @@ function Invoke-DiscoveryTests {
     Assert-Equal 2 $chineseOnly.Count 'Chinese edition filter returned the wrong count.'
     Assert-True (@($chineseOnly | Where-Object { $_.Edition -eq 'Chinese' }).Count -eq 2) 'Chinese edition filter returned another edition.'
 
+    $registryResult = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\Global', 'FixtureRegistry:\Chinese', 'FixtureRegistry:\Unrelated') -ProcessSnapshot @() -FallbackRoots @())
+    Assert-Equal 2 $registryResult.Count 'Registry discovery did not filter unrelated products.'
+    Assert-Equal 1 @($registryResult | Where-Object { $_.InstallRoot -eq $globalFixture.InstallRoot }).Count 'Global registry installation was not discovered.'
+    Assert-Equal 1 @($registryResult | Where-Object { $_.InstallRoot -eq $registryChineseFixture.InstallRoot }).Count 'Chinese registry installation was not discovered.'
+    Assert-Equal 0 @($registryResult | Where-Object { $_.InstallRoot -eq $unrelatedRegistryRoot }).Count 'Unrelated registry installation was accepted.'
+
+    $registryEditionConflict = Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\EditionConflict') -ProcessSnapshot @() -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $registryEditionConflict) 'Registry path and explicit edition conflict was accepted.'
+
+    $invalidRegistryEdition = Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\InvalidEdition') -ProcessSnapshot @() -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $invalidRegistryEdition) 'Noncanonical registry edition was accepted.'
+
+    $processEditionConflict = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $globalFixture.ManagerPath; CommandLine = '"' + $globalFixture.ManagerPath + '"'; InstallRoot = $globalFixture.InstallRoot; Edition = 'Chinese' }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $processEditionConflict) 'Process path and explicit edition conflict was accepted.'
+
+    $crossSourceEditionConflict = Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\Global') -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $globalFixture.ManagerPath; CommandLine = '"' + $globalFixture.ManagerPath + '"'; InstallRoot = $globalFixture.InstallRoot; Edition = 'Chinese' }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $crossSourceEditionConflict) 'Cross-source editions were merged into a hybrid record.'
+
+    $sameRegistryConflict = Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\SameSourceA', 'FixtureRegistry:\SameSourceB') -ProcessSnapshot @() -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $sameRegistryConflict) 'Same-source registry paths were merged silently.'
+    $sameProcessConflict = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @(
+        [pscustomobject]@{ ExecutablePath = $globalRelocatedManager; CommandLine = '"' + $globalRelocatedManager + '"'; InstallRoot = $globalFixture.InstallRoot; Edition = 'Global' },
+        [pscustomobject]@{ ExecutablePath = $globalRelocatedManager; CommandLine = '"' + $globalRelocatedManager + '"'; InstallRoot = $globalFixture.InstallRoot; Edition = 'Global'; VmsPath = $globalRelocatedVms }
+    ) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $sameProcessConflict) 'Same-source process VMS paths were merged silently.'
+
+    $multipleManagerRoot = Join-Path $discoveryRoot 'Multiple Manager Layout\MuMu Global'
+    $multipleManagerVms = Join-Path $multipleManagerRoot 'vms'
+    $multipleManagerShell = Join-Path $multipleManagerRoot 'shell\MuMuManager.exe'
+    $multipleManagerNested = Join-Path $multipleManagerRoot 'nx_main\shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path $multipleManagerVms -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $multipleManagerShell) -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $multipleManagerNested) -Force | Out-Null
+    [IO.File]::WriteAllText($multipleManagerShell, 'manager fixture')
+    [IO.File]::WriteAllText($multipleManagerNested, 'manager fixture')
+    $multipleManagerResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $multipleManagerNested; CommandLine = '"' + $multipleManagerNested + '"'; InstallRoot = $multipleManagerRoot; Edition = 'Global' }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $multipleManagerResult) 'Multiple valid manager layouts were selected silently.'
+    $explicitMultipleManagerResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $multipleManagerNested; CommandLine = '"' + $multipleManagerNested + '"'; InstallRoot = $multipleManagerRoot; Edition = 'Global'; ManagerPath = $multipleManagerNested }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $explicitMultipleManagerResult) 'Explicit process manager bypassed multiple-layout validation.'
+
+    $getMultipleRoot = Join-Path $discoveryRoot 'Get Multiple Manager Layout\MuMu Global'
+    $getMultipleVms = Join-Path $getMultipleRoot 'vms'
+    New-Item -ItemType Directory -Path $getMultipleVms -Force | Out-Null
+    $getMultipleInfo = [pscustomobject]@{ index = '1'; name = 'Multiple Manager'; is_main = $false; is_process_started = $false; android_version = '12.0' } | ConvertTo-Json -Compress
+    $getMultipleShellManager = New-DiscoveryManagerFixture -InstallRoot $getMultipleRoot -InfoJson $getMultipleInfo
+    $getMultipleNestedManager = Join-Path $getMultipleRoot 'nx_main\shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $getMultipleNestedManager) -Force | Out-Null
+    [IO.File]::Copy($script:discoveryManagerTemplatePath, $getMultipleNestedManager, $true)
+    $getMultipleUtf8 = New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $getMultipleNestedManager) 'info.json'), $getMultipleInfo, $getMultipleUtf8)
+    [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $getMultipleNestedManager) 'setting.json'), '{"root_permission":"false"}', $getMultipleUtf8)
+    $getMultipleInstall = [pscustomobject]@{ Edition = 'Global'; InstallRoot = [IO.Path]::GetFullPath($getMultipleRoot); VmsPath = [IO.Path]::GetFullPath($getMultipleVms); ManagerPath = $getMultipleShellManager; Source = 'Process' }
+    $getMultipleResult = Invoke-DiscoveryCall { Get-MuMuInstances -Install $getMultipleInstall -ManagerPath $getMultipleShellManager }
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $getMultipleResult) 'Get bypassed multiple manager layout validation.'
+    Assert-True (-not [IO.File]::Exists((Join-Path (Split-Path -Parent $getMultipleShellManager) 'args.log'))) 'Get executed before multiple manager validation.'
+
+    $invalidEditionThrew = $false
+    $invalidEditionResult = $null
+    try {
+        $invalidEditionResult = Find-MuMuInstallations -Edition 'Unsupported' -RegistryRoots @() -ProcessSnapshot @() -FallbackRoots @()
+    }
+    catch {
+        $invalidEditionThrew = $true
+    }
+    Assert-True (-not $invalidEditionThrew) 'Invalid public Edition threw instead of returning CriticalError.'
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $invalidEditionResult) 'Invalid public Edition was accepted.'
+
+    $env:APPDATA = $fixtureProfileRoot
+    $globalUserVms = Join-Path $fixtureProfileRoot 'Netease\MuMuPlayerGlobal\vms'
+    $chineseUserVms = Join-Path $fixtureProfileRoot 'Netease\MuMuPlayer\vms'
+    New-Item -ItemType Directory -Path $globalUserVms -Force | Out-Null
+    New-Item -ItemType Directory -Path $chineseUserVms -Force | Out-Null
+    $globalUserRoot = Join-Path $discoveryRoot 'Global User Layout\MuMu Global'
+    $globalUserManager = Join-Path $globalUserRoot 'shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $globalUserManager) -Force | Out-Null
+    [IO.File]::WriteAllText($globalUserManager, 'global user layout fixture')
+    $chineseUserRoot = Join-Path $discoveryRoot 'Chinese User Layout\MuMuPlayer'
+    $chineseUserManager = Join-Path $chineseUserRoot 'shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $chineseUserManager) -Force | Out-Null
+    [IO.File]::WriteAllText($chineseUserManager, 'chinese user layout fixture')
+
+    $globalUserResult = @(Find-MuMuInstallations -Edition 'Global' -RegistryRoots @() -ProcessSnapshot @() -FallbackRoots @($globalUserRoot))
+    Assert-Equal 1 $globalUserResult.Count 'Global user-data layout was not discovered.'
+    Assert-Equal $globalUserVms $globalUserResult[0].VmsPath 'Global user-data VMS path was not selected independently.'
+    $chineseUserResult = @(Find-MuMuInstallations -Edition 'Chinese' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $chineseUserManager; CommandLine = '"' + $chineseUserManager + '"'; InstallRoot = $chineseUserRoot; Edition = 'Chinese' }) -FallbackRoots @())
+    Assert-Equal 1 $chineseUserResult.Count 'Chinese user-data layout was not discovered.'
+    Assert-Equal $chineseUserVms $chineseUserResult[0].VmsPath 'Chinese user-data VMS path was not selected independently.'
+
+    $multipleVmsRoot = Join-Path $discoveryRoot 'Multiple VMS\MuMuPlayer'
+    $multipleVmsManager = Join-Path $multipleVmsRoot 'shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $multipleVmsManager) -Force | Out-Null
+    [IO.File]::WriteAllText($multipleVmsManager, 'multiple VMS fixture')
+    New-Item -ItemType Directory -Path (Join-Path $multipleVmsRoot 'vms') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $multipleVmsRoot 'nx_device\15.0\vms') -Force | Out-Null
+    $multipleVmsResult = Find-MuMuInstallations -Edition 'Chinese' -RegistryRoots @() -ProcessSnapshot @() -FallbackRoots @($multipleVmsRoot)
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $multipleVmsResult) 'Multiple inferred VMS paths were selected silently.'
+
+    $unknownEditionRoot = Join-Path $discoveryRoot 'Unknown Edition\MuMu'
+    $unknownEditionVms = Join-Path $unknownEditionRoot 'vms'
+    $unknownEditionManager = Join-Path $unknownEditionRoot 'shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path $unknownEditionVms -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $unknownEditionManager) -Force | Out-Null
+    [IO.File]::WriteAllText($unknownEditionManager, 'unknown edition fixture')
+    $unknownEditionResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @() -FallbackRoots @($unknownEditionRoot)
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $unknownEditionResult) 'Unknown fallback edition defaulted to Chinese.'
+
+    $staleRegistryVms = Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\StaleVms') -ProcessSnapshot @() -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $staleRegistryVms) 'Stale explicit registry VMS path was ignored.'
+    $staleProcessVms = Find-MuMuInstallations -Edition 'Global' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $globalRelocatedManager; CommandLine = '"' + $globalRelocatedManager + '"'; InstallRoot = $globalFixture.InstallRoot; Edition = 'Global'; VmsPath = $staleVmsPath }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $staleProcessVms) 'Stale explicit process VMS path was ignored.'
+
+    $conflictingVmsRoot = Join-Path $discoveryRoot 'Conflicting VMS\MuMu Global'
+    $conflictingVmsManager = Join-Path $conflictingVmsRoot 'shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $conflictingVmsManager) -Force | Out-Null
+    [IO.File]::WriteAllText($conflictingVmsManager, 'conflicting VMS fixture')
+    $conflictingVmsA = Join-Path $conflictingVmsRoot 'relocated-a\vms'
+    $conflictingVmsB = Join-Path $conflictingVmsRoot 'relocated-b\vms'
+    New-Item -ItemType Directory -Path $conflictingVmsA -Force | Out-Null
+    New-Item -ItemType Directory -Path $conflictingVmsB -Force | Out-Null
+    $conflictingVmsResult = Find-MuMuInstallations -Edition 'Global' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $conflictingVmsManager; CommandLine = '"' + $conflictingVmsManager + '" --vms_path "' + $conflictingVmsB + '"'; InstallRoot = $conflictingVmsRoot; Edition = 'Global'; VmsPath = $conflictingVmsA }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $conflictingVmsResult) 'Conflicting explicit VMS paths were merged silently.'
+    $env:APPDATA = $previousAppData
+
     $instanceRoot = Join-Path $discoveryRoot 'instances\MuMu Global'
     $instanceVms = Join-Path $discoveryRoot 'relocated instances\vms'
     New-Item -ItemType Directory -Path $instanceVms -Force | Out-Null
@@ -1003,7 +1264,7 @@ function Invoke-DiscoveryTests {
         Edition = 'Global'
         InstallRoot = [IO.Path]::GetFullPath($instanceRoot)
         VmsPath = [IO.Path]::GetFullPath($instanceVms)
-        ManagerPath = [IO.Path]::GetFullPath((Join-Path $instanceRoot 'missing-manager\MuMuManager.exe'))
+        ManagerPath = $instanceManager
         Source = 'Process'
     }
     $instances = @(Get-MuMuInstances -Install $instanceInstall -ManagerPath $instanceManager)
@@ -1019,8 +1280,9 @@ function Invoke-DiscoveryTests {
     Assert-Equal $true $instances[1].Eligible 'Android 15 instance was not eligible.'
     $managerArguments = [IO.File]::ReadAllLines((Join-Path (Split-Path -Parent $instanceManager) 'args.log'))
     Assert-Equal 'info|-v|all' $managerArguments[0] 'Manager info arguments were not structured.'
-    Assert-True (@($managerArguments | Where-Object { $_ -eq 'setting|-v|0|-k|root_permission' }).Count -eq 1) 'Base root setting was not queried with structured arguments.'
+    Assert-True (@($managerArguments | Where-Object { $_ -eq 'setting|-v|0|-k|root_permission' }).Count -eq 0) 'Base instance invoked a per-instance manager process.'
     Assert-True (@($managerArguments | Where-Object { $_ -eq 'setting|-v|2|-k|root_permission' }).Count -eq 1) 'Instance root setting arguments were changed.'
+    Assert-True (@($managerArguments | Where-Object { $_ -eq 'setting|-v|10|-k|root_permission' }).Count -eq 1) 'Android 12 root setting arguments were changed.'
 
     $eligibleZero = [pscustomobject]@{ Index = 0; Eligible = $false }
     $eligibleOne = [pscustomobject]@{ Index = 1; Eligible = $true }
@@ -1044,8 +1306,12 @@ function Invoke-DiscoveryTests {
     $baseInstall = [pscustomobject]@{ Edition = 'Global'; InstallRoot = [IO.Path]::GetFullPath($baseRoot); VmsPath = [IO.Path]::GetFullPath($baseVms); ManagerPath = $baseManager; Source = 'Process' }
     $baseInstances = @(Get-MuMuInstances -Install $baseInstall -ManagerPath $baseManager)
     $baseResult = Resolve-SelectedInstance -Instances $baseInstances -Selection $null
+    $baseArguments = [IO.File]::ReadAllLines((Join-Path (Split-Path -Parent $baseManager) 'args.log'))
     Assert-Equal 1 $baseInstances.Count 'Base instance was not returned for display.'
     Assert-Equal $false $baseInstances[0].Eligible 'Base instance was eligible.'
+    Assert-True ($null -eq $baseInstances[0].RootSetting) 'Base instance unexpectedly reported a queried root setting.'
+    Assert-Equal 1 $baseArguments.Count 'Base instance invoked a per-instance manager process.'
+    Assert-Equal 'info|-v|all' $baseArguments[0] 'Base instance manager arguments changed.'
     Assert-Equal 'CriticalError' $baseResult.Status 'Base-only instance selection was accepted.'
 
     $unsupportedRoot = Join-Path $discoveryRoot 'unsupported'
@@ -1056,8 +1322,103 @@ function Invoke-DiscoveryTests {
     $unsupportedInstall = [pscustomobject]@{ Edition = 'Global'; InstallRoot = [IO.Path]::GetFullPath($unsupportedRoot); VmsPath = [IO.Path]::GetFullPath($unsupportedVms); ManagerPath = $unsupportedManager; Source = 'Process' }
     $unsupportedInstances = @(Get-MuMuInstances -Install $unsupportedInstall -ManagerPath $unsupportedManager)
     $unsupportedResult = Resolve-SelectedInstance -Instances $unsupportedInstances -Selection $null
+    $unsupportedArguments = [IO.File]::ReadAllLines((Join-Path (Split-Path -Parent $unsupportedManager) 'args.log'))
     Assert-Equal $false $unsupportedInstances[0].Eligible 'Unsupported Android version was eligible.'
+    Assert-True ($null -eq $unsupportedInstances[0].RootSetting) 'Unsupported instance unexpectedly reported a queried root setting.'
+    Assert-Equal 1 $unsupportedArguments.Count 'Unsupported instance invoked a per-instance manager process.'
+    Assert-Equal 'info|-v|all' $unsupportedArguments[0] 'Unsupported instance manager arguments changed.'
     Assert-Equal 'CriticalError' $unsupportedResult.Status 'Unsupported Android version was accepted.'
+
+    $unknownMainRoot = Join-Path $discoveryRoot 'unknown-main'
+    $unknownMainVms = Join-Path $unknownMainRoot 'vms'
+    New-Item -ItemType Directory -Path $unknownMainVms -Force | Out-Null
+    $unknownMainInfo = [pscustomobject]@{ index = '0'; name = 'Unknown main state'; is_process_started = $false; android_version = '12.0' } | ConvertTo-Json -Compress
+    $unknownMainManager = New-DiscoveryManagerFixture -InstallRoot $unknownMainRoot -InfoJson $unknownMainInfo
+    $unknownMainInstall = [pscustomobject]@{ Edition = 'Global'; InstallRoot = [IO.Path]::GetFullPath($unknownMainRoot); VmsPath = [IO.Path]::GetFullPath($unknownMainVms); ManagerPath = $unknownMainManager; Source = 'Process' }
+    $unknownMainInstances = @(Get-MuMuInstances -Install $unknownMainInstall -ManagerPath $unknownMainManager)
+    $unknownMainResult = Resolve-SelectedInstance -Instances $unknownMainInstances -Selection $null
+    $unknownMainArguments = [IO.File]::ReadAllLines((Join-Path (Split-Path -Parent $unknownMainManager) 'args.log'))
+    Assert-Equal $false $unknownMainInstances[0].Eligible 'Missing is_main was treated as an eligible non-base instance.'
+    Assert-Equal 'CriticalError' $unknownMainResult.Status 'Missing is_main instance was selected.'
+    Assert-Equal 1 $unknownMainArguments.Count 'Missing is_main instance invoked a per-instance manager process.'
+
+    $invalidJsonCase = Invoke-DiscoveryManagerCase -Name 'invalid-json' -InfoJson '{not-json'
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidJsonCase.Result)[0]) 'Invalid manager JSON was accepted.'
+    Assert-True (@($invalidJsonCase.Result)[0].Message -match '(?i)json') 'Invalid manager JSON error omitted field context.'
+
+    $duplicateIndexInfo = @(
+        [pscustomobject]@{ index = '1'; name = 'First'; is_main = $false; is_process_started = $false; android_version = '12.0' },
+        [pscustomobject]@{ index = 1; name = 'Duplicate'; is_main = $false; is_process_started = $false; android_version = '12.0' }
+    ) | ConvertTo-Json -Compress
+    $duplicateIndexCase = Invoke-DiscoveryManagerCase -Name 'duplicate-index' -InfoJson $duplicateIndexInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($duplicateIndexCase.Result)[0]) 'Duplicate manager indexes were accepted.'
+    Assert-True (@($duplicateIndexCase.Result)[0].Message -match '(?i)index') 'Duplicate index error omitted field context.'
+
+    $invalidMainInfo = [pscustomobject]@{ index = '1'; name = 'Invalid main'; is_main = 'unknown'; is_process_started = $false; android_version = '12.0' } | ConvertTo-Json -Compress
+    $invalidMainCase = Invoke-DiscoveryManagerCase -Name 'invalid-main' -InfoJson $invalidMainInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidMainCase.Result)[0]) 'Invalid is_main was accepted.'
+    Assert-True (@($invalidMainCase.Result)[0].Message -match '(?i)is_main') 'Invalid is_main error omitted field context.'
+
+    $invalidRunningInfo = [pscustomobject]@{ index = '1'; name = 'Invalid running'; is_main = $false; is_process_started = 'unknown'; android_version = '12.0' } | ConvertTo-Json -Compress
+    $invalidRunningCase = Invoke-DiscoveryManagerCase -Name 'invalid-running' -InfoJson $invalidRunningInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidRunningCase.Result)[0]) 'Invalid running state was accepted.'
+    Assert-True (@($invalidRunningCase.Result)[0].Message -match '(?i)running') 'Invalid running state error omitted field context.'
+
+    $invalidNameInfo = [pscustomobject]@{ index = '1'; name = ''; is_main = $false; is_process_started = $false; android_version = '12.0' } | ConvertTo-Json -Compress
+    $invalidNameCase = Invoke-DiscoveryManagerCase -Name 'invalid-name' -InfoJson $invalidNameInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidNameCase.Result)[0]) 'Invalid instance name was accepted.'
+    Assert-True (@($invalidNameCase.Result)[0].Message -match '(?i)name') 'Invalid name error omitted field context.'
+
+    $invalidReportedRootInfo = [pscustomobject]@{ index = '1'; name = 'Invalid root'; is_main = $false; is_process_started = $false; android_version = '12.0'; root_permission = 'unknown' } | ConvertTo-Json -Compress
+    $invalidReportedRootCase = Invoke-DiscoveryManagerCase -Name 'invalid-reported-root' -InfoJson $invalidReportedRootInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidReportedRootCase.Result)[0]) 'Invalid reported root setting was accepted.'
+    Assert-True (@($invalidReportedRootCase.Result)[0].Message -match '(?i)root') 'Invalid root setting error omitted field context.'
+
+    $validRootInfo = [pscustomobject]@{ index = '1'; name = 'Invalid queried root'; is_main = $false; is_process_started = $false; android_version = '12.0' } | ConvertTo-Json -Compress
+    $invalidQueriedRootCase = Invoke-DiscoveryManagerCase -Name 'invalid-queried-root' -InfoJson $validRootInfo -SettingJson '{"root_permission":"unknown"}'
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidQueriedRootCase.Result)[0]) 'Invalid queried root setting was accepted.'
+    Assert-True (@($invalidQueriedRootCase.Result)[0].Message -match '(?i)root') 'Invalid queried root setting error omitted field context.'
+
+    $malformedInstallCase = Invoke-DiscoveryManagerCase -Name 'malformed-install' -InfoJson $validRootInfo
+    $validInstall = $malformedInstallCase.Install
+    $malformedInstalls = @(
+        [pscustomobject]@{ Label = 'Edition'; Value = [pscustomobject]@{ Edition = 'Other'; InstallRoot = $validInstall.InstallRoot; VmsPath = $validInstall.VmsPath; ManagerPath = $validInstall.ManagerPath; Source = $validInstall.Source } },
+        [pscustomobject]@{ Label = 'Source'; Value = [pscustomobject]@{ Edition = $validInstall.Edition; InstallRoot = $validInstall.InstallRoot; VmsPath = $validInstall.VmsPath; ManagerPath = $validInstall.ManagerPath; Source = 'Other' } },
+        [pscustomobject]@{ Label = 'VmsPath'; Value = [pscustomobject]@{ Edition = $validInstall.Edition; InstallRoot = $validInstall.InstallRoot; VmsPath = 17; ManagerPath = $validInstall.ManagerPath; Source = $validInstall.Source } },
+        [pscustomobject]@{ Label = 'ManagerPath'; Value = [pscustomobject]@{ Edition = $validInstall.Edition; InstallRoot = $validInstall.InstallRoot; VmsPath = $validInstall.VmsPath; ManagerPath = $unrelatedRegistryManager; Source = $validInstall.Source } }
+    )
+    foreach ($malformedInstall in $malformedInstalls) {
+        Assert-DiscoveryInstallRejected -Install $malformedInstall.Value -ManagerPath $malformedInstallCase.ManagerPath -ArgumentsPath $malformedInstallCase.ArgumentsPath -Label $malformedInstall.Label
+    }
+    $missingEditionInstall = [pscustomobject]@{ InstallRoot = $validInstall.InstallRoot; VmsPath = $validInstall.VmsPath; ManagerPath = $validInstall.ManagerPath; Source = $validInstall.Source }
+    Assert-DiscoveryInstallRejected -Install $missingEditionInstall -ManagerPath $malformedInstallCase.ManagerPath -ArgumentsPath $malformedInstallCase.ArgumentsPath -Label 'missing Edition'
+    $missingSourceInstall = [pscustomobject]@{ Edition = $validInstall.Edition; InstallRoot = $validInstall.InstallRoot; VmsPath = $validInstall.VmsPath; ManagerPath = $validInstall.ManagerPath }
+    Assert-DiscoveryInstallRejected -Install $missingSourceInstall -ManagerPath $malformedInstallCase.ManagerPath -ArgumentsPath $malformedInstallCase.ArgumentsPath -Label 'missing Source'
+    $missingInstallManager = [pscustomobject]@{ Edition = $validInstall.Edition; InstallRoot = $validInstall.InstallRoot; VmsPath = $validInstall.VmsPath; Source = $validInstall.Source }
+    Assert-DiscoveryInstallRejected -Install $missingInstallManager -ManagerPath $malformedInstallCase.ManagerPath -ArgumentsPath $malformedInstallCase.ArgumentsPath -Label 'missing ManagerPath'
+
+    $invalidEligible = [pscustomobject]@{ Index = 1; Eligible = 'maybe' }
+    $invalidIndex = [pscustomobject]@{ Index = 'not-an-index'; Eligible = $true }
+    $invalidEligibleResult = Resolve-SelectedInstance -Instances @($invalidEligible) -Selection $null
+    $invalidIndexResult = Resolve-SelectedInstance -Instances @($invalidIndex) -Selection $null
+    Assert-Equal 'CriticalError' $invalidEligibleResult.Status 'Invalid Eligible value was accepted.'
+    Assert-True ($invalidEligibleResult.Message -match '(?i)eligible') 'Invalid Eligible error omitted field context.'
+    Assert-Equal 'CriticalError' $invalidIndexResult.Status 'Invalid instance Index was accepted.'
+    Assert-True ($invalidIndexResult.Message -match '(?i)index') 'Invalid Index error omitted field context.'
+
+    $invalidAndroidInfo = [pscustomobject]@{ index = '1'; name = 'Invalid Android'; is_main = $false; is_process_started = $false; android_version = @('12.0') } | ConvertTo-Json -Compress
+    $invalidAndroidCase = Invoke-DiscoveryManagerCase -Name 'invalid-android' -InfoJson $invalidAndroidInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidAndroidCase.Result)[0]) 'Invalid AndroidVersion was accepted.'
+    Assert-True (@($invalidAndroidCase.Result)[0].Message -match '(?i)android') 'Invalid AndroidVersion error omitted field context.'
+
+    $metadataConflictRoot = Join-Path $testRoot 'discovery negative\instance-vms-conflict'
+    $metadataConflictVmsA = Join-Path $metadataConflictRoot 'vms-a'
+    $metadataConflictVmsB = Join-Path $metadataConflictRoot 'vms-b'
+    New-Item -ItemType Directory -Path $metadataConflictVmsA -Force | Out-Null
+    New-Item -ItemType Directory -Path $metadataConflictVmsB -Force | Out-Null
+    $metadataConflictInfo = [pscustomobject]@{ index = '1'; name = 'VMS conflict'; is_main = $false; is_process_started = $false; android_version = '12.0'; vms_path = $metadataConflictVmsA; vmsPath = $metadataConflictVmsB } | ConvertTo-Json -Compress
+    $metadataConflictCase = Invoke-DiscoveryManagerCase -Name 'instance-vms-conflict' -InfoJson $metadataConflictInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($metadataConflictCase.Result)[0]) 'Conflicting manager VMS fields were merged silently.'
 
     $missingManagerRoot = Join-Path $discoveryRoot 'missing-manager'
     $missingManagerVms = Join-Path $missingManagerRoot 'vms'
@@ -1110,6 +1471,62 @@ function Invoke-DiscoveryTests {
     $staleInstall = [pscustomobject]@{ Edition = 'Global'; InstallRoot = [IO.Path]::GetFullPath($staleRoot); VmsPath = [IO.Path]::GetFullPath($staleSharedVms); ManagerPath = $staleManager; Source = 'Process' }
     $staleResult = Get-MuMuInstances -Install $staleInstall -ManagerPath $staleManager
     Assert-Equal 'CriticalError' $staleResult.Status 'Stale manager VMS metadata was accepted.'
+
+    $unrelatedHelperPath = Join-Path $outsideRoot 'tools\helper.exe'
+    $unrelatedHelperDirectory = Split-Path -Parent $unrelatedHelperPath
+    New-Item -ItemType Directory -Path $unrelatedHelperDirectory -Force | Out-Null
+    [IO.File]::Copy($script:discoveryManagerTemplatePath, $unrelatedHelperPath, $true)
+    $unrelatedHelperInstallRoot = Join-Path $discoveryRoot 'unrelated-helper-install'
+    $unrelatedHelperVms = Join-Path $unrelatedHelperInstallRoot 'vms'
+    New-Item -ItemType Directory -Path $unrelatedHelperVms -Force | Out-Null
+    $insideUnrelatedHelperPath = Join-Path $unrelatedHelperInstallRoot 'tools\helper.exe'
+    $insideUnrelatedHelperDirectory = Split-Path -Parent $insideUnrelatedHelperPath
+    New-Item -ItemType Directory -Path $insideUnrelatedHelperDirectory -Force | Out-Null
+    [IO.File]::Copy($script:discoveryManagerTemplatePath, $insideUnrelatedHelperPath, $true)
+    $unrelatedHelperInstall = [pscustomobject]@{ Edition = 'Global'; InstallRoot = [IO.Path]::GetFullPath($unrelatedHelperInstallRoot); VmsPath = [IO.Path]::GetFullPath($unrelatedHelperVms); ManagerPath = [IO.Path]::GetFullPath($insideUnrelatedHelperPath); Source = 'Process' }
+    $unrelatedHelperResult = Get-MuMuInstances -Install $unrelatedHelperInstall -ManagerPath $insideUnrelatedHelperPath
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $unrelatedHelperResult) 'Unrelated executable was accepted as MuMuManager.exe.'
+    Assert-True (-not [IO.File]::Exists((Join-Path $insideUnrelatedHelperDirectory 'args.log'))) 'Unrelated executable reached the process runner.'
+
+    $unrelatedProcessResult = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $unrelatedHelperPath; CommandLine = '"' + $unrelatedHelperPath + '"' }) -FallbackRoots @())
+    Assert-Equal 0 $unrelatedProcessResult.Count 'Unrelated process record created a MuMu installation.'
+
+    $missingProcessRoot = Join-Path $discoveryRoot 'missing-process-manager'
+    $missingProcessVms = Join-Path $missingProcessRoot 'vms'
+    New-Item -ItemType Directory -Path $missingProcessVms -Force | Out-Null
+    $missingProcessManager = Join-Path $missingProcessRoot 'shell\MuMuManager.exe'
+    $missingProcessResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $missingProcessManager; CommandLine = '"' + $missingProcessManager + '"'; InstallRoot = $missingProcessRoot }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $missingProcessResult) 'Missing candidate manager process was silently ignored.'
+    Assert-True (-not [IO.File]::Exists((Join-Path (Split-Path -Parent $missingProcessManager) 'args.log'))) 'Missing candidate manager reached the process runner.'
+
+    $outsideProcessResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $outsideFixture.ManagerPath; CommandLine = '"' + $outsideFixture.ManagerPath + '"'; InstallRoot = $globalFixture.InstallRoot }) -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $outsideProcessResult) 'Outside candidate manager process was silently ignored.'
+    Assert-True (-not [IO.File]::Exists((Join-Path (Split-Path -Parent $outsideFixture.ManagerPath) 'args.log'))) 'Outside candidate manager reached the process runner.'
+
+    $nestedRoot = Join-Path $discoveryRoot 'nested-layout\MuMu Global'
+    $nestedVms = Join-Path $nestedRoot 'vms'
+    $nestedManager = Join-Path $nestedRoot 'nx_main\shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path $nestedVms -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $nestedManager) -Force | Out-Null
+    [IO.File]::WriteAllText($nestedManager, 'nested manager fixture')
+    $nestedResult = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $nestedManager; CommandLine = '"' + $nestedManager + '"'; Edition = 'Global' }) -FallbackRoots @())
+    Assert-Equal 1 @($nestedResult | Where-Object { $_.InstallRoot -eq $nestedRoot }).Count 'Nested manager layout did not preserve the installation root.'
+
+    $managerDirectoryFixture = Join-Path $unrelatedHelperInstallRoot 'shell\MuMuManager.exe'
+    New-Item -ItemType Directory -Path $managerDirectoryFixture -Force | Out-Null
+    $managerDirectoryInstall = [pscustomobject]@{ Edition = 'Global'; InstallRoot = [IO.Path]::GetFullPath($unrelatedHelperInstallRoot); VmsPath = [IO.Path]::GetFullPath($unrelatedHelperVms); ManagerPath = [IO.Path]::GetFullPath($managerDirectoryFixture); Source = 'Process' }
+    $managerDirectoryResult = Get-MuMuInstances -Install $managerDirectoryInstall -ManagerPath $managerDirectoryFixture
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $managerDirectoryResult) 'Directory named MuMuManager.exe was accepted as a manager file.'
+
+    $cycleRoot = Join-Path $discoveryRoot 'Reparse Loop'
+    $cycleA = Join-Path $cycleRoot 'loop-a'
+    $cycleB = Join-Path $cycleRoot 'loop-b'
+    New-Item -ItemType Directory -Path $cycleB -Force | Out-Null
+    New-Item -ItemType Junction -Path $cycleA -Target $cycleB | Out-Null
+    Remove-Item -LiteralPath $cycleB -Recurse -Force
+    New-Item -ItemType Junction -Path $cycleB -Target $cycleA | Out-Null
+    $cycleManagerPath = Join-Path $cycleA 'MuMuManager.exe'
+    Assert-True ($null -eq (Get-ToolkitResolvedPath -Path $cycleManagerPath)) 'Reparse loop did not fail closed.'
 }
 
 function Invoke-CommonTests {
@@ -1121,6 +1538,7 @@ function Invoke-CommonTests {
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('mumu-toolkit-tests-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
+$originalTestAppData = $env:APPDATA
 $exitCode = 0
 try {
     switch ($Suite) {
@@ -1156,6 +1574,7 @@ catch {
     $exitCode = 1
 }
 finally {
+    $env:APPDATA = $originalTestAppData
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($exitCode -eq 0) {
