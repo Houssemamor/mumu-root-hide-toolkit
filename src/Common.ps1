@@ -76,21 +76,31 @@ function Invoke-WithRetry {
             if ($outputs.Count -eq 1 -and $outputs[0] -is [pscustomobject]) {
                 $candidate = $outputs[0]
                 $propertyNames = @($candidate.PSObject.Properties | ForEach-Object { $_.Name })
-                if ($propertyNames.Count -eq 3 -and
+                $hasExactProperties = $propertyNames.Count -eq 3 -and
                     $propertyNames -ccontains 'Status' -and
                     $propertyNames -ccontains 'Message' -and
-                    $propertyNames -ccontains 'Data' -and
-                    $candidate.Status -is [string] -and
-                    @('Success', 'AlreadyApplied', 'Warning', 'RecoverableError', 'CriticalError') -ccontains $candidate.Status -and
-                    $candidate.Message -is [string] -and
-                    -not [string]::IsNullOrWhiteSpace($candidate.Message)) {
+                    $propertyNames -ccontains 'Data'
+                if (-not $hasExactProperties) {
+                    if ($propertyNames.Count -eq 3) {
+                        $invalidMessage = 'Operation returned one object with invalid property names or casing; expected exactly Status, Message, and Data.'
+                    }
+                }
+                elseif ($candidate.Status -isnot [string] -or
+                    @('Success', 'AlreadyApplied', 'Warning', 'RecoverableError', 'CriticalError') -cnotcontains $candidate.Status) {
+                    $invalidMessage = 'Operation returned one object with a noncanonical Status; expected a canonical toolkit status.'
+                }
+                elseif ($candidate.Message -isnot [string] -or [string]::IsNullOrWhiteSpace($candidate.Message)) {
+                    $invalidMessage = 'Operation returned one object with an empty or invalid Message.'
+                }
+                else {
                     $message = Protect-ToolkitText $candidate.Message
                     if (-not [string]::IsNullOrWhiteSpace($message)) {
                         return Get-ToolkitResult -Status $candidate.Status -Message $message -Data $candidate.Data
                     }
+                    $invalidMessage = 'Operation returned one object whose Message could not be sanitized.'
                 }
             }
-            return Get-ToolkitResult -Status 'RecoverableError' -Message $invalidMessage
+            return Get-ToolkitResult -Status 'RecoverableError' -Message (Protect-ToolkitText $invalidMessage)
         }
         catch {
             $message = Protect-ToolkitText ([string]$_.Exception.Message)

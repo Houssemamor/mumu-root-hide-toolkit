@@ -409,6 +409,8 @@ function Invoke-JournalTests {
 
     Add-Type -TypeDefinition 'public sealed class JournalSecretFixture { public string Password { get; set; } public string Token { get; set; } }'
     Add-Type -TypeDefinition 'public sealed class JournalSecretException : System.Exception { public string Password { get; set; } public string Token { get; set; } }'
+    Add-Type -TypeDefinition 'public sealed class ghp_exception_type_secret : System.Exception { public string Fixture { get; set; } }'
+    Add-Type -TypeDefinition 'public enum ghp_retry_type_secret { Fixture }'
     $fixtureInstance = New-Object JournalSecretFixture
     $fixtureInstance.Password = 'instance_password_secret'
     $fixtureInstance.Token = 'instance_token_secret'
@@ -443,6 +445,15 @@ function Invoke-JournalTests {
     Assert-True ($realExceptionJson -notmatch 'real_exception_secret') 'Journal leaked raw .NET exception text.'
     Assert-True ($realExceptionJson -notmatch 'ErrorRecord|InvocationInfo|ReflectedType|ModuleVersionId|"TargetSite"\s*:\s*\{') 'Journal serialized the reflection graph.'
     Write-JournalEvent -Journal $reopenedRealException -Level 'Info' -Message 'still usable' -Data @{ Value = 1 }
+
+    $typedException = New-Object ghp_exception_type_secret
+    $typedExceptionJournal = New-OperationJournal -Root $journalRoot -Operation 'Root12' -Instance $fixtureInstance
+    Write-JournalEvent -Journal $typedExceptionJournal -Level 'Error' -Message 'typed failure' -Data @{ Exception = $typedException }
+    $typedExceptionJson = [IO.File]::ReadAllText($typedExceptionJournal.JournalPath)
+    Assert-True ($typedExceptionJson -notmatch 'ghp_exception_type_secret') 'Journal leaked secret-shaped exception type metadata.'
+    $reopenedTypedException = Get-OperationJournal -Path $typedExceptionJournal.JournalPath
+    Assert-True ((@($reopenedTypedException.Checkpoints)[0].Data.Exception.Type) -notmatch 'ghp_exception_type_secret') 'Reopened exception type metadata was not sanitized.'
+    Write-JournalEvent -Journal $reopenedTypedException -Level 'Info' -Message 'still usable' -Data @{ Value = 2 }
 
     $readOnlyDictionary = New-Object 'System.Collections.Generic.Dictionary[string,string]'
     $readOnlyDictionary['Password'] = 'readonly_password_secret'
@@ -799,14 +810,22 @@ function Invoke-JournalTests {
         )
     } -Attempts 1 -DelaySeconds 0
     Assert-Equal 'RecoverableError' $arrayOutput.Status 'Retry accepted an array result.'
+    $typedRetryOutput = Invoke-WithRetry -Operation { [ghp_retry_type_secret]::Fixture } -Attempts 1 -DelaySeconds 0
+    Assert-Equal 'RecoverableError' $typedRetryOutput.Status 'Retry accepted a non-toolkit enum result.'
+    Assert-True ($typedRetryOutput.Message -notmatch 'ghp_retry_type_secret') 'Retry diagnostic leaked secret-shaped runtime type metadata.'
+    Assert-True ($typedRetryOutput.Message -match '\[REDACTED\]') 'Retry diagnostic did not sanitize runtime type metadata.'
     $wrongStatusOutput = Invoke-WithRetry -Operation {
         [pscustomobject]@{ Status = 'Invalid'; Message = 'wrong status'; Data = $null }
     } -Attempts 1 -DelaySeconds 0
     Assert-Equal 'RecoverableError' $wrongStatusOutput.Status 'Retry accepted a noncanonical result status.'
+    Assert-True ($wrongStatusOutput.Message -match '(?i)status') 'Retry diagnostic did not identify the invalid status.'
+    Assert-True ($wrongStatusOutput.Message -notmatch '(?i)properties') 'Retry diagnostic mislabeled an invalid status as a property-count mismatch.'
     $emptyMessageOutput = Invoke-WithRetry -Operation {
         [pscustomobject]@{ Status = 'Success'; Message = '   '; Data = $null }
     } -Attempts 1 -DelaySeconds 0
     Assert-Equal 'RecoverableError' $emptyMessageOutput.Status 'Retry accepted an empty result message.'
+    Assert-True ($emptyMessageOutput.Message -match '(?i)message') 'Retry diagnostic did not identify the invalid message.'
+    Assert-True ($emptyMessageOutput.Message -notmatch '(?i)properties') 'Retry diagnostic mislabeled an invalid message as a property-count mismatch.'
     $extraPropertyOutput = Invoke-WithRetry -Operation {
         [pscustomobject]@{ Status = 'Success'; Message = 'valid'; Data = $null; Extra = 'invalid' }
     } -Attempts 1 -DelaySeconds 0
@@ -816,6 +835,8 @@ function Invoke-JournalTests {
         [pscustomobject]@{ status = 'Success'; Message = 'valid'; Data = $null }
     } -Attempts 1 -DelaySeconds 0
     Assert-Equal 'RecoverableError' $wrongCaseOutput.Status 'Retry accepted incorrect result property casing.'
+    Assert-True ($wrongCaseOutput.Message -match '(?i)property names|casing') 'Retry diagnostic did not identify invalid property names or casing.'
+    Assert-True ($wrongCaseOutput.Message -notmatch '(?i)properties') 'Retry diagnostic mislabeled invalid casing as a property-count mismatch.'
 
     $exhaustedState = @{ Count = 0 }
     $failingOperation = {

@@ -9,7 +9,7 @@ function Protect-JournalValue {
     }
     if ($Value -is [System.Exception]) {
         return [pscustomobject]@{
-            Type = $Value.GetType().FullName
+            Type = Protect-ToolkitText $Value.GetType().FullName
             Message = Protect-ToolkitText $Value.Message
             Source = Protect-ToolkitText $Value.Source
             HResult = $Value.HResult
