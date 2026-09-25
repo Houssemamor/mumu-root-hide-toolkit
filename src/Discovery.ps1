@@ -91,7 +91,8 @@ function Test-ToolkitPathWithinRoot {
 function Get-ToolkitEdition {
     param(
         [string]$Text,
-        [string]$ExplicitEdition
+        [string]$ExplicitEdition,
+        [switch]$AllowGenericMuMu
     )
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitEdition) -and $ExplicitEdition -cnotin @('Global', 'Chinese')) {
@@ -114,6 +115,9 @@ function Get-ToolkitEdition {
     if ($null -ne $inferredEdition) {
         return $inferredEdition
     }
+    if ($AllowGenericMuMu -and $Text -match '(?i)(?:^|[\\/])mumu(?:[\\/]|$)') {
+        return 'Chinese'
+    }
     throw 'Edition cannot be determined.'
 }
 
@@ -127,21 +131,15 @@ function Test-ToolkitRegistryIdentity {
     if (Test-ToolkitManagerFile -Path $ManagerPath -InstallRoot $InstallRoot) {
         return $true
     }
-    $editionProperty = $Entry.PSObject.Properties['Edition']
-    if ($null -eq $editionProperty -or $editionProperty.Value -isnot [string] -or
-        [string]::IsNullOrWhiteSpace($editionProperty.Value) -or
-        $editionProperty.Value -cnotin @('Global', 'Chinese')) {
-        return $false
-    }
-    $displayName = ''
+    $pathIdentity = $InstallRoot -match '(?i)(?:^|[\\/])(?:mumu(?:\s+global)?|mumuplayer)(?:[\\/]|$)'
+    $metadataText = ''
     if ($null -ne $Entry.PSObject.Properties['DisplayName'] -and $Entry.DisplayName -is [string]) {
-        $displayName = $Entry.DisplayName
+        $metadataText += ' ' + $Entry.DisplayName
     }
-    $identityText = $displayName + ' ' + $InstallRoot
     if ($null -ne $Entry.PSObject.Properties['Publisher'] -and $Entry.Publisher -is [string]) {
-        $identityText += ' ' + $Entry.Publisher
+        $metadataText += ' ' + $Entry.Publisher
     }
-    return $identityText -match '(?i)(mumu|netease)'
+    return $pathIdentity -or $metadataText -match '(?i)(mumu|netease)'
 }
 
 function Get-ToolkitInstallRoot {
@@ -180,6 +178,17 @@ function Test-ToolkitManagerName {
 
     $fullPath = ConvertTo-ToolkitFullPath -Path $Path
     return $null -ne $fullPath -and [IO.Path]::GetFileName($fullPath) -ieq 'MuMuManager.exe'
+}
+
+function Test-ToolkitProcessName {
+    param([string]$Path)
+
+    $fullPath = ConvertTo-ToolkitFullPath -Path $Path
+    if ($null -eq $fullPath) {
+        return $false
+    }
+    $fileName = [IO.Path]::GetFileName($fullPath)
+    return $fileName -ieq 'MuMuManager.exe' -or $fileName -ieq 'MuMuPlayer.exe'
 }
 
 function Test-ToolkitManagerFile {
@@ -322,6 +331,45 @@ function Get-ToolkitVmsPath {
     return $null
 }
 
+function ConvertFrom-ToolkitUninstallSnapshot {
+    param([object]$Snapshot)
+
+    if ($null -eq $Snapshot) {
+        throw 'Registry snapshot is invalid.'
+    }
+    $source = $Snapshot
+    if ($null -ne $Snapshot.PSObject.Properties['Properties'] -and $Snapshot.Properties -is [object]) {
+        $source = $Snapshot.Properties
+    }
+    $installLocation = $source.PSObject.Properties['InstallLocation']
+    if ($null -eq $installLocation -or $installLocation.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($installLocation.Value)) {
+        throw 'Registry InstallLocation is invalid.'
+    }
+    $displayName = ''
+    if ($null -ne $source.PSObject.Properties['DisplayName'] -and $source.DisplayName -is [string]) {
+        $displayName = $source.DisplayName
+    }
+    $publisher = ''
+    if ($null -ne $source.PSObject.Properties['Publisher'] -and $source.Publisher -is [string]) {
+        $publisher = $source.Publisher
+    }
+    $edition = ''
+    if ($null -ne $source.PSObject.Properties['Edition'] -and $source.Edition -is [string]) {
+        $edition = $source.Edition
+    }
+    $vmsPath = ''
+    if ($null -ne $source.PSObject.Properties['VmsPath'] -and $source.VmsPath -is [string]) {
+        $vmsPath = $source.VmsPath
+    }
+    return [pscustomobject]@{
+        InstallLocation = $installLocation.Value
+        DisplayName = $displayName
+        Publisher = $publisher
+        Edition = $edition
+        VmsPath = $vmsPath
+    }
+}
+
 function Get-ToolkitUninstallEntries {
     param([string]$Root)
 
@@ -348,33 +396,14 @@ function Get-ToolkitUninstallEntries {
     foreach ($key in $keys) {
         try {
             $properties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
-            $installLocation = $properties.PSObject.Properties['InstallLocation']
-            if ($null -eq $installLocation -or $installLocation.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($installLocation.Value)) {
-                continue
-            }
-            $displayName = ''
-            if ($null -ne $properties.PSObject.Properties['DisplayName'] -and $properties.DisplayName -is [string]) {
-                $displayName = $properties.DisplayName
-            }
-            $edition = ''
-            if ($null -ne $properties.PSObject.Properties['Edition'] -and $properties.Edition -is [string]) {
-                $edition = $properties.Edition
-            }
-            $vmsPath = ''
-            if ($null -ne $properties.PSObject.Properties['VmsPath'] -and $properties.VmsPath -is [string]) {
-                $vmsPath = $properties.VmsPath
-            }
-            $publisher = ''
-            if ($null -ne $properties.PSObject.Properties['Publisher'] -and $properties.Publisher -is [string]) {
-                $publisher = $properties.Publisher
-            }
+            $entry = ConvertFrom-ToolkitUninstallSnapshot -Snapshot $properties
             $entries += [pscustomobject]@{
                 Root = $Root
-                DisplayName = $displayName
-                Publisher = $publisher
-                InstallLocation = $installLocation.Value
-                Edition = $edition
-                VmsPath = $vmsPath
+                DisplayName = $entry.DisplayName
+                Publisher = $entry.Publisher
+                InstallLocation = $entry.InstallLocation
+                Edition = $entry.Edition
+                VmsPath = $entry.VmsPath
             }
         }
         catch {
@@ -427,8 +456,16 @@ function Get-ToolkitProcessVmsPaths {
         if ($commandLineProperty.Value -isnot [string]) {
             throw 'ProcessSnapshot CommandLine is invalid.'
         }
-        $match = [regex]::Match([string]$commandLineProperty.Value, '(?i)(?:--vms-path|--vms_path|-vms-path)(?:=|\s+)(?:"([^"]+)"|(\S+))')
-        if ($match.Success) {
+        $commandLine = [string]$commandLineProperty.Value
+        $flagMatches = [regex]::Matches($commandLine, '(?i)(?:--vms-path|--vms_path|-vms-path)(?:=|\s|$)')
+        if ($flagMatches.Count -gt 1) {
+            throw 'ProcessSnapshot has multiple VMS path arguments.'
+        }
+        if ($flagMatches.Count -eq 1) {
+            $match = [regex]::Match($commandLine, '(?i)(?:--vms-path|--vms_path|-vms-path)(?:=|\s+)(?:"([^"]+)"|(\S+))')
+            if (-not $match.Success) {
+                throw 'ProcessSnapshot VMS argument is invalid.'
+            }
             if ($match.Groups[1].Success) {
                 $paths += $match.Groups[1].Value
             }
@@ -458,11 +495,32 @@ function Find-MuMuInstallations {
             if ($null -eq $entry) {
                 return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry entry is invalid.'
             }
-            $installLocationProperty = $entry.PSObject.Properties['InstallLocation']
-            if ($null -eq $installLocationProperty -or $installLocationProperty.Value -isnot [string] -or
-                [string]::IsNullOrWhiteSpace($installLocationProperty.Value)) {
-                return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry InstallLocation is invalid.'
+            $displayName = ''
+            if ($null -ne $entry.PSObject.Properties['DisplayName'] -and $entry.DisplayName -is [string]) {
+                $displayName = $entry.DisplayName
             }
+            $installLocation = ''
+            $installLocationProperty = $entry.PSObject.Properties['InstallLocation']
+            if ($null -ne $installLocationProperty -and $installLocationProperty.Value -is [string]) {
+                $installLocation = $installLocationProperty.Value
+            }
+            $installRoot = if ([string]::IsNullOrWhiteSpace($installLocation)) { $null } else { Get-ToolkitInstallRoot -Path $installLocation }
+            $managerPaths = @(if ($null -eq $installRoot) { } else { Get-ToolkitManagerPaths -InstallRoot $installRoot })
+            $managerPath = if ($managerPaths.Count -eq 1) { $managerPaths[0] } else { $null }
+            if (-not (Test-ToolkitRegistryIdentity -Entry $entry -InstallRoot $installRoot -ManagerPath $managerPath)) {
+                continue
+            }
+            if ($null -eq $installRoot) {
+                return Get-ToolkitResult -Status 'CriticalError' -Message 'Genuine registry row has an invalid InstallLocation.'
+            }
+            if ($managerPaths.Count -gt 1) {
+                return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry manager paths conflict.'
+            }
+            if ($managerPaths.Count -eq 0) {
+                return Get-ToolkitResult -Status 'CriticalError' -Message 'Genuine registry row has no valid MuMu manager.'
+            }
+            $managerPath = $managerPaths[0]
+
             $editionProperty = $entry.PSObject.Properties['Edition']
             $explicitEdition = ''
             if ($null -ne $editionProperty) {
@@ -471,10 +529,6 @@ function Find-MuMuInstallations {
                 }
                 $explicitEdition = $editionProperty.Value
             }
-            $displayName = ''
-            if ($null -ne $entry.PSObject.Properties['DisplayName'] -and $entry.DisplayName -is [string]) {
-                $displayName = $entry.DisplayName
-            }
             $vmsCandidate = ''
             $vmsCandidateProperty = $entry.PSObject.Properties['VmsPath']
             if ($null -ne $vmsCandidateProperty) {
@@ -482,18 +536,6 @@ function Find-MuMuInstallations {
                     return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry VMS path is invalid.'
                 }
                 $vmsCandidate = $vmsCandidateProperty.Value
-            }
-            $installRoot = Get-ToolkitInstallRoot -Path $installLocationProperty.Value
-            if ($null -eq $installRoot) {
-                return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry InstallLocation is unavailable.'
-            }
-            $managerPaths = @(Get-ToolkitManagerPaths -InstallRoot $installRoot)
-            if ($managerPaths.Count -gt 1) {
-                return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry manager paths conflict.'
-            }
-            $managerPath = if ($managerPaths.Count -eq 1) { $managerPaths[0] } else { $null }
-            if (-not (Test-ToolkitRegistryIdentity -Entry $entry -InstallRoot $installRoot -ManagerPath $managerPath)) {
-                continue
             }
             try {
                 $candidateEdition = Get-ToolkitEdition -Text ($displayName + ' ' + $installRoot) -ExplicitEdition $explicitEdition
@@ -522,24 +564,25 @@ function Find-MuMuInstallations {
             continue
         }
         $executablePath = Get-ToolkitProcessExecutable -ProcessRecord $processRecord
+        $executableIsProcess = Test-ToolkitProcessName -Path $executablePath
         $executableIsManager = Test-ToolkitManagerName -Path $executablePath
         $managerProperty = $processRecord.PSObject.Properties['ManagerPath']
         $reportedManagerPath = $null
         $reportedManagerIsManager = $false
         if ($null -ne $managerProperty) {
             if ($managerProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($managerProperty.Value)) {
-                if ($executableIsManager) {
+                if ($executableIsProcess) {
                     return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot.ManagerPath is invalid.'
                 }
                 continue
             }
             $reportedManagerPath = ConvertTo-ToolkitFullPath -Path $managerProperty.Value
             $reportedManagerIsManager = Test-ToolkitManagerName -Path $reportedManagerPath
-            if ($executableIsManager -and -not $reportedManagerIsManager) {
+            if ($executableIsProcess -and -not $reportedManagerIsManager) {
                 return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot.ManagerPath is not MuMuManager.exe.'
             }
         }
-        if (-not $executableIsManager -and -not $reportedManagerIsManager) {
+        if (-not $executableIsProcess -and -not $reportedManagerIsManager) {
             continue
         }
 
@@ -557,20 +600,26 @@ function Find-MuMuInstallations {
             $rootSource = if ($reportedManagerIsManager) { $reportedManagerPath } else { $executablePath }
             $installRoot = Get-ToolkitInstallRoot -Path $rootSource
             if ($null -eq $installRoot) {
-                return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot manager path is unavailable.'
+                return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot path is unavailable.'
             }
         }
+        if ($null -ne $executablePath -and -not (Test-ToolkitPathWithinRoot -Path $executablePath -Root $installRoot)) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot executable is outside InstallRoot.'
+        }
 
-        $managerPath = if ($reportedManagerIsManager) { $reportedManagerPath } else { $executablePath }
+        $managerPath = if ($reportedManagerIsManager) { $reportedManagerPath } else { $null }
         $detectedManagerPaths = @(Get-ToolkitManagerPaths -InstallRoot $installRoot)
         if ($detectedManagerPaths.Count -gt 1) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot manager paths conflict.'
         }
         if ($detectedManagerPaths.Count -eq 1) {
-            if ($reportedManagerIsManager -and -not $managerPath.Equals($detectedManagerPaths[0], [StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -ne $managerPath -and -not $managerPath.Equals($detectedManagerPaths[0], [StringComparison]::OrdinalIgnoreCase)) {
                 return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot manager paths conflict.'
             }
             $managerPath = $detectedManagerPaths[0]
+        }
+        elseif ($null -eq $managerPath -and $executableIsManager) {
+            $managerPath = $executablePath
         }
         if (-not (Test-ToolkitManagerFile -Path $managerPath -InstallRoot $installRoot)) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot manager path is not a valid MuMu manager.'
@@ -638,7 +687,7 @@ function Find-MuMuInstallations {
         }
         $managerPath = if ($managerPaths.Count -eq 1) { $managerPaths[0] } else { $null }
         try {
-            $candidateEdition = Get-ToolkitEdition -Text $installRoot -ExplicitEdition ''
+            $candidateEdition = Get-ToolkitEdition -Text $installRoot -ExplicitEdition '' -AllowGenericMuMu
         }
         catch {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'Fallback Edition cannot be determined.'
@@ -914,7 +963,7 @@ function Get-MuMuInstances {
     if ($null -eq $Install -or $Install -is [Array]) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Install is invalid.'
     }
-    $requiredInstallFields = @('Edition', 'InstallRoot', 'VmsPath', 'ManagerPath', 'Source')
+    $requiredInstallFields = @('Edition', 'InstallRoot', 'VmsPath', 'Source')
     foreach ($fieldName in $requiredInstallFields) {
         $field = $Install.PSObject.Properties[$fieldName]
         if ($null -eq $field -or $field.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($field.Value)) {
@@ -934,8 +983,7 @@ function Get-MuMuInstances {
     $vmsProperty = $Install.PSObject.Properties['VmsPath']
     $installManagerProperty = $Install.PSObject.Properties['ManagerPath']
     if ($null -eq $rootProperty -or $rootProperty.Value -isnot [string] -or
-        $null -eq $vmsProperty -or $vmsProperty.Value -isnot [string] -or
-        $null -eq $installManagerProperty -or $installManagerProperty.Value -isnot [string]) {
+        $null -eq $vmsProperty -or $vmsProperty.Value -isnot [string]) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Install path fields are invalid.'
     }
 
@@ -945,28 +993,40 @@ function Get-MuMuInstances {
         $null -eq $vmsPath -or -not (Test-Path -LiteralPath $vmsPath -PathType Container)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'MuMu installation paths are unavailable.'
     }
-    $installManagerPath = ConvertTo-ToolkitFullPath -Path $installManagerProperty.Value
-    if (-not (Test-ToolkitManagerFile -Path $installManagerPath -InstallRoot $installRoot)) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'Install.ManagerPath is invalid.'
+
+    $installManagerPath = $null
+    $installManagerIsValid = $false
+    if ($null -ne $installManagerProperty -and $installManagerProperty.Value -is [string] -and
+        -not [string]::IsNullOrWhiteSpace($installManagerProperty.Value)) {
+        $installManagerPath = ConvertTo-ToolkitFullPath -Path $installManagerProperty.Value
+        $installManagerIsValid = Test-ToolkitManagerFile -Path $installManagerPath -InstallRoot $installRoot
     }
 
-    $managerCandidate = $ManagerPath
-    if ([string]::IsNullOrWhiteSpace($managerCandidate)) {
-        $managerCandidate = $installManagerPath
+    $resolvedManagerPath = $null
+    if (-not [string]::IsNullOrWhiteSpace($ManagerPath)) {
+        $resolvedManagerPath = ConvertTo-ToolkitFullPath -Path $ManagerPath
+        if (-not (Test-ToolkitManagerFile -Path $resolvedManagerPath -InstallRoot $installRoot)) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'ManagerPath is not a valid MuMu manager.'
+        }
+        if ($installManagerIsValid -and -not $resolvedManagerPath.Equals($installManagerPath, [StringComparison]::OrdinalIgnoreCase)) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'ManagerPath conflicts with Install.ManagerPath.'
+        }
     }
-    $managerPath = ConvertTo-ToolkitFullPath -Path $managerCandidate
-    if (-not (Test-ToolkitManagerFile -Path $managerPath -InstallRoot $installRoot)) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'ManagerPath is not a valid MuMu manager.'
+    elseif ($installManagerIsValid) {
+        $resolvedManagerPath = $installManagerPath
+    }
+    else {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Install.ManagerPath is invalid.'
     }
     $detectedManagerPaths = @(Get-ToolkitManagerPaths -InstallRoot $installRoot)
     if ($detectedManagerPaths.Count -gt 1) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Manager paths conflict.'
     }
-    if ($detectedManagerPaths.Count -eq 1 -and -not $managerPath.Equals($detectedManagerPaths[0], [StringComparison]::OrdinalIgnoreCase)) {
+    if ($detectedManagerPaths.Count -eq 1 -and -not $resolvedManagerPath.Equals($detectedManagerPaths[0], [StringComparison]::OrdinalIgnoreCase)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Manager paths conflict.'
     }
 
-    $managerResult = Invoke-CheckedProcess -FilePath $managerPath -ArgumentList @('info', '-v', 'all')
+    $managerResult = Invoke-CheckedProcess -FilePath $resolvedManagerPath -ArgumentList @('info', '-v', 'all')
     if ($null -eq $managerResult -or $managerResult.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'MuMu manager query failed.'
     }
@@ -1031,7 +1091,7 @@ function Get-MuMuInstances {
             }
         }
 
-        $running = $false
+        $running = $null
         $runningValue = Get-ToolkitFirstProperty -InputObject $managerRecord -PropertyNames @('is_process_started', 'is_android_started', 'running')
         if ($null -ne $managerRecord.PSObject.Properties['is_process_started'] -or
             $null -ne $managerRecord.PSObject.Properties['is_android_started'] -or
@@ -1068,6 +1128,10 @@ function Get-MuMuInstances {
             $eligible = $false
             $reason = 'Base instance state is unknown.'
         }
+        elseif ($null -eq $running) {
+            $eligible = $false
+            $reason = 'Running state is unknown.'
+        }
         elseif ($androidVersion -notin @('12.0', '15.0')) {
             $eligible = $false
             $reason = 'Unsupported Android version.'
@@ -1079,7 +1143,7 @@ function Get-MuMuInstances {
             $null -ne $managerRecord.PSObject.Properties['rootSetting']
         $rootSetting = $null
         if ($hasReportedRootSetting -or $eligible) {
-            $rootSetting = Get-MuMuRootSetting -ManagerPath $managerPath -Index $indexedRecord.Index -InfoRecord $managerRecord
+            $rootSetting = Get-MuMuRootSetting -ManagerPath $resolvedManagerPath -Index $indexedRecord.Index -InfoRecord $managerRecord
         }
         if (($hasReportedRootSetting -or $eligible) -and $null -eq $rootSetting) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'root_permission is invalid.'
@@ -1089,7 +1153,7 @@ function Get-MuMuInstances {
             Edition = $installEdition
             InstallRoot = $installRoot
             VmsPath = $instanceVmsPath
-            ManagerPath = $managerPath
+            ManagerPath = $resolvedManagerPath
             Source = $installSource
         }
 
@@ -1098,7 +1162,7 @@ function Get-MuMuInstances {
             Name = [string]$nameProperty.Value
             AndroidVersion = $androidVersion
             Install = $instanceInstall
-            Running = [bool]$running
+            Running = $running
             RootSetting = $rootSetting
             Eligible = $eligible
             IneligibleReason = $reason
