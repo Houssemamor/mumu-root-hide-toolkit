@@ -31,6 +31,21 @@ Supported targets:
 - MuMu Android 15 instances using MuMu's built-in KernelSU root implementation;
 - Windows 10 and Windows 11 with Windows PowerShell 5.1 or newer.
 
+## Tested setup versions
+
+These are the versions used for the live setup verification on 2026-09-25. The implementation will pin these versions and hashes in its manifest; a newer release is not treated as compatible until it is separately tested. The live verification used the Global edition. Chinese-edition support remains fixture-tested until a live Chinese installation is verified.
+
+| Component | Tested version | Reference |
+| --- | --- | --- |
+| MuMu Player Global | 6.8.0.0 | [Official download page](https://www.mumuplayer.com/download/) |
+| Android 12 instance | Android 12.0 | [MuMu Android-version documentation](https://www.mumuplayer.com/help/win/how-to-upgrade-mumuplayer.html) |
+| Android 15 instance | Android 15.0, built-in KernelSU 3.2.5 | [MuMu Android-version documentation](https://www.mumuplayer.com/help/win/how-to-upgrade-mumuplayer.html) |
+| Kitsune Magisk | v31.0-25fa2159 | [Kitsune release](https://github.com/Jordan231111/KitsuneMagisk/releases/tag/v31.0-25fa2159) |
+| Hide My Applist OSS | oss-161 | [HMA-OSS release](https://github.com/frknkrc44/HMA-OSS/releases/tag/oss-161) |
+| Vector | v2.0, build 3043 | [Vector release](https://github.com/JingMatrix/LSPosed/releases/tag/v2.0) |
+| NeoZygisk | v2.3, build 282-8b12252 | [NeoZygisk release](https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.3) |
+| CorePatch | 4.9 | [CorePatch release](https://github.com/LSPosed/CorePatch/releases/tag/4.9) |
+
 Explicit non-goals:
 
 - modifying or patching individual game APKs;
