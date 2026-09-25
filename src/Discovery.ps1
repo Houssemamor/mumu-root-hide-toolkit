@@ -334,7 +334,7 @@ function Get-ToolkitVmsPath {
 function ConvertFrom-ToolkitUninstallSnapshot {
     param([object]$Snapshot)
 
-    if ($null -eq $Snapshot) {
+    if ($null -eq $Snapshot -or $Snapshot -is [Array]) {
         throw 'Registry snapshot is invalid.'
     }
     $source = $Snapshot
@@ -342,8 +342,9 @@ function ConvertFrom-ToolkitUninstallSnapshot {
         $source = $Snapshot.Properties
     }
     $installLocation = $source.PSObject.Properties['InstallLocation']
-    if ($null -eq $installLocation -or $installLocation.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($installLocation.Value)) {
-        throw 'Registry InstallLocation is invalid.'
+    $installLocationValue = ''
+    if ($null -ne $installLocation -and $installLocation.Value -is [string]) {
+        $installLocationValue = $installLocation.Value
     }
     $displayName = ''
     if ($null -ne $source.PSObject.Properties['DisplayName'] -and $source.DisplayName -is [string]) {
@@ -362,7 +363,7 @@ function ConvertFrom-ToolkitUninstallSnapshot {
         $vmsPath = $source.VmsPath
     }
     return [pscustomobject]@{
-        InstallLocation = $installLocation.Value
+        InstallLocation = $installLocationValue
         DisplayName = $displayName
         Publisher = $publisher
         Edition = $edition
@@ -457,12 +458,17 @@ function Get-ToolkitProcessVmsPaths {
             throw 'ProcessSnapshot CommandLine is invalid.'
         }
         $commandLine = [string]$commandLineProperty.Value
-        $flagMatches = [regex]::Matches($commandLine, '(?i)(?:--vms-path|--vms_path|-vms-path)(?:=|\s|$)')
+        $supportedVmsFlags = @('--vms-path', '--vms_path', '-vms-path')
+        $flagMatches = [regex]::Matches($commandLine, '(?i)(?<name>(?:--|-)vms[-_][A-Za-z0-9_.-]+)(?:=|\s|$)')
         if ($flagMatches.Count -gt 1) {
             throw 'ProcessSnapshot has multiple VMS path arguments.'
         }
         if ($flagMatches.Count -eq 1) {
-            $match = [regex]::Match($commandLine, '(?i)(?:--vms-path|--vms_path|-vms-path)(?:=|\s+)(?:"([^"]+)"|(\S+))')
+            $flagName = $flagMatches[0].Groups['name'].Value.ToLowerInvariant()
+            if ($supportedVmsFlags -notcontains $flagName) {
+                throw 'ProcessSnapshot has an unsupported VMS argument.'
+            }
+            $match = [regex]::Match($commandLine, '(?i)(?:' + [regex]::Escape($flagName) + ')(?:=|\s+)(?:"([^"]+)"|(\S+))')
             if (-not $match.Success) {
                 throw 'ProcessSnapshot VMS argument is invalid.'
             }
@@ -538,7 +544,7 @@ function Find-MuMuInstallations {
                 $vmsCandidate = $vmsCandidateProperty.Value
             }
             try {
-                $candidateEdition = Get-ToolkitEdition -Text ($displayName + ' ' + $installRoot) -ExplicitEdition $explicitEdition
+                $candidateEdition = Get-ToolkitEdition -Text ($displayName + ' ' + $installRoot) -ExplicitEdition $explicitEdition -AllowGenericMuMu
             }
             catch {
                 return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry Edition is invalid or conflicting.'
@@ -637,7 +643,7 @@ function Find-MuMuInstallations {
             $explicitEdition = $editionProperty.Value
         }
         try {
-            $candidateEdition = Get-ToolkitEdition -Text ($installRoot + ' ' + $executablePath) -ExplicitEdition $explicitEdition
+            $candidateEdition = Get-ToolkitEdition -Text ($installRoot + ' ' + $executablePath) -ExplicitEdition $explicitEdition -AllowGenericMuMu
         }
         catch {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'ProcessSnapshot.Edition is invalid or conflicting.'
@@ -1016,7 +1022,12 @@ function Get-MuMuInstances {
         $resolvedManagerPath = $installManagerPath
     }
     else {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'Install.ManagerPath is invalid.'
+        $installManagerMessage = 'Install.ManagerPath is invalid.'
+        if ($null -eq $installManagerProperty -or
+            ($installManagerProperty.Value -is [string] -and [string]::IsNullOrWhiteSpace($installManagerProperty.Value))) {
+            $installManagerMessage = 'Install.ManagerPath is missing.'
+        }
+        return Get-ToolkitResult -Status 'CriticalError' -Message $installManagerMessage
     }
     $detectedManagerPaths = @(Get-ToolkitManagerPaths -InstallRoot $installRoot)
     if ($detectedManagerPaths.Count -gt 1) {
