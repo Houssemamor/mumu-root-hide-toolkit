@@ -24,6 +24,32 @@ function Get-ToolkitResult {
     }
 }
 
+function ConvertTo-ToolkitFullPath {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+        if (-not [string]::IsNullOrWhiteSpace($pathRoot) -and $fullPath.Length -gt $pathRoot.Length) {
+            $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+            $fullPath = $fullPath.TrimEnd($separators)
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $fullPath
+}
+
 function Protect-ToolkitText {
     param(
         [AllowNull()]
