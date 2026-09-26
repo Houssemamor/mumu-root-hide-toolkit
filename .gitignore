@@ -5,3 +5,12 @@ downloads/
 logs/
 tests/artifacts/
 tests/Fixtures/
+# Publishing safeguards: no bundled binaries and no signing material are committed.
+*.apk
+*.zip
+*.7z
+*.exe
+*.msi
+*.pfx
+*.snk
+.env

@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell parser checks
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in @(Get-ChildItem -Path src, tests -Recurse -Filter *.ps1 | Sort-Object FullName)) {
+              $parseErrors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$parseErrors) | Out-Null
+              foreach ($parseError in @($parseErrors)) {
+                  Write-Host ("{0}: {1}" -f $file.Name, $parseError.Message)
+                  $failed = $true
+              }
+          }
+          if ($failed) { exit 1 }
+      - name: Test suite
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File tests\Run-Tests.ps1 -Suite All

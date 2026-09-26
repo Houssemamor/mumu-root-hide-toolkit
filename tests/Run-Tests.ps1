@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Ads', 'Root12', 'Root15', 'Verification', 'Concealment', 'Menu', 'All')]
+    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Ads', 'Root12', 'Root15', 'Verification', 'Concealment', 'Menu', 'Docs', 'All')]
     [string]$Suite = 'All'
 )
 
@@ -7919,6 +7919,121 @@ Write-Output 'STANDALONE_OK'
     }
 }
 
+function Invoke-DocsTests {
+    $readmePath = Join-Path $repoRoot 'README.md'
+    $noticePath = Join-Path $repoRoot 'NOTICE.md'
+    $licensePath = Join-Path $repoRoot 'LICENSE'
+    $workflowPath = Join-Path $repoRoot '.github\workflows\test.yml'
+    $gitignorePath = Join-Path $repoRoot '.gitignore'
+    foreach ($requiredPath in @($readmePath, $noticePath, $licensePath, $workflowPath, $gitignorePath)) {
+        Assert-True (Test-Path -LiteralPath $requiredPath -PathType Leaf) "A required documentation or publishing file is missing: $requiredPath"
+    }
+
+    $readme = Get-Content -LiteralPath $readmePath -Raw
+    $notice = Get-Content -LiteralPath $noticePath -Raw
+    $license = Get-Content -LiteralPath $licensePath -Raw
+    $workflow = Get-Content -LiteralPath $workflowPath -Raw
+    $gitignore = Get-Content -LiteralPath $gitignorePath -Raw
+
+    # The upstream release pages are derived from the pinned manifest so the documentation cannot drift from the pins.
+    $manifest = Get-ToolkitManifest -Path $manifestPath
+    foreach ($dependency in @($manifest.dependencies)) {
+        $projectUrl = @(([string]$dependency.url -split '/releases/'))[0]
+        $releasePage = $projectUrl + '/releases/tag/' + [string]$dependency.version
+        Assert-True ($readme.Contains($releasePage)) "README does not link the pinned release page: $releasePage"
+        Assert-True ($notice.Contains($projectUrl)) "NOTICE does not credit the upstream project: $projectUrl"
+    }
+    foreach ($mumuLink in @('https://www.mumuplayer.com/download/', 'https://www.mumuplayer.com/help/win/how-to-upgrade-mumuplayer.html')) {
+        Assert-True ($readme.Contains($mumuLink)) "README is missing a tested reference link: $mumuLink"
+    }
+    Assert-True ($readme.Contains([string]$manifest.mumu.testedVersion)) "README does not state the tested MuMu version: $([string]$manifest.mumu.testedVersion)"
+    Assert-True ($readme -notmatch 'github\.com/JingMatrix/LSPosed/releases') 'README documents a Vector release page under the retired LSPosed repository path instead of the pinned Vector source.'
+
+    foreach ($statement in @(
+            @{ Pattern = 'Direct Install into system partition'; Message = 'README lacks the exact Kitsune system-partition choice.' }
+            @{ Pattern = 'Global.*Chinese'; Message = 'README does not state the supported MuMu editions.' }
+            @{ Pattern = 'Android 12'; Message = 'README does not state the Android 12 behavior.' }
+            @{ Pattern = 'Android 15'; Message = 'README does not state the Android 15 behavior.' }
+            @{ Pattern = '(?i)Setup order'; Message = 'README does not state the setup order.' }
+            @{ Pattern = '(?i)Run as administrator'; Message = 'README does not state how the operator supplies administrator rights.' }
+            @{ Pattern = '(?i)never relaunches itself'; Message = 'README does not state the UAC direct-relaunch limitation.' }
+            @{ Pattern = '(?i)fail(s)? closed'; Message = 'README does not state the current fail-closed behavior.' }
+            @{ Pattern = '(?i)creates and verifies a clone'; Message = 'README does not state the clone-first behavior.' }
+            @{ Pattern = '(?i)Recovery'; Message = 'README does not state how to recover from an interrupted operation.' }
+            @{ Pattern = '-Confirmed'; Message = 'README does not document the explicit Android 15 confirmation switch.' }
+            @{ Pattern = 'CONFIRM'; Message = 'README does not document the interactive Android 15 confirmation word.' }
+            @{ Pattern = '(?i)verified clone'; Message = 'README does not state that concealment requires a verified clone.' }
+            @{ Pattern = '(?i)explicitly selected'; Message = 'README does not state the selected-app-only concealment scope.' }
+            @{ Pattern = '-Packages'; Message = 'README does not document the package selection parameter.' }
+            @{ Pattern = 'campaign\.json'; Message = 'README does not state the advertisement scope.' }
+            @{ Pattern = '(?i)AllowedRoot'; Message = 'README does not state the advertisement restore boundary.' }
+            @{ Pattern = '-Action Restore'; Message = 'README does not document the advertisement restore command.' }
+            @{ Pattern = '-NonInteractive'; Message = 'README does not document the noninteractive mode.' }
+            @{ Pattern = '(?m)Success.*\b0\b'; Message = 'README does not map Success to exit code 0.' }
+            @{ Pattern = '(?m)Warning.*\b0\b'; Message = 'README does not map Warning to exit code 0.' }
+            @{ Pattern = '(?m)RecoverableError.*\b2\b'; Message = 'README does not map RecoverableError to exit code 2.' }
+            @{ Pattern = '(?m)CriticalError.*\b1\b'; Message = 'README does not map CriticalError to exit code 1.' }
+            @{ Pattern = '(?i)no live (qualification|run|test)'; Message = 'README does not disclose that no live qualification was performed here.' }
+            @{ Pattern = '(?i)transport'; Message = 'README does not disclose the transport assumptions.' }
+            @{ Pattern = '(?i)Play Integrity'; Message = 'README does not address Play Integrity.' }
+            @{ Pattern = '(?i)no guarantee|does not guarantee'; Message = 'README does not disclaim any Play Integrity or attestation guarantee.' }
+            @{ Pattern = '(?i)no binaries'; Message = 'README does not state that no binaries are bundled.' }
+        )) {
+        Assert-True ($readme -match $statement.Pattern) $statement.Message
+    }
+    foreach ($action in @('Detect', 'Verify', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')) {
+        Assert-True ($readme -match ('(?i)-Action ' + $action + '\b')) "README does not document the implemented action: $action"
+    }
+
+    Assert-True ($license -match 'MIT License') 'LICENSE is not the MIT license.'
+    Assert-True ($license -match 'Permission is hereby granted, free of charge') 'LICENSE does not contain the MIT grant.'
+    Assert-True ($license -match 'THE SOFTWARE IS PROVIDED "AS IS"') 'LICENSE does not contain the MIT warranty disclaimer.'
+    Assert-True ($notice -match 'Jordan231111/mumu-magisk-1click') 'NOTICE does not credit the original project this work is clean-room from.'
+    Assert-True ($notice -match '(?i)own licen') 'NOTICE does not state that upstream artifacts keep their own licenses.'
+    Assert-True ($notice -match '(?i)does not imply endorsement|no endorsement|not endorsed') 'NOTICE does not disclaim endorsement.'
+    Assert-True ($readme -match 'NOTICE\.md') 'README does not point at the attribution file.'
+    Assert-True ($readme -match 'Jordan231111/mumu-magisk-1click') 'README does not credit the original project this work is clean-room from.'
+
+    Assert-True ($workflow -match '(?m)^\s*runs-on:\s*windows') 'The workflow does not run on Windows.'
+    Assert-True ($workflow -match 'actions/checkout@v[0-9]+') 'The workflow does not check out the repository with a pinned action.'
+    Assert-True ($workflow -match '\[System\.Management\.Automation\.Language\.Parser\]') 'The workflow does not run PowerShell parser checks.'
+    Assert-True ($workflow -match '-Suite All') 'The workflow does not run the full test suite.'
+    foreach ($forbidden in @(
+            'upload-artifact'
+            'actions/setup-'
+            'Invoke-WebRequest'
+            'Invoke-RestMethod'
+            'Install-Module'
+            'Save-Module'
+            'Set-ExecutionPolicy'
+            'choco '
+            'winget'
+            'scoop'
+            'dotnet'
+            'pip install'
+            'npm install'
+            'MuMu'
+            '(?i)\badb\b'
+        )) {
+        Assert-True ($workflow -notmatch $forbidden) "The workflow uses a forbidden construct for a checkout-only build: $forbidden"
+    }
+
+    foreach ($document in @(
+            [pscustomobject]@{ Name = 'README.md'; Text = $readme }
+            [pscustomobject]@{ Name = 'NOTICE.md'; Text = $notice }
+        )) {
+        Assert-True ($document.Text -notmatch '[^\x00-\x7F]') "$($document.Name) contains non-ASCII text, which is not the clean-room English documentation."
+        Assert-True ($document.Text -notmatch '(?i)\.(apk|zip|7z|msi|img|ico|iso|cab|whl|nupkg)\b') "$($document.Name) references a packaged binary artifact file name."
+        foreach ($hostMatch in [regex]::Matches($document.Text, 'https?://([A-Za-z0-9.-]+)')) {
+            $linkHost = $hostMatch.Groups[1].Value.ToLowerInvariant()
+            Assert-True (@('github.com', 'www.mumuplayer.com', 'mumuplayer.com') -contains $linkHost) "$($document.Name) links a host that is not an official upstream source: $linkHost"
+        }
+    }
+    foreach ($ignoredPattern in @('*.apk', '*.zip', '*.exe', '*.pfx')) {
+        Assert-True ($gitignore.Contains($ignoredPattern)) ".gitignore does not exclude the publishing safeguard pattern: $ignoredPattern"
+    }
+}
+
 function Invoke-CommonTests {
     Assert-True ($null -ne (Get-Command Get-ToolkitLogPath -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitLogPath is unavailable.'
     $logRoot = Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit\logs'
@@ -7969,6 +8084,9 @@ try {
         'Menu' {
             Invoke-MenuTests
         }
+        'Docs' {
+            Invoke-DocsTests
+        }
         'All' {
             Invoke-ManifestTests
             Invoke-AssetTests
@@ -7983,6 +8101,7 @@ try {
             Invoke-Root12Tests
             Invoke-Root15Tests
             Invoke-MenuTests
+            Invoke-DocsTests
             Invoke-CommonTests
         }
     }
