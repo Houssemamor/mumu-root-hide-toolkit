@@ -68,19 +68,12 @@ function Test-Android15Root {
     $fields['KernelSU'] = $true
     $fields['KernelSUVersion'] = [string]$packageFields.VersionName
 
-    $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
-    $rootShell = Get-ToolkitRootShellStatus -Call $rootCall
-    if ($rootShell.Status -ne 'Success') {
-        return Get-ToolkitResult -Status 'CriticalError' -Message ('The built-in root shell could not be verified. ' + $rootShell.Message) -Data (New-Android15RootState -Code ([string]$rootShell.Data.Code) -Fields $fields)
-    }
-    $fields['RootShell'] = $true
-
     $kitsuneCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command $script:Root15PackageListCommand -Runner $Runner
     if ($null -eq $kitsuneCall -or $kitsuneCall.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The package list query failed, so an absent Kitsune package could not be confirmed.' -Data (New-Android15RootState -Code 'ADB_FAILED' -Fields $fields)
     }
     $kitsuneLine = 'package:' + $script:Root15KitsunePackage
-    $kitsunePresent = $false
+    $kitsuneObserved = @()
     foreach ($line in @(([string]$kitsuneCall.Text) -split "`r?`n")) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             continue
@@ -89,13 +82,21 @@ function Test-Android15Root {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'The package list response is not a list of packages, so an absent Kitsune package could not be confirmed.' -Data (New-Android15RootState -Code 'ADB_FAILED' -Fields $fields)
         }
         if ($line.Trim() -ceq $kitsuneLine) {
-            $kitsunePresent = $true
+            $kitsuneObserved += $line.Trim()
         }
     }
-    if ($kitsunePresent) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message "The instance already has the Kitsune package $script:Root15KitsunePackage, which this workflow never installs and cannot account for." -Data (New-Android15RootState -Code 'KITSUNE_PRESENT' -Fields $fields)
+    # The inherited package is reported before the root shell, because a Kitsune instance has no built-in root to probe and the shell result would name the wrong cause.
+    if ($kitsuneObserved.Count -gt 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message ("The instance already has the Kitsune package $script:Root15KitsunePackage, which this workflow never installs and cannot account for. Observed in the guest package list: " + ($kitsuneObserved -join ', ') + '. This workflow verifies the built-in KernelSU root only, so no root result is claimed for this instance.') -Data (New-Android15RootState -Code 'KITSUNE_PRESENT' -Fields $fields)
     }
     $fields['KitsuneAbsent'] = $true
+
+    $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
+    $rootShell = Get-ToolkitRootShellStatus -Call $rootCall
+    if ($rootShell.Status -ne 'Success') {
+        return Get-ToolkitResult -Status 'CriticalError' -Message ('The built-in root shell could not be verified. ' + $rootShell.Message) -Data (New-Android15RootState -Code ([string]$rootShell.Data.Code) -Fields $fields)
+    }
+    $fields['RootShell'] = $true
 
     return Get-ToolkitResult -Status 'Success' -Message 'The Android 15 built-in KernelSU root is verified.' -Data (New-Android15RootState -Code 'OK' -Fields $fields)
 }

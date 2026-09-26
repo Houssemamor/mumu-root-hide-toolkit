@@ -192,8 +192,17 @@ claims no root. Nothing outside the selected clone is changed in either path.
 
 `Root15` never installs Kitsune or Magisk. It creates and verifies a clone, enables MuMu's
 built-in root setting on that clone, cold-boots it, and verifies the built-in KernelSU package,
-a root shell, and the absence of the Kitsune package. The built-in root is kept enabled on the
-clone.
+the absence of the Kitsune package, and a root shell, in that order. The Kitsune check runs first
+so a clone that inherited the Kitsune package is reported as `KITSUNE_PRESENT`, with the observed
+package line, instead of being reported as a root denial it never had. A guest with no `su` binary
+at all is reported as `ROOT_UNAVAILABLE`, which says the root state is unknown, rather than as a
+policy denial. The built-in root is kept enabled on the clone.
+
+Android 15 is **not qualified on this host yet.** The live run on the instance at index 1 produced
+a clone that inherited `io.github.huskydg.magisk` and had no usable `su` and no built-in KernelSU
+daemon, so that clone is not a valid built-in-KernelSU target and the action reported
+`KITSUNE_PRESENT`. A source instance that already carries Kitsune cannot be qualified with
+`Root15`; a Kitsune-free instance still has to be run before Android 15 can be called qualified.
 
 Because that change is not reversible through the toolkit, `Root15` requires explicit
 confirmation. The menu asks you to type `CONFIRM`; the command line requires `-Confirmed`.
@@ -320,6 +329,10 @@ These are the honest limits of the current state of the code.
   survive the cleanup, because on MuMu 6.8 the Kitsune `su` path is `/system/bin/su` and disabling
   the vendor root removes it while the adb shell stays `uid=2000`. That state is reported as a
   `Warning`, never as a `Success`, and the retained vendor root is recorded in the journal.
+- Android 15 is not qualified. The live run on the instance at index 1 produced a clone that
+  inherited `io.github.huskydg.magisk` and had no usable `su` and no built-in KernelSU daemon, so
+  that clone is not a valid built-in-KernelSU target. `Root15` reports `KITSUNE_PRESENT` for it and
+  a source instance that already carries Kitsune cannot be qualified.
 - no binaries are bundled: no APK, archive, installer, or image is committed here, and the
   repository ignores those file types on purpose.
 - The Chinese edition is fixture-tested only. The live setup verification behind the tested

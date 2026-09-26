@@ -205,6 +205,9 @@ function Get-ToolkitRootShellStatus {
     if ($Call.ExitCode -eq 0 -and ([string]$Call.Text) -match '(?m)uid=0\(') {
         return Get-ToolkitResult -Status 'Success' -Message 'The root shell returned a root identity.' -Data (@{ Code = 'OK'; RootShell = $true })
     }
+    if ($Call.ExitCode -eq 127) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The root shell binary is not available in the guest, so the root state is unknown and no denial can be concluded.' -Data (@{ Code = 'ROOT_UNAVAILABLE' })
+    }
     if ($Call.ExitCode -ne 0 -and [string]::IsNullOrWhiteSpace([string]$Call.Text)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The root shell query returned no guest output, so a guest refusal cannot be concluded.' -Data (@{ Code = 'ADB_FAILED' })
     }

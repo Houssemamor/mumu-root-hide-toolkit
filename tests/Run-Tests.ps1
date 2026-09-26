@@ -3638,6 +3638,7 @@ $script:Root12Codes = @(
     'DAEMON_ABSENT',
     'DAEMON_DUPLICATE',
     'ROOT_DENIED',
+    'ROOT_UNAVAILABLE',
     'ADB_FAILED'
 )
 
@@ -3785,6 +3786,7 @@ function New-Root12ManagerState {
         RootDisableCount = @{}
         RootEnableExitCodeAfterDisable = 0
         RootAllowed = $true
+        RootShellMissing = $false
         RootShellText = 'uid=0(root) gid=0(root) groups=0(root)'
         JournalLockPath = ''
         JournalLockPattern = ''
@@ -5304,6 +5306,7 @@ $script:Root15Codes = @(
     'BOOT_TIMEOUT',
     'KERNELSU_ABSENT',
     'ROOT_DENIED',
+    'ROOT_UNAVAILABLE',
     'KITSUNE_PRESENT',
     'ADB_FAILED'
 )
@@ -5381,6 +5384,7 @@ function New-Root15ManagerState {
         PackageListText = ''
         RelatedPackageName = ''
         RootAllowed = $true
+        RootShellMissing = $false
         RootShellText = 'uid=0(root) gid=0(root) groups=0(root)'
         JournalLockPath = ''
         JournalLockPattern = ''
@@ -5546,6 +5550,9 @@ function New-Root15ManagerRunner {
                 return [pscustomobject]@{ ExitCode = 0; Text = ($lines -join [Environment]::NewLine) }
             }
             if ($request -ceq 'shell su -c id') {
+                if ($State.RootShellMissing) {
+                    return [pscustomobject]@{ ExitCode = 127; Text = '/system/bin/sh: su: not found' }
+                }
                 if (-not $State.RootAllowed) {
                     return [pscustomobject]@{ ExitCode = 1; Text = '/system/bin/sh: su: not found' }
                 }
@@ -5806,7 +5813,8 @@ function Invoke-Root15Tests {
         Assert-True ($bootCall -gt $launchCall) 'The Android 15 workflow did not wait for Android readiness after the cold boot.'
         Assert-True ($kernelCall -gt $bootCall) 'The Android 15 workflow verified KernelSU before Android was ready.'
         Assert-True ($rootShellCall -gt $kernelCall) 'The Android 15 workflow verified the root shell before the KernelSU package.'
-        Assert-True ($kitsuneCall -gt $rootShellCall) 'The Android 15 workflow did not check for a Kitsune package after the root shell.'
+        Assert-True ($kitsuneCall -gt $kernelCall) 'The Android 15 workflow did not check for a Kitsune package after the KernelSU package.'
+        Assert-True ($rootShellCall -gt $kitsuneCall) 'The Android 15 workflow verified the root shell before reporting an inherited Kitsune package.'
         Assert-Equal 1 @(Get-Root15Calls -State $successState -Pattern 'clone*').Count 'The Android 15 workflow did not create exactly one clone.'
         Assert-Equal 0 @(Get-Root15Calls -State $successState -Pattern '*install*').Count 'The Android 15 workflow installed a package.'
         foreach ($verificationCall in @(Get-Root15Calls -State $successState -Pattern 'adb*')) {
@@ -5952,6 +5960,55 @@ function Invoke-Root15Tests {
         Assert-True ($bootTimeoutCase.Result.Message -match '2 checks') 'The boot timeout did not report the number of checks.'
         Assert-Equal -1 (Get-Root15CallIndex -Calls $bootTimeoutState.Calls -Pattern '*dumpsys package*') 'A failed boot verified the KernelSU package.'
         Assert-Equal -1 (Get-Root15CallIndex -Calls $bootTimeoutState.Calls -Pattern '*su -c id*') 'A failed boot verified the root shell.'
+
+        foreach ($orderCase in @(
+                [pscustomobject]@{ Kitsune = $true; Missing = $true; Code = 'KITSUNE_PRESENT'; Status = 'CriticalError'; KitsuneAbsent = $false; RootShell = $false; Label = 'an inherited Kitsune package and no su' },
+                [pscustomobject]@{ Kitsune = $false; Missing = $true; Code = 'ROOT_UNAVAILABLE'; Status = 'CriticalError'; KitsuneAbsent = $true; RootShell = $false; Label = 'no Kitsune package and no su' },
+                [pscustomobject]@{ Kitsune = $false; Missing = $false; Code = 'ROOT_DENIED'; Status = 'CriticalError'; KitsuneAbsent = $true; RootShell = $false; Label = 'no Kitsune package and a denied su' },
+                [pscustomobject]@{ Kitsune = $false; Missing = $false; Code = 'OK'; Status = 'Success'; KitsuneAbsent = $true; RootShell = $true; Label = 'the verified built-in root' }
+            )) {
+            $orderState = New-Root15ManagerState -Install $install
+            $orderState.RootSettings[[string]$orderState.CloneIndex] = $true
+            $orderState.KitsuneInstalled = $orderCase.Kitsune
+            $orderState.RootShellMissing = $orderCase.Missing
+            if ($orderCase.Code -ceq 'ROOT_DENIED') {
+                $orderState.RootShellText = 'uid=2000(shell) gid=2000(shell) groups=2000(shell)'
+            }
+            $orderChecks = Test-Android15Root -ManagerPath $install.ManagerPath -InstanceIndex $orderState.CloneIndex -Runner (New-Root15ManagerRunner -State $orderState)
+            Assert-Equal $orderCase.Status $orderChecks.Status "The Android 15 check reported the wrong status for $($orderCase.Label)."
+            Assert-Equal $orderCase.Code $orderChecks.Data.Code "The Android 15 check reported the wrong code for $($orderCase.Label)."
+            Assert-Equal $orderCase.KitsuneAbsent $orderChecks.Data.KitsuneAbsent "The Android 15 check reported the wrong Kitsune absence for $($orderCase.Label)."
+            Assert-Equal $orderCase.RootShell $orderChecks.Data.RootShell "The Android 15 check reported the wrong root shell state for $($orderCase.Label)."
+            Assert-Equal $true $orderChecks.Data.RootPermission "The Android 15 check lost the vendor root state for $($orderCase.Label)."
+            $orderKitSUCall = Get-Root15CallIndex -Calls $orderState.Calls -Pattern '*dumpsys package me.weishu.kernelsu*'
+            $orderListCall = Get-Root15CallIndex -Calls $orderState.Calls -Pattern '*pm list packages*'
+            $orderRootCall = Get-Root15CallIndex -Calls $orderState.Calls -Pattern '*su -c id*'
+            Assert-True ($orderListCall -gt $orderKitSUCall) "The Android 15 check did not query the package list after the KernelSU check ($($orderCase.Label))."
+            if ($orderCase.Code -ceq 'KITSUNE_PRESENT') {
+                Assert-Equal -1 $orderRootCall "The Android 15 check probed the root shell before reporting the inherited Kitsune package ($($orderCase.Label))."
+                Assert-True ($orderChecks.Message -match 'package:io\.github\.huskydg\.magisk') "The inherited Kitsune report does not carry the observed package evidence ($($orderCase.Label)): $($orderChecks.Message)"
+                Assert-True ($orderChecks.Message -match '(?i)cannot account for') "The inherited Kitsune report does not explain itself ($($orderCase.Label))"
+            }
+            else {
+                Assert-True ($orderRootCall -gt $orderListCall) "The Android 15 check did not probe the root shell after the package list ($($orderCase.Label))."
+            }
+            if ($orderCase.Code -ceq 'ROOT_UNAVAILABLE') {
+                Assert-True ($orderChecks.Message -match '(?i)not available') "A missing su binary was reported as a policy denial ($($orderCase.Label)): $($orderChecks.Message)"
+                Assert-True ($orderChecks.Message -match '(?i)unknown') "A missing su binary does not say the root state is unknown ($($orderCase.Label))"
+            }
+            if ($orderCase.Status -ceq 'Success') {
+                Assert-Equal $true $orderChecks.Data.KernelSU "The verified built-in root does not report KernelSU ($($orderCase.Label))"
+                Assert-Equal '3.2.5' $orderChecks.Data.KernelSUVersion "The verified built-in root does not report the KernelSU version ($($orderCase.Label))"
+            }
+        }
+
+        $inheritedCloneState = New-Root15ManagerState -Install $install
+        $inheritedCloneState.KitsuneInstalled = $true
+        $inheritedCloneState.RootShellMissing = $true
+        $inheritedCloneCase = Invoke-Root15Case -State $inheritedCloneState -Instance $android15 -JournalRoot $journalRoot
+        Assert-Root15Failure -Result $inheritedCloneCase.Result -Journal $inheritedCloneCase.Journal -Code 'KITSUNE_PRESENT' -Message 'A clone that inherited Kitsune was reported as a built-in KernelSU root.'
+        Assert-Equal $false $inheritedCloneCase.Result.Data.KitsuneAbsent 'A clone that inherited Kitsune was reported as free of the Kitsune package.'
+        Assert-Equal -1 (Get-Root15CallIndex -Calls $inheritedCloneState.Calls -Pattern '*su -c id*') 'A clone that inherited Kitsune was probed for a root shell before the Kitsune report.'
 
         foreach ($missingRootCase in @(
                 [pscustomobject]@{ Knob = 'KernelSUInstalled'; Value = $false; Code = 'KERNELSU_ABSENT'; Field = 'KernelSU'; Label = 'absent KernelSU' },

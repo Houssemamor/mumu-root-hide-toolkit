@@ -617,7 +617,9 @@ Expected: FAIL because the workflow does not exist.
 
 - [ ] **Step 3: Implement the built-in root toggle and verification**
 
-Call the manager's `setting -k root_permission -val true`, restart the selected Android 15 instance, wait for Android readiness, verify the built-in KernelSU package and root shell, and assert that Kitsune is not installed by this workflow. Never disable Hyper-V, VBS, or memory integrity.
+Call the manager's `setting -k root_permission -val true`, restart the selected Android 15 instance, wait for Android readiness, verify the built-in KernelSU package, then the absence of the Kitsune package, and only then the root shell. The Kitsune check runs before the root shell on purpose: a clone that inherited `io.github.huskydg.magisk` has no built-in root to probe, so probing the shell first reported `ROOT_DENIED` for a root that was never there and hid the real cause. The inherited package is reported as `KITSUNE_PRESENT` with the observed `package:` line, and a guest whose `su` binary does not exist is reported as `ROOT_UNAVAILABLE`, which says the root state is unknown instead of implying a policy denial. `KitsuneAbsent` stays in the result contract, so a `KITSUNE_PRESENT` record reports it as false. Never disable Hyper-V, VBS, or memory integrity.
+
+Live qualification status: Android 15 is **not qualified**. The live run on the instance at index 1 produced a clone that inherited `io.github.huskydg.magisk` and had no usable `su` and no built-in KernelSU daemon, so that clone is not a valid built-in-KernelSU target, and a source instance that already carries Kitsune cannot be qualified with this workflow. A Kitsune-free Android 15 instance still has to be run before Android 15 can be called qualified.
 
 ```powershell
 function Enable-Android15Root {
