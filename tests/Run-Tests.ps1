@@ -7992,11 +7992,17 @@ Write-Output 'STANDALONE_OK'
 function New-TargetFixture {
     param(
         [string]$Name,
-        [int[]]$InstanceIndexes = @(0, 2, 3)
+        [int[]]$InstanceIndexes = @(0, 2, 3),
+        [switch]$AmbiguousVms,
+        [switch]$Running
     )
 
     $root = Join-Path $testRoot ('target fixtures\MuMu Global\' + $Name)
     $fixture = New-SafetyInstallFixture -InstallRoot $root -InstanceIndexes $InstanceIndexes
+    if ($AmbiguousVms) {
+        [void][IO.Directory]::CreateDirectory((Join-Path $root 'nx_device\12.0\vms'))
+        [void][IO.Directory]::CreateDirectory((Join-Path $root 'nx_device\15.0\vms'))
+    }
     return [pscustomobject]@{
         Install = [pscustomobject]@{
             Edition = 'Global'
@@ -8006,7 +8012,7 @@ function New-TargetFixture {
             Source = 'Fallback'
         }
         VmsPath = $fixture.VmsPath
-        State = (New-SafetyManagerState -VmsPath $fixture.VmsPath -Running $false)
+        State = (New-SafetyManagerState -VmsPath $fixture.VmsPath -Running ([bool]$Running))
     }
 }
 
@@ -8020,6 +8026,12 @@ function Get-TargetManagerCommands {
     param([object]$State)
 
     return @(@($State.Calls) | ForEach-Object { (@($_) -join '|') })
+}
+
+function Get-TargetMutatingCommands {
+    param([object]$State)
+
+    return @(@(Get-TargetManagerCommands -State $State) | Where-Object { $_ -notmatch '^(info|setting)\|' })
 }
 
 function Assert-TargetManagerCommands {
@@ -8071,7 +8083,7 @@ function Get-TargetSourceInstanceDelta {
 }
 
 function Invoke-TargetTests {
-    foreach ($commandName in @('Get-ToolkitInstanceChoices', 'New-MuMuInstance', 'Select-ToolkitTarget')) {
+    foreach ($commandName in @('Get-ToolkitInstanceChoices', 'New-MuMuInstance', 'Select-ToolkitTarget', 'Resolve-ToolkitCloneSource', 'ConvertTo-ToolkitInstanceIndex')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Target command is unavailable: $commandName"
     }
     Assert-True (Test-Path -LiteralPath $targetScriptPath -PathType Leaf) 'src/Target.ps1 does not exist.'
@@ -8100,11 +8112,20 @@ function Invoke-TargetTests {
         )) {
         Assert-True ($targetSource -notmatch [regex]::Escape($forbidden)) "The target source uses a forbidden construct: $forbidden"
     }
-    foreach ($sharedPrimitive in @('Get-MuMuInstances', 'Resolve-SelectedInstance', 'New-InstanceClone', 'Get-MuMuInstanceRecord', 'Get-MuMuInstanceRootPath', 'Get-MuMuInstanceRunningState', 'Measure-MuMuInstanceDiskBytes', 'Test-ToolkitManagerFile', 'Get-ToolkitMenuChoice', 'New-ToolkitInstanceFailure')) {
+    foreach ($sharedPrimitive in @('Get-MuMuInstances', 'Resolve-SelectedInstance', 'New-InstanceClone', 'Get-MuMuInstanceRecord', 'Get-MuMuInstanceRootPath', 'Get-MuMuInstanceRunningState', 'Measure-MuMuInstanceDiskBytes', 'Test-ToolkitManagerFile', 'Test-ToolkitPathWithinRoot', 'Get-ToolkitMenuChoice', 'New-ToolkitInstanceFailure', 'ConvertTo-ToolkitInstanceIndex', 'Resolve-ToolkitCloneSource')) {
         Assert-True ($targetSource -match [regex]::Escape($sharedPrimitive)) "The target flow does not reuse the shared primitive: $sharedPrimitive"
     }
     Assert-True ($targetSource -match "'create',\s*'-n'") 'The target flow does not call the manager create command with structured arguments.'
     Assert-True ($targetSource -match "cnotcontains \`$Mode") 'The target flow does not reject an unsupported target mode.'
+    Assert-True ($targetSource -notmatch 'Get-ToolkitVmsPath') 'The target flow re-derives an instance root instead of using the selected installation.'
+    Assert-True ($targetSource -notmatch 'Get-ToolkitInstallRoot|Get-ToolkitEdition') 'The target flow re-derives installation metadata instead of using the selected installation.'
+    Assert-True ($targetSource -match "\`$Install\.PSObject\.Properties\['VmsPath'\]") 'The target flow does not use the selected installation VMS path.'
+
+    Assert-Equal 5 (ConvertTo-ToolkitInstanceIndex -Value '5') 'The instance index parser rejected a plain index.'
+    Assert-Equal 0 (ConvertTo-ToolkitInstanceIndex -Value ' 0 ') 'The instance index parser rejected a padded zero index.'
+    foreach ($rejectedIndex in @($null, '', '   ', 'abc', '-1', '5.5', @('5'), [pscustomobject]@{ Index = 5 })) {
+        Assert-Equal $null (ConvertTo-ToolkitInstanceIndex -Value $rejectedIndex) "The instance index parser accepted [$rejectedIndex]."
+    }
 
     $targetAppData = $env:APPDATA
     $targetProfileRoot = Join-Path $testRoot 'target profile'
@@ -8141,9 +8162,25 @@ function Invoke-TargetTests {
         Assert-True (@((Get-OperationJournal -Path $identifyJournal.JournalPath).Checkpoints)).Count -ge 1 'The Identify target mode did not record the selected target in its journal.'
         Assert-TargetManagerCommands -State $identify.State -AllowedVerbs @('info', 'setting') -Message 'The Identify target mode'
 
-        $ambiguousState = $identify.State
+        $identifyText = @(Format-ToolkitResult -Result $identifyResult) -join "`n"
+        foreach ($expectedLine in @(
+                'Instance 0 | Base | Android 12.0 | Running False | Eligible False',
+                'Instance 2 | Other | Android 12.0 | Running False | Eligible True',
+                'Instance 3 | Target | Android 12.0 | Running False | Eligible True'
+            )) {
+            Assert-True ($identifyText -match [regex]::Escape($expectedLine)) "The rendered Identify result does not list the instance fields: $expectedLine"
+        }
+        $overflowChoices = @()
+        for ($overflowIndex = 0; $overflowIndex -lt ($script:ToolkitInstanceChoiceLimit + 4); $overflowIndex++) {
+            $overflowChoices += [pscustomobject]@{ Index = $overflowIndex; Name = 'Filler'; AndroidVersion = '12.0'; Running = $false; Eligible = $true }
+        }
+        $overflowResult = Get-ToolkitResult -Status 'Success' -Message 'overflow fixture' -Data (@{ Mode = 'Identify'; Instances = $overflowChoices })
+        $overflowText = @(Format-ToolkitResult -Result $overflowResult) -join "`n"
+        Assert-Equal $script:ToolkitInstanceChoiceLimit @([regex]::Matches($overflowText, '(?m)^  Instance ')).Count 'The rendered instance listing is not bounded.'
+        Assert-True ($overflowText -match 'more instance\(s\) were not listed') 'The rendered instance listing does not report the omitted instances.'
+
         $ambiguousJournal = New-TargetJournal -Instance $identify.Install
-        $ambiguous = Select-ToolkitTarget -Install $identify.Install -Journal $ambiguousJournal -Mode Identify -Runner (New-SafetyManagerRunner -State $ambiguousState)
+        $ambiguous = Select-ToolkitTarget -Install $identify.Install -Journal $ambiguousJournal -Mode Identify -Runner (New-SafetyManagerRunner -State $identify.State)
         Assert-TargetFailedJournal -Result $ambiguous -Journal $ambiguousJournal -Message 'An ambiguous target selection was accepted.'
         Assert-True ($ambiguous.Message -match '(?i)explicit|target') "An ambiguous target selection did not explain itself: $($ambiguous.Message)"
 
@@ -8174,7 +8211,7 @@ function Invoke-TargetTests {
 
         $unconfirmedCreate = New-TargetFixture -Name 'unconfirmed create'
         $unconfirmedJournal = New-TargetJournal -Instance $unconfirmedCreate.Install
-        $unconfirmed = New-MuMuInstance -ManagerPath $unconfirmedCreate.Install.ManagerPath -Journal $unconfirmedJournal -Runner (New-SafetyManagerRunner -State $unconfirmedCreate.State)
+        $unconfirmed = New-MuMuInstance -ManagerPath $unconfirmedCreate.Install.ManagerPath -Install $unconfirmedCreate.Install -Journal $unconfirmedJournal -Runner (New-SafetyManagerRunner -State $unconfirmedCreate.State)
         Assert-TargetFailedJournal -Result $unconfirmed -Journal $unconfirmedJournal -Message 'An unconfirmed instance creation was accepted.'
         Assert-True ($unconfirmed.Message -match '(?i)confirm') 'An unconfirmed instance creation did not ask for an explicit confirmation.'
         Assert-Equal 0 $unconfirmedCreate.State.Calls.Count "An unconfirmed instance creation reached the manager: $(@(Get-TargetManagerCommands -State $unconfirmedCreate.State) -join '|')"
@@ -8182,7 +8219,7 @@ function Invoke-TargetTests {
         foreach ($badCount in @(0, 2)) {
             $countFixture = New-TargetFixture -Name "count $badCount"
             $countJournal = New-TargetJournal -Instance $countFixture.Install
-            $count = New-MuMuInstance -ManagerPath $countFixture.Install.ManagerPath -Journal $countJournal -Count $badCount -Confirmed -Runner (New-SafetyManagerRunner -State $countFixture.State)
+            $count = New-MuMuInstance -ManagerPath $countFixture.Install.ManagerPath -Install $countFixture.Install -Journal $countJournal -Count $badCount -Confirmed -Runner (New-SafetyManagerRunner -State $countFixture.State)
             Assert-Equal 'CriticalError' $count.Status "A create count of $badCount was accepted."
             Assert-Equal 0 $countFixture.State.Calls.Count "A rejected create count of $badCount reached the manager."
         }
@@ -8190,14 +8227,14 @@ function Invoke-TargetTests {
         foreach ($badIndex in @('', '   ', 'abc', '-1', '-7')) {
             $indexFixture = New-TargetFixture -Name 'invalid start index'
             $indexJournal = New-TargetJournal -Instance $indexFixture.Install
-            $index = New-MuMuInstance -ManagerPath $indexFixture.Install.ManagerPath -Journal $indexJournal -StartIndex $badIndex -Confirmed -Runner (New-SafetyManagerRunner -State $indexFixture.State)
+            $index = New-MuMuInstance -ManagerPath $indexFixture.Install.ManagerPath -Install $indexFixture.Install -Journal $indexJournal -StartIndex $badIndex -Confirmed -Runner (New-SafetyManagerRunner -State $indexFixture.State)
             Assert-Equal 'CriticalError' $index.Status "The start index [$badIndex] was accepted."
             Assert-Equal 0 $indexFixture.State.Calls.Count "The start index [$badIndex] reached the manager."
         }
 
         $inUseFixture = New-TargetFixture -Name 'index in use'
         $inUseJournal = New-TargetJournal -Instance $inUseFixture.Install
-        $inUse = New-MuMuInstance -ManagerPath $inUseFixture.Install.ManagerPath -Journal $inUseJournal -StartIndex '2' -Confirmed -Runner (New-SafetyManagerRunner -State $inUseFixture.State)
+        $inUse = New-MuMuInstance -ManagerPath $inUseFixture.Install.ManagerPath -Install $inUseFixture.Install -Journal $inUseJournal -StartIndex '2' -Confirmed -Runner (New-SafetyManagerRunner -State $inUseFixture.State)
         Assert-Equal 'CriticalError' $inUse.Status 'A create request over an existing instance index was accepted.'
         Assert-True ($inUse.Message -match 'already in use') "A create request over an existing index did not explain itself: $($inUse.Message)"
         Assert-TargetManagerCommands -State $inUseFixture.State -AllowedVerbs @('info', 'setting') -Message 'A create request over an existing index'
@@ -8205,18 +8242,42 @@ function Invoke-TargetTests {
 
         $managerFixture = New-TargetFixture -Name 'invalid manager'
         $managerJournal = New-TargetJournal -Instance $managerFixture.Install
-        $notManager = New-MuMuInstance -ManagerPath (Join-Path $managerFixture.Install.InstallRoot 'vms\2\system.img') -Journal $managerJournal -Confirmed -Runner (New-SafetyManagerRunner -State $managerFixture.State)
+        $notManager = New-MuMuInstance -ManagerPath (Join-Path $managerFixture.Install.InstallRoot 'vms\2\system.img') -Install $managerFixture.Install -Journal $managerJournal -Confirmed -Runner (New-SafetyManagerRunner -State $managerFixture.State)
         Assert-Equal 'CriticalError' $notManager.Status 'A create request with a path that is not MuMuManager.exe was accepted.'
         Assert-Equal 0 $managerFixture.State.Calls.Count 'A create request with an invalid manager reached the process runner.'
         $outsideJournal = New-TargetJournal -Instance $managerFixture.Install
-        $outsideManager = New-MuMuInstance -ManagerPath (Join-Path $testRoot 'target fixtures\MuMu Global\absent\shell\MuMuManager.exe') -Journal $outsideJournal -Confirmed -Runner (New-SafetyManagerRunner -State $managerFixture.State)
+        $outsideManager = New-MuMuInstance -ManagerPath (Join-Path $testRoot 'target fixtures\MuMu Global\absent\shell\MuMuManager.exe') -Install $managerFixture.Install -Journal $outsideJournal -Confirmed -Runner (New-SafetyManagerRunner -State $managerFixture.State)
         Assert-Equal 'CriticalError' $outsideManager.Status 'A create request with a manager outside the install root was accepted.'
+        $noInstallJournal = New-TargetJournal -Instance $managerFixture.Install
+        $noInstall = New-MuMuInstance -ManagerPath $managerFixture.Install.ManagerPath -Install $null -Journal $noInstallJournal -Confirmed -Runner (New-SafetyManagerRunner -State $managerFixture.State)
+        Assert-Equal 'CriticalError' $noInstall.Status 'A create request without the selected installation was accepted.'
+        $conflictingInstall = [pscustomobject]@{
+            Edition = 'Global'
+            InstallRoot = $managerFixture.Install.InstallRoot
+            VmsPath = $managerFixture.Install.VmsPath
+            ManagerPath = (Join-Path $managerFixture.Install.InstallRoot 'nx_device\12.0\vms\MuMuManager.exe')
+            Source = 'Fallback'
+        }
+        $conflictingJournal = New-TargetJournal -Instance $managerFixture.Install
+        $conflicting = New-MuMuInstance -ManagerPath $managerFixture.Install.ManagerPath -Install $conflictingInstall -Journal $conflictingJournal -Confirmed -Runner (New-SafetyManagerRunner -State $managerFixture.State)
+        Assert-Equal 'CriticalError' $conflicting.Status 'A create request whose manager conflicts with the selected installation was accepted.'
+        $absentVms = [pscustomobject]@{
+            Edition = 'Global'
+            InstallRoot = $managerFixture.Install.InstallRoot
+            VmsPath = (Join-Path $managerFixture.Install.InstallRoot 'vms\absent')
+            ManagerPath = $managerFixture.Install.ManagerPath
+            Source = 'Fallback'
+        }
+        $absentVmsJournal = New-TargetJournal -Instance $managerFixture.Install
+        $absentVmsResult = New-MuMuInstance -ManagerPath $managerFixture.Install.ManagerPath -Install $absentVms -Journal $absentVmsJournal -Confirmed -Runner (New-SafetyManagerRunner -State $managerFixture.State)
+        Assert-Equal 'CriticalError' $absentVmsResult.Status 'A create request with an unavailable instance root was accepted.'
+        Assert-Equal 0 @(Get-TargetMutatingCommands -State $managerFixture.State).Count "A rejected create request reached the manager: $(@(Get-TargetManagerCommands -State $managerFixture.State) -join '|')"
 
         $createFixture = New-TargetFixture -Name 'create'
         $createFixture.State.CreateIndexes = @('5')
         $createSnapshotBefore = New-MenuSnapshot -Root $createFixture.Install.VmsPath
         $createJournal = New-TargetJournal -Instance $createFixture.Install
-        $create = New-MuMuInstance -ManagerPath $createFixture.Install.ManagerPath -Journal $createJournal -Count 1 -StartIndex '5' -Confirmed -Runner (New-SafetyManagerRunner -State $createFixture.State)
+        $create = New-MuMuInstance -ManagerPath $createFixture.Install.ManagerPath -Install $createFixture.Install -Journal $createJournal -Count 1 -StartIndex '5' -Confirmed -Runner (New-SafetyManagerRunner -State $createFixture.State)
         Assert-Equal 'Success' $create.Status "A confirmed instance creation failed: $($create.Message)"
         Assert-Equal 5 $create.Data.Index 'The created instance record reported the wrong index.'
         Assert-Equal 'Created instance' $create.Data.Name 'The created instance record reported the wrong name.'
@@ -8236,6 +8297,24 @@ function Invoke-TargetTests {
         $createSourceDelta = @(Get-TargetSourceInstanceDelta -Before $createSnapshotBefore -After (New-MenuSnapshot -Root $createFixture.Install.VmsPath) -InstanceIndexes @(0, 2, 3))
         Assert-Equal 0 $createSourceDelta.Count "A confirmed instance creation changed an existing instance: $($createSourceDelta -join '|')"
 
+        $ambiguousVmsFixture = New-TargetFixture -Name 'ambiguous vms' -AmbiguousVms
+        $inferenceRefused = $false
+        try {
+            $null = Get-ToolkitVmsPath -InstallRoot $ambiguousVmsFixture.Install.InstallRoot -CandidatePath '' -Edition 'Global'
+        }
+        catch {
+            $inferenceRefused = $true
+        }
+        Assert-True $inferenceRefused 'The multi-candidate fixture did not make instance root inference ambiguous.'
+        $ambiguousVmsFixture.State.CreateIndexes = @('5')
+        $ambiguousVmsJournal = New-TargetJournal -Instance $ambiguousVmsFixture.Install
+        $ambiguousVmsCreate = New-MuMuInstance -ManagerPath $ambiguousVmsFixture.Install.ManagerPath -Install $ambiguousVmsFixture.Install -Journal $ambiguousVmsJournal -StartIndex '5' -Confirmed -Runner (New-SafetyManagerRunner -State $ambiguousVmsFixture.State)
+        Assert-Equal 'Success' $ambiguousVmsCreate.Status "A create on an installation with several inferred instance roots failed: $($ambiguousVmsCreate.Message)"
+        Assert-Equal 5 $ambiguousVmsCreate.Data.Index 'A create on an ambiguous installation reported the wrong index.'
+        Assert-Equal (Join-Path $ambiguousVmsFixture.Install.VmsPath '5') $ambiguousVmsCreate.Data.VmsPath 'A create on an ambiguous installation did not use the selected installation instance root.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $ambiguousVmsFixture.Install.VmsPath '5\system.img') -PathType Leaf) 'A create on an ambiguous installation did not write the instance into the selected installation instance root.'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $ambiguousVmsFixture.Install.InstallRoot 'nx_device\12.0\vms\5'))) 'A create on an ambiguous installation wrote into an inferred instance root that was not selected.'
+
         $createTargetFixture = New-TargetFixture -Name 'create target'
         $createTargetFixture.State.CreateIndexes = @('5')
         $unconfirmedTargetJournal = New-TargetJournal -Instance $createTargetFixture.Install
@@ -8253,7 +8332,7 @@ function Invoke-TargetTests {
         $createFailureFixture = New-TargetFixture -Name 'create failure'
         $createFailureFixture.State.CreateExitCode = 1
         $createFailureJournal = New-TargetJournal -Instance $createFailureFixture.Install
-        $createFailure = New-MuMuInstance -ManagerPath $createFailureFixture.Install.ManagerPath -Journal $createFailureJournal -Confirmed -Runner (New-SafetyManagerRunner -State $createFailureFixture.State)
+        $createFailure = New-MuMuInstance -ManagerPath $createFailureFixture.Install.ManagerPath -Install $createFailureFixture.Install -Journal $createFailureJournal -Confirmed -Runner (New-SafetyManagerRunner -State $createFailureFixture.State)
         Assert-Equal 'CriticalError' $createFailure.Status 'A failed manager create command was reported as a created instance.'
         Assert-True ($createFailure.Message -match '(?i)create command failed') "A failed create command did not explain itself: $($createFailure.Message)"
 
@@ -8261,7 +8340,7 @@ function Invoke-TargetTests {
             $ambiguousCreateFixture = New-TargetFixture -Name 'ambiguous create'
             $ambiguousCreateFixture.State.CreateIndexes = $createdIndexes
             $ambiguousCreateJournal = New-TargetJournal -Instance $ambiguousCreateFixture.Install
-            $ambiguousCreate = New-MuMuInstance -ManagerPath $ambiguousCreateFixture.Install.ManagerPath -Journal $ambiguousCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $ambiguousCreateFixture.State)
+            $ambiguousCreate = New-MuMuInstance -ManagerPath $ambiguousCreateFixture.Install.ManagerPath -Install $ambiguousCreateFixture.Install -Journal $ambiguousCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $ambiguousCreateFixture.State)
             Assert-Equal 'CriticalError' $ambiguousCreate.Status "A create reporting $($createdIndexes.Count) new instance(s) was accepted."
             Assert-True ($ambiguousCreate.Message -match '(?i)exactly one new instance') "An ambiguous create result did not explain itself: $($ambiguousCreate.Message)"
         }
@@ -8269,14 +8348,14 @@ function Invoke-TargetTests {
         $malformedCreateFixture = New-TargetFixture -Name 'malformed create'
         $malformedCreateFixture.State.CreateIndexes = @('abc')
         $malformedCreateJournal = New-TargetJournal -Instance $malformedCreateFixture.Install
-        $malformedCreate = New-MuMuInstance -ManagerPath $malformedCreateFixture.Install.ManagerPath -Journal $malformedCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $malformedCreateFixture.State)
+        $malformedCreate = New-MuMuInstance -ManagerPath $malformedCreateFixture.Install.ManagerPath -Install $malformedCreateFixture.Install -Journal $malformedCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $malformedCreateFixture.State)
         Assert-Equal 'CriticalError' $malformedCreate.Status 'A create reporting an unparsable new index was accepted.'
 
         $baseCreateFixture = New-TargetFixture -Name 'base create'
         $baseCreateFixture.State.CreateIndexes = @('5')
         $baseCreateFixture.State.CreateIsMain = $true
         $baseCreateJournal = New-TargetJournal -Instance $baseCreateFixture.Install
-        $baseCreate = New-MuMuInstance -ManagerPath $baseCreateFixture.Install.ManagerPath -Journal $baseCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $baseCreateFixture.State)
+        $baseCreate = New-MuMuInstance -ManagerPath $baseCreateFixture.Install.ManagerPath -Install $baseCreateFixture.Install -Journal $baseCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $baseCreateFixture.State)
         Assert-Equal 'CriticalError' $baseCreate.Status 'A create reporting a base instance was accepted.'
         Assert-True ($baseCreate.Message -match 'non-base') "A base create result did not explain itself: $($baseCreate.Message)"
 
@@ -8284,7 +8363,7 @@ function Invoke-TargetTests {
         $versionCreateFixture.State.CreateIndexes = @('5')
         $versionCreateFixture.State.CreateAndroid = ' '
         $versionCreateJournal = New-TargetJournal -Instance $versionCreateFixture.Install
-        $versionCreate = New-MuMuInstance -ManagerPath $versionCreateFixture.Install.ManagerPath -Journal $versionCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $versionCreateFixture.State)
+        $versionCreate = New-MuMuInstance -ManagerPath $versionCreateFixture.Install.ManagerPath -Install $versionCreateFixture.Install -Journal $versionCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $versionCreateFixture.State)
         Assert-Equal 'CriticalError' $versionCreate.Status 'A create without a readable Android version was accepted.'
         Assert-True ($versionCreate.Message -match '(?i)android version') "An unreadable create version did not explain itself: $($versionCreate.Message)"
 
@@ -8292,7 +8371,7 @@ function Invoke-TargetTests {
         $diskCreateFixture.State.CreateIndexes = @('5')
         $diskCreateFixture.State.CreateCreatesDisk = $false
         $diskCreateJournal = New-TargetJournal -Instance $diskCreateFixture.Install
-        $diskCreate = New-MuMuInstance -ManagerPath $diskCreateFixture.Install.ManagerPath -Journal $diskCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $diskCreateFixture.State)
+        $diskCreate = New-MuMuInstance -ManagerPath $diskCreateFixture.Install.ManagerPath -Install $diskCreateFixture.Install -Journal $diskCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $diskCreateFixture.State)
         Assert-Equal 'CriticalError' $diskCreate.Status 'A create without a usable disk was accepted.'
         Assert-True ($diskCreate.Message -match '(?i)disk') "An unusable create disk did not explain itself: $($diskCreate.Message)"
 
@@ -8300,7 +8379,7 @@ function Invoke-TargetTests {
         $rootCreateFixture.State.CreateIndexes = @('5')
         $rootCreateFixture.State.CreateCreatesRoot = $false
         $rootCreateJournal = New-TargetJournal -Instance $rootCreateFixture.Install
-        $rootCreate = New-MuMuInstance -ManagerPath $rootCreateFixture.Install.ManagerPath -Journal $rootCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $rootCreateFixture.State)
+        $rootCreate = New-MuMuInstance -ManagerPath $rootCreateFixture.Install.ManagerPath -Install $rootCreateFixture.Install -Journal $rootCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $rootCreateFixture.State)
         Assert-Equal 'CriticalError' $rootCreate.Status 'A create without an instance root was accepted.'
 
         $outsideVmsFixture = New-TargetFixture -Name 'outside vms create'
@@ -8308,11 +8387,11 @@ function Invoke-TargetTests {
         $outsideVmsFixture.State.CreateVmsPath = (Join-Path $testRoot 'target fixtures\MuMu Global\elsewhere\vms')
         [void][IO.Directory]::CreateDirectory($outsideVmsFixture.State.CreateVmsPath)
         $outsideVmsJournal = New-TargetJournal -Instance $outsideVmsFixture.Install
-        $outsideVms = New-MuMuInstance -ManagerPath $outsideVmsFixture.Install.ManagerPath -Journal $outsideVmsJournal -Confirmed -Runner (New-SafetyManagerRunner -State $outsideVmsFixture.State)
-        Assert-Equal 'CriticalError' $outsideVms.Status 'A create outside the install boundary was accepted.'
+        $outsideVms = New-MuMuInstance -ManagerPath $outsideVmsFixture.Install.ManagerPath -Install $outsideVmsFixture.Install -Journal $outsideVmsJournal -Confirmed -Runner (New-SafetyManagerRunner -State $outsideVmsFixture.State)
+        Assert-Equal 'CriticalError' $outsideVms.Status 'A create outside the selected installation instance root was accepted.'
 
-        $cloneFixture = New-TargetFixture -Name 'clone'
-        $cloneState = New-SafetyManagerState -VmsPath $cloneFixture.VmsPath -Running $true
+        $cloneFixture = New-TargetFixture -Name 'clone' -Running
+        $cloneState = $cloneFixture.State
         $cloneSnapshotBefore = New-MenuSnapshot -Root $cloneFixture.Install.VmsPath
         $unconfirmedCloneJournal = New-TargetJournal -Instance $cloneFixture.Install
         $unconfirmedClone = Select-ToolkitTarget -Install $cloneFixture.Install -Journal $unconfirmedCloneJournal -Mode Clone -SourceIndex 3 -Runner (New-SafetyManagerRunner -State $cloneState)
@@ -8338,39 +8417,63 @@ function Invoke-TargetTests {
         $missingSourceJournal = New-TargetJournal -Instance $missingSourceFixture.Install
         $missingSource = Select-ToolkitTarget -Install $missingSourceFixture.Install -Journal $missingSourceJournal -Mode Clone -SourceIndex 9 -Confirmed -Runner (New-SafetyManagerRunner -State $missingSourceFixture.State)
         Assert-Equal 'CriticalError' $missingSource.Status 'A clone of an undiscovered source instance was accepted.'
-        Assert-True ($missingSource.Message -match 'not found') "A clone of an undiscovered source instance did not explain itself: $($missingSource.Message)"
         Assert-TargetManagerCommands -State $missingSourceFixture.State -AllowedVerbs @('info', 'setting') -Message 'A clone of an undiscovered source instance'
         Assert-Equal 0 @(@(Get-TargetManagerCommands -State $missingSourceFixture.State) | Where-Object { $_ -like 'clone|*' }).Count 'A clone of an undiscovered source instance reached the manager clone command.'
         $sourceLessFixture = New-TargetFixture -Name 'clone without source'
         $sourceLessJournal = New-TargetJournal -Instance $sourceLessFixture.Install
         $sourceLess = Select-ToolkitTarget -Install $sourceLessFixture.Install -Journal $sourceLessJournal -Mode Clone -Confirmed -Runner (New-SafetyManagerRunner -State $sourceLessFixture.State)
         Assert-Equal 'CriticalError' $sourceLess.Status 'A clone without a source instance index was accepted.'
+        Assert-True ($sourceLess.Message -match '(?i)explicit clone source') "A clone without a source index did not explain itself: $($sourceLess.Message)"
+        Assert-Equal 0 @(@(Get-TargetManagerCommands -State $sourceLessFixture.State) | Where-Object { $_ -like 'clone|*' }).Count 'A clone without a source instance index reached the manager clone command.'
+        $sourceLessPromptedJournal = New-TargetJournal -Instance $sourceLessFixture.Install
+        $sourceLessPrompted = Select-ToolkitTarget -Install $sourceLessFixture.Install -Journal $sourceLessPromptedJournal -Mode Clone -Prompt ({ '2' }).GetNewClosure() -Confirmed -Runner (New-SafetyManagerRunner -State $sourceLessFixture.State)
+        Assert-Equal 'Success' $sourceLessPrompted.Status "A prompted clone source selection failed: $($sourceLessPrompted.Message)"
+        Assert-Equal 3 $sourceLessPrompted.Data.SourceIndex 'A prompted clone source selection chose the wrong source instance.'
+
+        $baseSourceFixture = New-TargetFixture -Name 'clone base source'
+        $baseSourceJournal = New-TargetJournal -Instance $baseSourceFixture.Install
+        $baseSource = Select-ToolkitTarget -Install $baseSourceFixture.Install -Journal $baseSourceJournal -Mode Clone -SourceIndex 0 -Confirmed -Runner (New-SafetyManagerRunner -State $baseSourceFixture.State)
+        Assert-Equal 'CriticalError' $baseSource.Status 'A base instance was accepted as a clone source.'
+        Assert-Equal 0 @(@(Get-TargetManagerCommands -State $baseSourceFixture.State) | Where-Object { $_ -notmatch '^(info|setting)\|' }).Count 'A base clone source reached a mutating manager command.'
+
+        $oldSourceFixture = New-TargetFixture -Name 'clone old source'
+        foreach ($oldSourceInstance in @($oldSourceFixture.State.Instances)) {
+            if ([int]$oldSourceInstance.Index -eq 3) {
+                $oldSourceInstance.Android = '11.0'
+            }
+        }
+        $oldSourceJournal = New-TargetJournal -Instance $oldSourceFixture.Install
+        $oldSource = Select-ToolkitTarget -Install $oldSourceFixture.Install -Journal $oldSourceJournal -Mode Clone -SourceIndex 3 -Confirmed -Runner (New-SafetyManagerRunner -State $oldSourceFixture.State)
+        Assert-Equal 'CriticalError' $oldSource.Status 'An unsupported Android version was accepted as a clone source.'
+        Assert-Equal 0 @(@(Get-TargetManagerCommands -State $oldSourceFixture.State) | Where-Object { $_ -notmatch '^(info|setting)\|' }).Count 'An unsupported clone source reached a mutating manager command.'
 
         $defaultSourceFixture = New-TargetFixture -Name 'clone default source'
         $defaultSourceJournal = New-TargetJournal -Instance $defaultSourceFixture.Install
         $defaultSource = Select-ToolkitTarget -Install $defaultSourceFixture.Install -Journal $defaultSourceJournal -Mode Clone -InstanceIndex 3 -Confirmed -Runner (New-SafetyManagerRunner -State $defaultSourceFixture.State)
         Assert-Equal 'Success' $defaultSource.Status "A clone of the selected instance failed: $($defaultSource.Message)"
         Assert-Equal 3 $defaultSource.Data.SourceIndex 'A clone of the selected instance did not use the selected index as its source.'
+        $invalidInstall = Select-ToolkitTarget -Install $null -Journal (New-TargetJournal -Instance $defaultSourceFixture.Install) -Mode Clone -Confirmed -Runner (New-SafetyManagerRunner -State $defaultSourceFixture.State)
+        Assert-Equal 'CriticalError' $invalidInstall.Status 'A clone with an invalid install was accepted.'
 
-        $targetFlow = @{ Calls = @(); Confirmed = $false; SourceIndex = -1; StartIndex = 'absent' }
-        function New-MuMuInstance {
-            param([string]$ManagerPath, [object]$Journal, [int]$Count = 1, [object]$StartIndex = $null, [switch]$Confirmed, [scriptblock]$Runner = $null)
-            $targetFlow.Calls += 'Create'
-            $targetFlow.Confirmed = [bool]$Confirmed
-            if ($null -ne $StartIndex) {
-                $targetFlow.StartIndex = [string]$StartIndex
-            }
-            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed instance creation.' -Data @{ Index = 5; Name = 'Created instance'; AndroidVersion = '12.0'; Running = $false; DiskBytes = 4096; VmsPath = 'shadowed'; RequestedIndex = $null })
-        }
-        function New-InstanceClone {
-            param([string]$ManagerPath, [object]$Instance, [object]$Journal, [scriptblock]$Runner = $null)
-            $targetFlow.Calls += 'Clone'
-            $targetFlow.SourceIndex = [int]$Instance.Index
-            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed clone.' -Data @{ SourceIndex = [int]$Instance.Index; CloneIndex = 4; CloneName = 'Shadowed clone'; AndroidVersion = '12.0'; DiskBytes = 4096; VmsPath = 'shadowed' })
-        }
-
-        $controllerFixture = New-MenuInstallFixture -Name 'target controller' -InfoJson $script:MenuInfoJson12
-        $script:TargetFallbackRoots = @($controllerFixture.Install.InstallRoot)
+        $controllerIdentify = New-TargetFixture -Name 'controller identify'
+        $controllerCreate = New-TargetFixture -Name 'controller create'
+        $controllerCreate.State.CreateIndexes = @('5')
+        $controllerCreatePrompted = New-TargetFixture -Name 'controller create prompted'
+        $controllerCreatePrompted.State.CreateIndexes = @('5')
+        $controllerCreateExplicit = New-TargetFixture -Name 'controller create explicit'
+        $controllerCreateExplicit.State.CreateIndexes = @('5')
+        $controllerClone = New-TargetFixture -Name 'controller clone' -Running
+        $controllerClonePrompted = New-TargetFixture -Name 'controller clone prompted' -Running
+        $controllerCloneExplicit = New-TargetFixture -Name 'controller clone explicit' -Running
+        $script:TargetFallbackRoots = @(
+            $controllerIdentify.Install.InstallRoot
+            $controllerCreate.Install.InstallRoot
+            $controllerCreatePrompted.Install.InstallRoot
+            $controllerCreateExplicit.Install.InstallRoot
+            $controllerClone.Install.InstallRoot
+            $controllerClonePrompted.Install.InstallRoot
+            $controllerCloneExplicit.Install.InstallRoot
+        )
         function Get-ToolkitDiscoverySources {
             return @{
                 RegistryRoots = @('FixtureRegistry:\Target')
@@ -8386,29 +8489,81 @@ function Invoke-TargetTests {
 
         $controllerStateRoot = Join-Path $testRoot 'target controller state'
         [void][IO.Directory]::CreateDirectory($controllerStateRoot)
-        $controllerManagerCallsBefore = @(Get-MenuManagerCalls -Fixture $controllerFixture)
+        $absentInstallRoot = Join-Path $testRoot 'target fixtures\MuMu Global\absent install'
 
-        $missingMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot
+        $earlyMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $absentInstallRoot -StateRoot $controllerStateRoot -Mode 'Bogus'
+        Assert-Equal 'TARGET_MODE_INVALID' $earlyMode.Data.Code 'An unsupported mode was not rejected before installation discovery.'
+        Assert-True ($earlyMode.Message -notmatch 'installation was not discovered') 'The unsupported mode was rejected after installation discovery.'
+        $earlyMisuse = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $absentInstallRoot -StateRoot $controllerStateRoot -Mode 'Identify'
+        Assert-Equal 'TARGET_PARAMETER_MISUSE' $earlyMisuse.Data.Code 'A target parameter on another action was not rejected before installation discovery.'
+        $earlyStartIndex = Invoke-ToolkitAction -Action 'Target' -InstallRoot $absentInstallRoot -StateRoot $controllerStateRoot -Mode 'Create'
+        Assert-Equal 'TARGET_START_INDEX_REQUIRED' $earlyStartIndex.Data.Code 'A noninteractive create without a start index was not rejected before installation discovery.'
+        $earlyBlankStartIndex = Invoke-ToolkitAction -Action 'Target' -InstallRoot $absentInstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -StartIndex '  '
+        Assert-Equal 'TARGET_START_INDEX_REQUIRED' $earlyBlankStartIndex.Data.Code 'A noninteractive create with a blank start index was not rejected before installation discovery.'
+        Assert-Equal 0 @(@(Get-ToolkitJournalRecords -StateRoot $controllerStateRoot)).Count 'A refused target parameter created an operation journal.'
+
+        $missingMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot
         Assert-Equal 'CriticalError' $missingMode.Status 'A noninteractive target run without an explicit mode was accepted.'
         Assert-Equal 'TARGET_MODE_REQUIRED' $missingMode.Data.Code 'A noninteractive target run without an explicit mode did not report the missing mode.'
-        Assert-Equal 0 $targetFlow.Calls.Count "A refused target run called a mutating flow: $($targetFlow.Calls -join '|')"
+        Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerIdentify.State).Count "A target run without a mode reached a mutating manager command: $(@(Get-TargetManagerCommands -State $controllerIdentify.State) -join '|')"
 
-        $invalidControllerMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Bogus'
+        $invalidControllerMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Bogus'
         Assert-Equal 'CriticalError' $invalidControllerMode.Status 'A target run with an unsupported mode was accepted.'
-        Assert-Equal 0 $targetFlow.Calls.Count "A refused target mode called a mutating flow: $($targetFlow.Calls -join '|')"
+        Assert-Equal 'TARGET_MODE_INVALID' $invalidControllerMode.Data.Code 'A target run with an unsupported mode did not report the invalid mode.'
+        Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerIdentify.State).Count 'A target run with an unsupported mode reached a mutating manager command.'
 
-        $modeMisuse = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Identify'
+        $modeMisuse = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Identify'
         Assert-Equal 'CriticalError' $modeMisuse.Status 'A target parameter was accepted by another action.'
         Assert-Equal 'TARGET_PARAMETER_MISUSE' $modeMisuse.Data.Code 'A target parameter on another action did not report the misuse code.'
+        $sourceIndexMisuse = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -SourceIndex 2
+        Assert-Equal 'CriticalError' $sourceIndexMisuse.Status 'A target source parameter was accepted by another action.'
 
-        $identifyAction = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -InstanceIndex 2 -StateRoot $controllerStateRoot -Mode 'Identify'
+        $identifyAction = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerIdentify.Install.InstallRoot -InstanceIndex 2 -StateRoot $controllerStateRoot -Mode 'Identify' -Runner (New-SafetyManagerRunner -State $controllerIdentify.State)
         Assert-Equal 'Success' $identifyAction.Status "The Target action failed: $($identifyAction.Message)"
         Assert-Equal 'Identify' $identifyAction.Data.Mode 'The Target action did not report its mode.'
         Assert-Equal 2 $identifyAction.Data.Index 'The Target action did not report the target index.'
-        Assert-Equal 'Android 12' $identifyAction.Data.Name 'The Target action did not report the target name.'
+        Assert-Equal 'Other' $identifyAction.Data.Name 'The Target action did not report the target name.'
         Assert-Equal 'Global' $identifyAction.Data.Edition 'The Target action did not report the installation edition.'
         Assert-Equal '12.0' $identifyAction.Data.AndroidVersion 'The Target action did not report the Android version.'
+        Assert-True ((@(Format-ToolkitResult -Result $identifyAction) -join "`n") -match 'Instance 3 \| Target') 'The controller Target result did not render every discovered instance.'
+        Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerIdentify.State).Count "The controller Identify target mode issued a mutating manager command: $(@(Get-TargetManagerCommands -State $controllerIdentify.State) -join '|')"
         Assert-Equal 1 @(Get-ToolkitJournalRecords -StateRoot $controllerStateRoot | Where-Object { [string]$_.Operation -ceq 'Target' -and [string]$_.State -ceq 'Completed' }).Count 'The Target action did not keep exactly one completed target journal.'
+
+        $nonInteractiveStartIndex = Invoke-MenuAction -Action 'Target' -InstallRoot $absentInstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -LogPath (Join-Path $controllerStateRoot 'target.log')
+        Assert-Equal 'TARGET_START_INDEX_REQUIRED' $nonInteractiveStartIndex.Data.Code 'A noninteractive create target run without a start index was accepted.'
+        $nonInteractiveCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreate.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -StartIndex '5' -Runner (New-SafetyManagerRunner -State $controllerCreate.State)
+        Assert-Equal 'CriticalError' $nonInteractiveCreate.Status 'A noninteractive create target run without a confirmation was accepted.'
+        Assert-True ($nonInteractiveCreate.Message -match '(?i)confirm') 'A noninteractive create target run without a confirmation did not report the missing confirmation.'
+        Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerCreate.State).Count "A refused noninteractive controller create reached a mutating manager command: $(@(Get-TargetManagerCommands -State $controllerCreate.State) -join '|')"
+        $nonInteractiveClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClone.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Clone' -SourceIndex 3 -Runner (New-SafetyManagerRunner -State $controllerClone.State)
+        Assert-Equal 'CriticalError' $nonInteractiveClone.Status 'A noninteractive clone target run without a confirmation was accepted.'
+        Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerClone.State).Count "A refused noninteractive controller clone reached a mutating manager command: $(@(Get-TargetManagerCommands -State $controllerClone.State) -join '|')"
+        $nonInteractiveCloneSource = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClone.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Clone' -Confirmed -Runner (New-SafetyManagerRunner -State $controllerClone.State)
+        Assert-Equal 'CriticalError' $nonInteractiveCloneSource.Status 'A noninteractive clone target run without an explicit source was accepted.'
+        Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerClone.State).Count 'A noninteractive clone without a source reached a mutating manager command.'
+
+        $controllerCreateCalls = @($controllerCreate.State.Calls).Count
+        $confirmedCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreate.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -StartIndex '5' -Confirmed -Runner (New-SafetyManagerRunner -State $controllerCreate.State)
+        Assert-Equal 'Success' $confirmedCreate.Status "A confirmed controller create target run failed: $($confirmedCreate.Message)"
+        Assert-Equal 'Create' $confirmedCreate.Data.Mode 'A confirmed controller create target run did not report its mode.'
+        Assert-Equal 5 $confirmedCreate.Data.Index 'A confirmed controller create target run did not report the created index.'
+        Assert-True ([long]$confirmedCreate.Data.DiskBytes -gt 0) 'A confirmed controller create target run reported no usable disk.'
+        $controllerCreateCommands = @(Get-TargetManagerCommands -State $controllerCreate.State)
+        Assert-Equal 1 @($controllerCreateCommands | Where-Object { $_ -ceq 'create|-n|1' }).Count "A confirmed controller create target run issued an unexpected create command: $($controllerCreateCommands -join '|')"
+        Assert-Equal 2 @($controllerCreateCommands | Where-Object { $_ -ceq 'info|-v|all' }).Count "A confirmed controller create target run did not enumerate exactly twice: $($controllerCreateCommands -join '|')"
+        Assert-TargetManagerCommands -State $controllerCreate.State -AllowedVerbs @('info', 'setting', 'create') -Message 'A confirmed controller create target run'
+        Assert-True ((@($controllerCreate.State.Calls).Count) -gt $controllerCreateCalls) 'A confirmed controller create target run issued no manager request.'
+
+        $controllerCloneCommands = @(Get-TargetManagerCommands -State $controllerClone.State)
+        $confirmedClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClone.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Clone' -SourceIndex 3 -Confirmed -Runner (New-SafetyManagerRunner -State $controllerClone.State)
+        Assert-Equal 'Success' $confirmedClone.Status "A confirmed controller clone target run failed: $($confirmedClone.Message)"
+        Assert-Equal 'Clone' $confirmedClone.Data.Mode 'A confirmed controller clone target run did not report its mode.'
+        Assert-Equal 3 $confirmedClone.Data.SourceIndex 'A confirmed controller clone target run did not select the requested source instance.'
+        Assert-Equal 4 $confirmedClone.Data.Index 'A confirmed controller clone target run did not report the clone index.'
+        $controllerCloneCommands = @(Get-TargetManagerCommands -State $controllerClone.State)
+        Assert-Equal 1 @($controllerCloneCommands | Where-Object { $_ -ceq 'clone|-v|3|-n|1' }).Count "A confirmed controller clone target run issued an unexpected clone command: $($controllerCloneCommands -join '|')"
+        Assert-Equal 1 @($controllerCloneCommands | Where-Object { $_ -ceq 'control|-v|3|shutdown' }).Count "A confirmed controller clone target run issued an unexpected control command: $($controllerCloneCommands -join '|')"
+        Assert-TargetManagerCommands -State $controllerClone.State -AllowedVerbs @('info', 'setting', 'control', 'clone') -Message 'A confirmed controller clone target run'
 
         $targetPromptState = @{ Questions = @(); Answers = @() }
         $targetPrompt = {
@@ -8424,81 +8579,79 @@ function Invoke-TargetTests {
 
         $targetPromptState.Questions = @()
         $targetPromptState.Answers = @('Bogus')
-        $promptedInvalidMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt
+        $promptedInvalidMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerIdentify.State)
         Assert-Equal 'CriticalError' $promptedInvalidMode.Status 'A prompted target run with an unsupported answer was accepted.'
         Assert-True ((@($targetPromptState.Questions) -join '|') -match 'Identify, Create, or Clone') 'The target action did not ask for a mode.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'CONFIRM') 'An unsupported prompted mode asked for a mutation confirmation.'
 
         $targetPromptState.Questions = @()
-        $targetPromptState.Answers = @('Identify')
-        $promptedIdentify = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt
+        $targetPromptState.Answers = @('Identify', '1')
+        $promptedIdentify = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerIdentify.State)
         Assert-Equal 'Success' $promptedIdentify.Status "A prompted Identify target run failed: $($promptedIdentify.Message)"
         Assert-Equal 2 $promptedIdentify.Data.Index 'A prompted Identify target run chose the wrong instance.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -match 'Select the target MuMu instance') 'The Identify target mode did not ask for a target instance.'
         Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'CONFIRM') 'A prompted Identify target run asked for a mutation confirmation.'
 
         $targetPromptState.Questions = @()
         $targetPromptState.Answers = @('Create', '7', 'no')
-        $refusedCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt
+        $createMutationsBefore = @(Get-TargetMutatingCommands -State $controllerCreate.State).Count
+        $refusedCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreate.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerCreate.State)
         Assert-Equal 'CriticalError' $refusedCreate.Status 'A refused create target run was accepted.'
         Assert-True ((@($targetPromptState.Questions) -join '|') -match 'Free instance index') 'The create target mode did not ask for the new instance index.'
         Assert-True ((@($targetPromptState.Questions) -join '|') -match 'CONFIRM') 'The create target mode did not ask for an explicit confirmation.'
-        Assert-Equal 0 @($targetFlow.Calls | Where-Object { $_ -ceq 'Create' }).Count 'A refused create target run reached the creation flow.'
-        Assert-Equal $false $targetFlow.Confirmed 'A refused create target run reached the creation flow with a confirmation.'
+        Assert-Equal $createMutationsBefore @(Get-TargetMutatingCommands -State $controllerCreate.State).Count 'A refused create target run reached a mutating manager command.'
+
+        $targetPromptState.Questions = @()
+        $targetPromptState.Answers = @('Create', 'blank')
+        $createMutationsBefore = @(Get-TargetMutatingCommands -State $controllerCreate.State).Count
+        $blankIndexCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreate.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerCreate.State)
+        Assert-Equal 'TARGET_START_INDEX_INVALID' $blankIndexCreate.Data.Code 'A prompted create with a blank free instance index was accepted.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'CONFIRM') 'A blank free instance index asked for a mutation confirmation.'
+        Assert-Equal $createMutationsBefore @(Get-TargetMutatingCommands -State $controllerCreate.State).Count 'A blank free instance index reached a mutating manager command.'
 
         $targetPromptState.Questions = @()
         $targetPromptState.Answers = @('Create', '6', 'CONFIRM')
-        $targetFlow.Calls = @()
-        $targetFlow.Confirmed = $false
-        $targetFlow.StartIndex = 'absent'
-        $confirmedCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt
-        Assert-Equal 'Success' $confirmedCreate.Status "A confirmed create target run failed: $($confirmedCreate.Message)"
-        Assert-Equal 'Create' $confirmedCreate.Data.Mode 'A confirmed create target run did not report its mode.'
-        Assert-Equal 1 @($targetFlow.Calls | Where-Object { $_ -ceq 'Create' }).Count 'A confirmed create target run did not reach the creation flow exactly once.'
-        Assert-Equal $true $targetFlow.Confirmed 'A confirmed create target run did not pass the explicit confirmation.'
-        Assert-Equal '6' $targetFlow.StartIndex 'A confirmed create target run did not pass the answered start index.'
+        $confirmedPromptedCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreatePrompted.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerCreatePrompted.State)
+        Assert-Equal 'Success' $confirmedPromptedCreate.Status "A prompted confirmed create target run failed: $($confirmedPromptedCreate.Message)"
+        Assert-Equal 6 $confirmedPromptedCreate.Data.RequestedIndex 'A prompted confirmed create did not pass the answered free instance index.'
 
         $targetPromptState.Questions = @()
         $targetPromptState.Answers = @('CONFIRM')
-        $targetFlow.Calls = @()
-        $targetFlow.Confirmed = $false
-        $targetFlow.StartIndex = 'absent'
-        $explicitIndexCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -StartIndex '8' -Prompt $targetPrompt
+        $explicitIndexCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreateExplicit.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -StartIndex '8' -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerCreateExplicit.State)
         Assert-Equal 'Success' $explicitIndexCreate.Status "A create target run with an explicit start index failed: $($explicitIndexCreate.Message)"
-        Assert-Equal '8' $targetFlow.StartIndex 'A create target run with an explicit start index did not pass it through.'
+        Assert-Equal 8 $explicitIndexCreate.Data.RequestedIndex 'A create target run with an explicit start index did not pass it through.'
         Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'Free instance index') 'A create target run asked for a start index that was supplied as a parameter.'
 
         $targetPromptState.Questions = @()
-        $targetPromptState.Answers = @('Clone', 'no')
-        $refusedClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -InstanceIndex 2 -StateRoot $controllerStateRoot -Prompt $targetPrompt
-        Assert-Equal 'CriticalError' $refusedClone.Status 'A refused clone target run was accepted.'
-        Assert-True ((@($refusedClone.Message) -join ' ') -match '(?i)confirm') 'A refused clone target run did not report the missing confirmation.'
-        Assert-Equal 0 @($targetFlow.Calls | Where-Object { $_ -ceq 'Clone' }).Count 'A refused clone target run reached the clone flow.'
+        $targetPromptState.Answers = @('Clone', '9')
+        $cloneMutationsBefore = @(Get-TargetMutatingCommands -State $controllerClone.State).Count
+        $refusedCloneSource = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClone.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerClone.State)
+        Assert-Equal 'CriticalError' $refusedCloneSource.Status 'A prompted clone with an invalid source was accepted.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -match 'clone source MuMu instance') 'The clone target mode did not ask for a source instance.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'CONFIRM') 'An invalid prompted clone source asked for a mutation confirmation.'
+        Assert-Equal $cloneMutationsBefore @(Get-TargetMutatingCommands -State $controllerClone.State).Count 'A prompted clone with an invalid source reached a mutating manager command.'
 
         $targetPromptState.Questions = @()
-        $targetPromptState.Answers = @('Clone', 'CONFIRM')
-        $targetFlow.Calls = @()
-        $targetFlow.SourceIndex = -1
-        $confirmedClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -InstanceIndex 2 -StateRoot $controllerStateRoot -Prompt $targetPrompt
-        Assert-Equal 'Success' $confirmedClone.Status "A confirmed clone target run failed: $($confirmedClone.Message)"
-        Assert-Equal 'Clone' $confirmedClone.Data.Mode 'A confirmed clone target run did not report its mode.'
-        Assert-Equal 1 @($targetFlow.Calls | Where-Object { $_ -ceq 'Clone' }).Count 'A confirmed clone target run did not reach the clone flow exactly once.'
-        Assert-Equal 2 $targetFlow.SourceIndex 'A confirmed clone target run did not select the requested source instance.'
+        $targetPromptState.Answers = @('Clone', '2', 'no')
+        $cloneMutationsBefore = @(Get-TargetMutatingCommands -State $controllerClone.State).Count
+        $refusedClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClone.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerClone.State)
+        Assert-Equal 'CriticalError' $refusedClone.Status 'A declined clone confirmation was accepted.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -match 'CONFIRM') 'The declined clone did not ask for a confirmation.'
+        Assert-Equal $cloneMutationsBefore @(Get-TargetMutatingCommands -State $controllerClone.State).Count 'A declined clone confirmation reached a mutating manager command.'
 
-        $targetFlow.Calls = @()
-        $nonInteractiveStartIndex = Invoke-MenuAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -LogPath (Join-Path $controllerStateRoot 'target.log')
-        Assert-Equal 'CriticalError' $nonInteractiveStartIndex.Status 'A noninteractive create target run without a start index was accepted.'
-        Assert-Equal 'TARGET_START_INDEX_REQUIRED' $nonInteractiveStartIndex.Data.Code 'A noninteractive create target run without a start index did not report the missing index.'
-        $nonInteractiveCreate = Invoke-MenuAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -StartIndex '6' -LogPath (Join-Path $controllerStateRoot 'target.log')
-        Assert-Equal 'CriticalError' $nonInteractiveCreate.Status 'A noninteractive create target run without a confirmation was accepted.'
-        $nonInteractiveClone = Invoke-MenuAction -Action 'Target' -InstallRoot $controllerFixture.Install.InstallRoot -InstanceIndex 2 -StateRoot $controllerStateRoot -Mode 'Clone' -LogPath (Join-Path $controllerStateRoot 'target.log')
-        Assert-Equal 'CriticalError' $nonInteractiveClone.Status 'A noninteractive clone target run without a confirmation was accepted.'
-        Assert-Equal 0 @($targetFlow.Calls | Where-Object { $_ -in @('Create', 'Clone') }).Count "A noninteractive refused target run reached a mutating flow: $($targetFlow.Calls -join '|')"
+        $targetPromptState.Questions = @()
+        $targetPromptState.Answers = @('Clone', '2', 'CONFIRM')
+        $confirmedPromptedClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClonePrompted.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerClonePrompted.State)
+        Assert-Equal 'Success' $confirmedPromptedClone.Status "A prompted confirmed clone target run failed: $($confirmedPromptedClone.Message)"
+        Assert-Equal 3 $confirmedPromptedClone.Data.SourceIndex 'A prompted confirmed clone did not use the answered source instance.'
+        Assert-True (@(@(Get-TargetManagerCommands -State $controllerClonePrompted.State) | Where-Object { $_ -eq 'clone|-v|3|-n|1' }).Count -ge 1) 'A prompted confirmed clone did not reach the manager clone command.'
 
-        $controllerManagerCalls = @(Get-MenuManagerCalls -Fixture $controllerFixture)
-        $controllerManagerDelta = @($controllerManagerCalls | Select-Object -Skip $controllerManagerCallsBefore.Count)
-        Assert-True (@($controllerManagerDelta).Count -ge 1) 'The target action issued no manager request at all.'
-        foreach ($command in $controllerManagerDelta) {
-            Assert-True ($command -match '^(info|setting)\|') "The target action issued a mutating manager request: $command"
-        }
+        $targetPromptState.Questions = @()
+        $targetPromptState.Answers = @('CONFIRM')
+        $explicitSourceClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCloneExplicit.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Clone' -SourceIndex 3 -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerCloneExplicit.State)
+        Assert-Equal 'Success' $explicitSourceClone.Status "A clone target run with an explicit source index failed: $($explicitSourceClone.Message)"
+        Assert-Equal 3 $explicitSourceClone.Data.SourceIndex 'A clone target run with an explicit source index did not use it.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'clone source MuMu instance') 'A clone target run asked for a source that was supplied as a parameter.'
 
         $controllerCatalog = @(Get-ToolkitActionCatalog | ForEach-Object { [string]$_.Name })
         Assert-True ($controllerCatalog -ccontains 'Target') 'The action catalog does not offer the Target action.'
@@ -8614,15 +8767,26 @@ function Invoke-DocsTests {
             @{ Pattern = '-Mode Create'; Message = 'The target selection section has no noninteractive Create example.' }
             @{ Pattern = '-Mode Clone'; Message = 'The target selection section has no noninteractive Clone example.' }
             @{ Pattern = '-StartIndex'; Message = 'The target selection section does not document the start index parameter.' }
+            @{ Pattern = '-SourceIndex'; Message = 'The target selection section does not document the clone source parameter.' }
             @{ Pattern = '-InstanceIndex'; Message = 'The target selection section does not bind the reported target index to the later actions.' }
             @{ Pattern = '-Confirmed'; Message = 'The target selection section does not document the explicit confirmation switch.' }
+            @{ Pattern = '(?i)precondition, not an instruction'; Message = 'The target selection section does not state that the start index is a precondition rather than a manager argument.' }
+            @{ Pattern = '(?i)never sent to the manager'; Message = 'The target selection section does not state that the requested index is not sent to the manager.' }
+            @{ Pattern = '(?i)MuMu assigns the index itself'; Message = 'The target selection section does not state that the manager assigns the created index.' }
+            @{ Pattern = '(?i)`Index` in the result is the only authoritative index'; Message = 'The target selection section does not state that the returned index is authoritative.' }
+            @{ Pattern = '(?i)Always use the returned `Index` for later actions'; Message = 'The target selection section does not tell the operator to use the returned index for later actions.' }
+            @{ Pattern = '(?i)never the\s+requested index'; Message = 'The target selection section does not exclude the requested index as a later target.' }
+            @{ Pattern = 'RequestedIndex'; Message = 'The target selection section does not name the reported precondition field.' }
             @{ Pattern = '(?i)never overwrites an index'; Message = 'The target selection section does not state that Create never overwrites an index.' }
-            @{ Pattern = '(?i)never prompts and never confirms'; Message = 'The target selection section does not state that a noninteractive run never prompts or confirms.' }
+            @{ Pattern = '(?i)base instance, has an unsupported Android'; Message = 'The target selection section does not state which clone sources are refused.' }
+            @{ Pattern = '(?i)lists every discovered instance'; Message = 'The target selection section does not state that Identify lists every instance.' }
+            @{ Pattern = '(?i)noninteractive run never prompts and\s+never confirms'; Message = 'The target selection section does not state that a noninteractive run never prompts or confirms.' }
             @{ Pattern = 'TARGET_MODE_REQUIRED'; Message = 'The target selection section does not document the fail-closed code for a missing mode.' }
             @{ Pattern = 'TARGET_START_INDEX_REQUIRED'; Message = 'The target selection section does not document the fail-closed code for a missing start index.' }
         )) {
         Assert-True ($targetSection.Value -match $targetStatement.Pattern) $targetStatement.Message
     }
+    Assert-True ($targetSection.Value -notmatch '(?i)(use|pass|run)[^.\n]*requested index (for|as) ') 'The target selection section tells the operator to use the requested index for a later action.'
 
     Assert-True ($license -match 'MIT License') 'LICENSE is not the MIT license.'
     Assert-True ($license -match 'Permission is hereby granted, free of charge') 'LICENSE does not contain the MIT grant.'

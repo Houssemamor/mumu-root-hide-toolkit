@@ -1,3 +1,25 @@
+$script:ToolkitTargetModes = @('Identify', 'Create', 'Clone')
+
+function ConvertTo-ToolkitInstanceIndex {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    if ($Value -isnot [string] -and $Value -isnot [int] -and $Value -isnot [long]) {
+        return $null
+    }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+    $parsed = 0
+    if (-not [int]::TryParse($text, [ref]$parsed) -or $parsed -lt 0) {
+        return $null
+    }
+    return $parsed
+}
+
 function Get-ToolkitInstanceChoices {
     param(
         [object]$Install,
@@ -26,9 +48,50 @@ function Get-ToolkitInstanceChoices {
     return Get-ToolkitResult -Status 'Success' -Message "$($choices.Count) instance(s) were read from the selected installation. Nothing was changed." -Data $choices
 }
 
+function Resolve-ToolkitCloneSource {
+    param(
+        [object]$Install,
+        [int]$SourceIndex = -1,
+        [int]$InstanceIndex = -1,
+        [scriptblock]$Prompt = $null,
+        [scriptblock]$Runner = $null
+    )
+
+    if ($null -eq $Install -or $Install -is [Array]) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'Install is invalid.'
+    }
+    $managerPath = [string](Get-ToolkitFirstProperty -InputObject $Install -PropertyNames @('ManagerPath'))
+    $instances = @(Get-MuMuInstances -Install $Install -ManagerPath $managerPath -Runner $Runner)
+    if ($instances.Count -eq 1 -and $null -ne $instances[0].PSObject.Properties['Status']) {
+        return $instances[0]
+    }
+    $eligible = @($instances | Where-Object { $_.Eligible -eq $true })
+    $requestedIndex = $SourceIndex
+    if ($requestedIndex -lt 0) {
+        $requestedIndex = $InstanceIndex
+    }
+    $selection = $null
+    if ($requestedIndex -ge 0) {
+        $selection = [pscustomobject]@{ Index = $requestedIndex }
+    }
+    elseif ($eligible.Count -gt 1) {
+        $choice = Get-ToolkitMenuChoice -Label 'Select the clone source MuMu instance' -Count $eligible.Count -Prompt $Prompt
+        if ($null -eq $choice) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message "$($eligible.Count) eligible MuMu instances were found, so an explicit clone source is required. Pass -InstanceIndex or -SourceIndex to select one without a prompt. No instance was cloned."
+        }
+        $selection = [pscustomobject]@{ Index = [int]$eligible[$choice - 1].Index }
+    }
+    $resolved = Resolve-SelectedInstance -Instances $instances -Selection $selection
+    if ($null -ne $resolved.PSObject.Properties['Status']) {
+        return $resolved
+    }
+    return Get-ToolkitResult -Status 'Success' -Message "The clone source is the MuMu instance at index $([int]$resolved.Index)." -Data $resolved
+}
+
 function New-MuMuInstance {
     param(
         [string]$ManagerPath,
+        [object]$Install,
         [object]$Journal,
         [int]$Count = 1,
         [object]$StartIndex = $null,
@@ -57,38 +120,34 @@ function New-MuMuInstance {
     }
     $requestedIndex = $null
     if ($null -ne $StartIndex) {
-        $parsedStartIndex = 0
-        $startIndexText = ''
-        if ($StartIndex -is [string] -or $StartIndex -is [int] -or $StartIndex -is [long]) {
-            $startIndexText = ([string]$StartIndex).Trim()
-        }
-        if ([string]::IsNullOrWhiteSpace($startIndexText) -or
-            -not [int]::TryParse($startIndexText, [ref]$parsedStartIndex) -or
-            $parsedStartIndex -lt 0) {
+        $requestedIndex = ConvertTo-ToolkitInstanceIndex -Value $StartIndex
+        if ($null -eq $requestedIndex) {
             return New-ToolkitInstanceFailure -Journal $Journal -Message 'The requested start index must be a non-negative integer, so no instance was created.'
         }
-        $requestedIndex = $parsedStartIndex
     }
 
-    $installRoot = Get-ToolkitInstallRoot -Path $manager
-    if ($null -eq $installRoot -or -not (Test-ToolkitManagerFile -Path $manager -InstallRoot $installRoot)) {
+    if ($null -eq $Install -or $Install -is [Array]) {
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The create install is invalid.'
+    }
+    $installRootProperty = $Install.PSObject.Properties['InstallRoot']
+    $vmsProperty = $Install.PSObject.Properties['VmsPath']
+    if ($null -eq $installRootProperty -or $installRootProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($installRootProperty.Value) -or
+        $null -eq $vmsProperty -or $vmsProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($vmsProperty.Value)) {
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The create install paths are invalid.'
+    }
+    $installRoot = ConvertTo-ToolkitFullPath -Path $installRootProperty.Value
+    $vmsPath = ConvertTo-ToolkitFullPath -Path $vmsProperty.Value
+    if ($null -eq $installRoot -or -not (Test-Path -LiteralPath $installRoot -PathType Container) -or
+        $null -eq $vmsPath -or -not (Test-Path -LiteralPath $vmsPath -PathType Container)) {
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The create install paths are unavailable.'
+    }
+    if (-not (Test-ToolkitManagerFile -Path $manager -InstallRoot $installRoot)) {
         return New-ToolkitInstanceFailure -Journal $Journal -Message 'The create manager is not a valid MuMu manager inside the install root.'
     }
-    $edition = ''
-    try {
-        $edition = Get-ToolkitEdition -Text $installRoot -ExplicitEdition '' -AllowGenericMuMu
-    }
-    catch {
-        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The MuMu edition cannot be determined from the install root.'
-    }
-    try {
-        $vmsPath = Get-ToolkitVmsPath -InstallRoot $installRoot -CandidatePath '' -Edition $edition
-    }
-    catch {
-        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The instance root cannot be resolved for the selected installation.'
-    }
-    if ($null -eq $vmsPath) {
-        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The instance root cannot be resolved for the selected installation.'
+    $selectedManagerPath = [string](Get-ToolkitFirstProperty -InputObject $Install -PropertyNames @('ManagerPath'))
+    if (-not [string]::IsNullOrWhiteSpace($selectedManagerPath) -and
+        -not $manager.Equals((ConvertTo-ToolkitFullPath -Path $selectedManagerPath), [StringComparison]::OrdinalIgnoreCase)) {
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The create manager conflicts with the selected installation.'
     }
 
     $preRecords = @(Get-MuMuInstanceRecord -ManagerPath $manager -VersionArgument 'all' -Runner $Runner)
@@ -211,7 +270,7 @@ function Select-ToolkitTarget {
     if ($null -eq $Install -or $Install -is [Array]) {
         return New-ToolkitInstanceFailure -Journal $Journal -Message 'Install is invalid.'
     }
-    if (@('Identify', 'Create', 'Clone') -cnotcontains $Mode) {
+    if ($script:ToolkitTargetModes -cnotcontains $Mode) {
         return New-ToolkitInstanceFailure -Journal $Journal -Message 'The target mode must be Identify, Create, or Clone, so no instance was created or changed.'
     }
     if (-not $Confirmed -and $Mode -cne 'Identify') {
@@ -222,7 +281,7 @@ function Select-ToolkitTarget {
     $edition = [string](Get-ToolkitFirstProperty -InputObject $Install -PropertyNames @('Edition'))
 
     if ($Mode -ceq 'Create') {
-        $created = New-MuMuInstance -ManagerPath $managerPath -Journal $Journal -Count 1 -StartIndex $StartIndex -Confirmed -Runner $Runner
+        $created = New-MuMuInstance -ManagerPath $managerPath -Install $Install -Journal $Journal -Count 1 -StartIndex $StartIndex -Confirmed -Runner $Runner
         if ($created.Status -ne 'Success') {
             return $created
         }
@@ -250,22 +309,12 @@ function Select-ToolkitTarget {
     }
 
     if ($Mode -ceq 'Clone') {
-        $cloneSourceIndex = $SourceIndex
-        if ($cloneSourceIndex -lt 0) {
-            $cloneSourceIndex = $InstanceIndex
+        $source = Resolve-ToolkitCloneSource -Install $Install -SourceIndex $SourceIndex -InstanceIndex $InstanceIndex -Prompt $Prompt -Runner $Runner
+        if ($source.Status -ne 'Success') {
+            return $source
         }
-        if ($cloneSourceIndex -lt 0) {
-            return New-ToolkitInstanceFailure -Journal $Journal -Message 'A clone source instance index is required, so no instance was cloned.'
-        }
-        $sourceInstances = @(Get-MuMuInstances -Install $Install -ManagerPath $managerPath -Runner $Runner)
-        if ($sourceInstances.Count -eq 1 -and $null -ne $sourceInstances[0].PSObject.Properties['Status']) {
-            return $sourceInstances[0]
-        }
-        $sources = @($sourceInstances | Where-Object { [int]$_.Index -eq $cloneSourceIndex })
-        if ($sources.Count -ne 1) {
-            return New-ToolkitInstanceFailure -Journal $Journal -Message "The clone source instance at index $cloneSourceIndex was not found in the selected installation, so no instance was cloned."
-        }
-        $clone = New-InstanceClone -ManagerPath $managerPath -Instance $sources[0] -Journal $Journal -Runner $Runner
+        $cloneSourceIndex = [int]$source.Data.Index
+        $clone = New-InstanceClone -ManagerPath $managerPath -Instance $source.Data -Journal $Journal -Runner $Runner
         if ($clone.Status -ne 'Success') {
             return $clone
         }

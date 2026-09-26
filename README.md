@@ -72,7 +72,7 @@ the menu and the `-Action` value is ignored, so every example below passes both.
 | --- | --- | --- |
 | `Detect` | nothing in MuMu; reports installations and instances | `Run-MumuToolkit.bat -Action Detect -NonInteractive` |
 | `Verify` | nothing in MuMu; reports the read-only status of the selected instance | `Run-MumuToolkit.bat -Action Verify -NonInteractive` |
-| `Target` | `Identify` changes nothing; `Create` and `Clone` add exactly one MuMu instance | `Run-MumuToolkit.bat -Action Target -Mode Identify -NonInteractive` |
+| `Target` | `Identify` changes nothing; `Create` and `Clone` each add exactly one MuMu instance | `Run-MumuToolkit.bat -Action Target -Mode Identify -NonInteractive` |
 | `Root12` | the verified clone of an Android 12 instance | menu only; `-Action Root12 -NonInteractive` always returns `USER_CONFIRMATION_REQUIRED` |
 | `Root15` | the verified clone of an Android 15 instance | `Run-MumuToolkit.bat -Action Root15 -Confirmed -NonInteractive` |
 | `Conceal` | root visibility for explicitly selected apps on the verified clone | `Run-MumuToolkit.bat -Action Conceal -Packages com.example.app -NonInteractive` |
@@ -98,29 +98,38 @@ it never guesses: when more than one eligible instance exists it requires an exp
 
 | Mode | What it changes | Confirmation |
 | --- | --- | --- |
-| `Identify` | nothing in MuMu; reports every discovered instance with its index, name, Android version, running state, and eligibility | not required, because it is read-only |
-| `Create` | adds exactly one new instance at the index you name | required: the menu asks for the free index and then for `CONFIRM`, the command line requires `-StartIndex` and `-Confirmed` |
-| `Clone` | adds exactly one clone of a source instance, after stopping that source instance | required: the menu asks for `CONFIRM`, the command line requires `-Confirmed` |
+| `Identify` | nothing in MuMu; lists every discovered instance with its index, name, Android version, running state, and eligibility, then names the selected target | not required, because it is read-only |
+| `Create` | adds exactly one new instance, at the index MuMu actually assigns | required: the menu asks for a free index to insist on and then for `CONFIRM`, the command line requires `-StartIndex` and `-Confirmed` |
+| `Clone` | adds exactly one clone of a source instance, after stopping that source instance | required: the menu asks for `CONFIRM` once the source is known, the command line requires `-Confirmed` |
 
-The menu asks for the mode with the words `Identify`, `Create`, or `Clone`. A noninteractive run
-never prompts and never confirms anything, so it must carry the parameters itself:
+The menu asks for the mode with the words `Identify`, `Create`, or `Clone`. `Identify` and `Clone`
+ask which instance to use when more than one is eligible. A noninteractive run never prompts and
+never confirms anything, so it must carry the parameters itself:
 
 ```text
 Run-MumuToolkit.bat -Action Target -Mode Identify -InstanceIndex 2 -NonInteractive
 Run-MumuToolkit.bat -Action Target -Mode Create -StartIndex 5 -Confirmed -NonInteractive
-Run-MumuToolkit.bat -Action Target -Mode Clone -InstanceIndex 2 -Confirmed -NonInteractive
+Run-MumuToolkit.bat -Action Target -Mode Clone -SourceIndex 2 -Confirmed -NonInteractive
 ```
 
-`-Mode` and `-StartIndex` belong to `Target`; any other action refuses them. Without `-Mode` a
-noninteractive run changes nothing and reports `TARGET_MODE_REQUIRED`, and a noninteractive
-`Create` without `-StartIndex` reports `TARGET_START_INDEX_REQUIRED`.
+`-Mode`, `-StartIndex`, and `-SourceIndex` belong to `Target`; any other action refuses them.
+Without `-Mode` a noninteractive run changes nothing and reports `TARGET_MODE_REQUIRED`, a
+noninteractive `Create` without `-StartIndex` reports `TARGET_START_INDEX_REQUIRED`, and
+`Target Clone` refuses a source instance that is a base instance, has an unsupported Android
+version, or has an unknown state, so it never returns an unusable target.
 
-`Create` never overwrites an index. If `-StartIndex` names an index that already exists the action
-stops before the manager is called. After the manager reports the new instance, the action requires
-exactly one new index and verifies that it is a non-base instance with a readable Android version,
-a contained instance root, and a usable disk. `Clone` reuses the same verified clone flow that
-`Root12` and `Root15` use. Neither mode deletes, renames, or reconfigures any other instance, and
-both are recorded in the operation journal.
+`-StartIndex` is a precondition, not an instruction to the manager. The toolkit verifies that the
+index is free and refuses to continue when it is not, then asks MuMu to create one instance without
+sending the index at all. MuMu assigns the index itself, so the created index can differ from the
+requested one. The `Index` in the result is the only authoritative index; the result also echoes the
+precondition as `RequestedIndex`. Always use the returned `Index` for later actions, never the
+requested index.
+
+`Create` never overwrites an index and never deletes or renames anything. After the manager reports
+the new instance, the action requires exactly one new index and verifies that it is a non-base
+instance with a readable Android version, an instance root inside the selected installation, and a
+usable disk. `Clone` reuses the same verified clone flow that `Root12` and `Root15` use. Neither
+mode changes any other instance, and both are recorded in the operation journal.
 
 The reported target index is the value to pass to `-InstanceIndex` for `Root12`, `Root15`, and
 `Conceal`. `Target` does not store that choice: the toolkit never picks an instance on your behalf
@@ -135,7 +144,8 @@ Command-line parameters:
 | `-StateRoot <path>` | override `%LOCALAPPDATA%\mumu-root-hide-toolkit` |
 | `-Packages <a,b>` | the exact package names to conceal; required by `Conceal` |
 | `-Mode <mode>` | the `Target` mode: `Identify`, `Create`, or `Clone` |
-| `-StartIndex <n>` | the free index the `Target Create` mode must use; it is verified as unused and never overwritten |
+| `-SourceIndex <n>` | the `Target Clone` source instance; defaults to `-InstanceIndex` |
+| `-StartIndex <n>` | a free instance index that `Target Create` insists on before it calls the manager; it is never sent to the manager and never overwritten |
 | `-Confirmed` | the explicit confirmation required by `Root15`, `Target Create`, and `Target Clone` |
 | `-NonInteractive` | run one action and exit instead of opening the menu |
 | `-SkipToolbar` | omit the menu banner |
@@ -277,9 +287,9 @@ These are the honest limits of the current state of the code.
   blocked port makes the action fail closed rather than guess.
 - `Target Create` and `Target Clone` are the only actions that add an instance, and both depend on
   the manager accepting the `create` and `clone` commands with these exact arguments. The manager
-  may assign an index other than `-StartIndex`; the action verifies the index it actually reported
-  instead of assuming one. Neither mode has been exercised against a live MuMu installation from
-  this repository.
+  assigns the created index itself, so `Target Create` reports the index MuMu returned and never
+  assumes the requested index. Neither mode has been exercised against a live MuMu installation
+  from this repository.
 - Root concealment reduces package and module visibility. It is not attestation bypass, and
   there is no guarantee about Play Integrity, device integrity, or any other hardware-backed
   signal.

@@ -3,6 +3,7 @@ param(
     [string]$Action = '',
     [string]$InstallRoot = '',
     [int]$InstanceIndex = -1,
+    [int]$SourceIndex = -1,
     [string]$StateRoot = '',
     [string[]]$Packages = @(),
     [string]$Mode = '',
@@ -31,6 +32,7 @@ $script:ToolkitRegistryRoots = @(
     'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
 )
 $script:ToolkitRecoveryGuidance = 'Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.'
+$script:ToolkitInstanceChoiceLimit = 32
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
 . (Join-Path $PSScriptRoot 'Manifest.ps1')
@@ -317,11 +319,39 @@ function Invoke-ToolkitAdvertisements {
     return (Close-ToolkitActionJournal -Journal $journal -Result $suppressed)
 }
 
+function Get-ToolkitTargetParameterRefusal {
+    param(
+        [string]$Action,
+        [string]$Mode,
+        [object]$StartIndex,
+        [scriptblock]$Prompt
+    )
+
+    $requestedMode = ''
+    if (-not [string]::IsNullOrWhiteSpace($Mode)) {
+        $requestedMode = $Mode.Trim()
+    }
+    if ($Action -cne 'Target') {
+        if ([string]::IsNullOrWhiteSpace($requestedMode) -and $null -eq $StartIndex) {
+            return $null
+        }
+        return Get-ToolkitResult -Status 'CriticalError' -Message "-Mode and -StartIndex belong to the Target action, so the $Action action was not started." -Data (@{ Code = 'TARGET_PARAMETER_MISUSE' })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($requestedMode) -and $script:ToolkitTargetModes -cnotcontains $requestedMode) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The target mode must be Identify, Create, or Clone, so no instance was created or changed.' -Data (@{ Code = 'TARGET_MODE_INVALID' })
+    }
+    if ($requestedMode -ceq 'Create' -and $null -eq $Prompt -and $null -eq (ConvertTo-ToolkitInstanceIndex -Value $StartIndex)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive create target run requires an explicit -StartIndex that is a non-negative integer. No instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_REQUIRED' })
+    }
+    return $null
+}
+
 function Invoke-ToolkitTarget {
     param(
         [object]$Install,
         [string]$StateRoot,
         [int]$InstanceIndex = -1,
+        [int]$SourceIndex = -1,
         [string]$Mode = '',
         [object]$StartIndex = $null,
         [switch]$Confirmed,
@@ -329,23 +359,33 @@ function Invoke-ToolkitTarget {
         [scriptblock]$Runner = $null
     )
 
-    $targetMode = ''
-    if (-not [string]::IsNullOrWhiteSpace($Mode)) {
-        $targetMode = $Mode.Trim()
-    }
-    elseif ($null -ne $Prompt) {
+    $targetMode = $Mode
+    if ([string]::IsNullOrWhiteSpace($targetMode) -and $null -ne $Prompt) {
         $targetMode = ([string](& $Prompt 'Target mode: Identify, Create, or Clone')).Trim()
     }
     if ([string]::IsNullOrWhiteSpace($targetMode)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive target run requires an explicit mode. Pass -Mode Identify, -Mode Create, or -Mode Clone. No instance was created or changed.' -Data (@{ Code = 'TARGET_MODE_REQUIRED' })
     }
+    $modeRefusal = Get-ToolkitTargetParameterRefusal -Action 'Target' -Mode $targetMode -StartIndex $StartIndex -Prompt $Prompt
+    if ($null -ne $modeRefusal) {
+        return $modeRefusal
+    }
 
     $targetStartIndex = $StartIndex
-    if ($targetMode -ceq 'Create' -and $null -eq $targetStartIndex) {
-        if ($null -eq $Prompt) {
-            return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive create target run requires an explicit -StartIndex. No instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_REQUIRED' })
+    if ($targetMode -ceq 'Create' -and $null -eq (ConvertTo-ToolkitInstanceIndex -Value $targetStartIndex)) {
+        $targetStartIndex = ConvertTo-ToolkitInstanceIndex -Value ([string](& $Prompt 'Free instance index for the new instance'))
+        if ($null -eq $targetStartIndex) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The free instance index must be a non-negative integer, so no instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_INVALID' })
         }
-        $targetStartIndex = ([string](& $Prompt 'Free instance index for the new instance')).Trim()
+    }
+
+    $targetSourceIndex = $SourceIndex
+    if ($targetMode -ceq 'Clone') {
+        $source = Resolve-ToolkitCloneSource -Install $Install -SourceIndex $SourceIndex -InstanceIndex $InstanceIndex -Prompt $Prompt -Runner $Runner
+        if ($source.Status -ne 'Success') {
+            return $source
+        }
+        $targetSourceIndex = [int]$source.Data.Index
     }
 
     $targetConfirmed = $Confirmed
@@ -354,7 +394,7 @@ function Invoke-ToolkitTarget {
     }
 
     $journal = New-ToolkitActionJournal -StateRoot $StateRoot -Operation 'Target' -Instance $Install
-    $result = Select-ToolkitTarget -Install $Install -Journal $journal -Mode $targetMode -InstanceIndex $InstanceIndex -StartIndex $targetStartIndex -Confirmed:$targetConfirmed -Prompt $Prompt -Runner $Runner
+    $result = Select-ToolkitTarget -Install $Install -Journal $journal -Mode $targetMode -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StartIndex $targetStartIndex -Confirmed:$targetConfirmed -Prompt $Prompt -Runner $Runner
     return (Close-ToolkitActionJournal -Journal $journal -Result $result)
 }
 
@@ -364,6 +404,7 @@ function Invoke-ToolkitAction {
         [string]$Action,
         [string]$InstallRoot = '',
         [int]$InstanceIndex = -1,
+        [int]$SourceIndex = -1,
         [string]$StateRoot = '',
         [string[]]$Packages = @(),
         [string]$Mode = '',
@@ -376,6 +417,11 @@ function Invoke-ToolkitAction {
     $refusal = Get-ToolkitActionRefusal -Action $Action
     if ($null -ne $refusal) {
         return $refusal
+    }
+
+    $parameterRefusal = Get-ToolkitTargetParameterRefusal -Action $Action -Mode $Mode -StartIndex $StartIndex -Prompt $Prompt
+    if ($null -ne $parameterRefusal) {
+        return $parameterRefusal
     }
 
     $statePath = Get-ToolkitStatePath -Requested $StateRoot -Create
@@ -393,11 +439,7 @@ function Invoke-ToolkitAction {
     }
 
     if ($Action -ceq 'Target') {
-        return (Invoke-ToolkitTarget -Install $install.Data -StateRoot $statePath -InstanceIndex $InstanceIndex -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt -Runner $Runner)
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($Mode) -or -not [string]::IsNullOrWhiteSpace($StartIndex)) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message "-Mode and -StartIndex belong to the Target action, so the $Action action was not started." -Data (@{ Code = 'TARGET_PARAMETER_MISUSE' })
+        return (Invoke-ToolkitTarget -Install $install.Data -StateRoot $statePath -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt -Runner $Runner)
     }
 
     $instance = Resolve-ToolkitInstance -Install $install.Data -InstanceIndex $InstanceIndex -Prompt $Prompt
@@ -465,6 +507,33 @@ function Invoke-ToolkitAction {
     return Get-ToolkitResult -Status 'CriticalError' -Message "The requested action has no implementation: $Action" -Data (@{ Code = 'ACTION_UNKNOWN'; Requested = Protect-ToolkitText $Action })
 }
 
+function Format-ToolkitInstanceChoices {
+    param([object]$Choices)
+
+    $lines = @()
+    $records = @($Choices)
+    $listed = 0
+    foreach ($instance in $records) {
+        if ($listed -ge $script:ToolkitInstanceChoiceLimit) {
+            break
+        }
+        if ($null -eq $instance -or $null -eq $instance.PSObject) {
+            continue
+        }
+        $name = Protect-ToolkitText ([string](Get-ToolkitRecordValue -Record $instance -PropertyNames @('Name')))
+        $lines += ('  Instance ' + [string](Get-ToolkitRecordValue -Record $instance -PropertyNames @('Index')) +
+            ' | ' + $name +
+            ' | Android ' + [string](Get-ToolkitRecordValue -Record $instance -PropertyNames @('AndroidVersion')) +
+            ' | Running ' + [string](Get-ToolkitRecordValue -Record $instance -PropertyNames @('Running')) +
+            ' | Eligible ' + [string](Get-ToolkitRecordValue -Record $instance -PropertyNames @('Eligible')))
+        $listed++
+    }
+    if ($records.Count -gt $listed) {
+        $lines += ('  ' + ($records.Count - $listed) + ' more instance(s) were not listed. Run the read-only report for the full list.')
+    }
+    return $lines
+}
+
 function Format-ToolkitResult {
     param([object]$Result)
 
@@ -472,13 +541,16 @@ function Format-ToolkitResult {
     $data = $Result.Data
     if ($null -ne $data -and $data -is [Collections.IDictionary]) {
         foreach ($key in @($data.Keys | Sort-Object)) {
-            if ([string]$key -ceq 'Log') {
+            if ([string]$key -ceq 'Log' -or [string]$key -ceq 'Instances') {
                 continue
             }
             $value = $data[$key]
             if ($value -is [string] -or $value -is [bool] -or $value -is [int] -or $value -is [long]) {
                 $lines += ('  ' + [string]$key + ' = ' + [string]$value)
             }
+        }
+        if ($data.Contains('Instances')) {
+            $lines += @(Format-ToolkitInstanceChoices -Choices $data['Instances'])
         }
         if ($data.Contains('Log') -and -not [string]::IsNullOrWhiteSpace([string]$data['Log'])) {
             $lines += ('  Log: ' + [string]$data['Log'])
@@ -496,6 +568,7 @@ function Invoke-MenuAction {
         [string]$Action,
         [string]$InstallRoot = '',
         [int]$InstanceIndex = -1,
+        [int]$SourceIndex = -1,
         [string]$StateRoot = '',
         [string[]]$Packages = @(),
         [string]$Mode = '',
@@ -517,7 +590,7 @@ function Invoke-MenuAction {
                 $result = & $Runner $Action
             }
             else {
-                $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt
+                $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt
             }
         }
         catch {
@@ -636,6 +709,7 @@ function Start-ToolkitController {
         [string]$Action = '',
         [string]$InstallRoot = '',
         [int]$InstanceIndex = -1,
+        [int]$SourceIndex = -1,
         [string]$StateRoot = '',
         [string[]]$Packages = @(),
         [string]$Mode = '',
@@ -674,7 +748,7 @@ function Start-ToolkitController {
             }
             return (Get-ToolkitExitCode $result)
         }
-        $result = Invoke-MenuAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -LogPath $logPath
+        $result = Invoke-MenuAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $statePath -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -LogPath $logPath
         foreach ($line in @(Format-ToolkitResult -Result $result)) {
             & $write $line
         }
@@ -705,11 +779,12 @@ function Start-ToolkitController {
             }
             $targetMode = ''
             $targetStartIndex = $null
+            $targetSourceIndex = $SourceIndex
             if ($Choice -ceq 'Target') {
                 $targetMode = $Mode
                 $targetStartIndex = $StartIndex
             }
-            return (Invoke-ToolkitAction -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -Prompt $ask)
+            return (Invoke-ToolkitAction -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -Prompt $ask)
         }.GetNewClosure()
     }
 
@@ -727,5 +802,5 @@ function Start-ToolkitController {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar)
+    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar)
 }
