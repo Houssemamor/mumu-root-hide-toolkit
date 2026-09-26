@@ -236,7 +236,7 @@ function Measure-MuMuInstanceDiskBytes {
     return $total
 }
 
-function New-InstanceCloneFailure {
+function New-ToolkitInstanceFailure {
     param(
         [object]$Journal,
         [string]$Message
@@ -244,7 +244,7 @@ function New-InstanceCloneFailure {
 
     $message = Protect-ToolkitText $Message
     if ([string]::IsNullOrWhiteSpace($message)) {
-        $message = 'Clone verification failed.'
+        $message = 'The instance operation failed.'
     }
     $result = Get-ToolkitResult -Status 'CriticalError' -Message $message
     if ($null -eq $Journal) {
@@ -307,56 +307,56 @@ function New-InstanceClone {
 
     $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
     if ($null -eq $manager -or -not (Test-ToolkitManagerName -Path $manager)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone manager must be MuMuManager.exe.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone manager must be MuMuManager.exe.'
     }
     if ($null -eq $Journal) {
-        return New-InstanceCloneFailure -Journal $null -Message 'A clone journal is required.'
+        return New-ToolkitInstanceFailure -Journal $null -Message 'A clone journal is required.'
     }
     try {
         Assert-OperationJournal $Journal
     }
     catch {
-        return New-InstanceCloneFailure -Journal $null -Message 'The clone journal is invalid.'
+        return New-ToolkitInstanceFailure -Journal $null -Message 'The clone journal is invalid.'
     }
     if ($null -eq $Instance -or $Instance -is [Array] -or $Instance -isnot [pscustomobject]) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance is invalid.'
     }
     $indexProperty = $Instance.PSObject.Properties['Index']
     if ($null -eq $indexProperty -or
         ($indexProperty.Value -isnot [string] -and $indexProperty.Value -isnot [int] -and $indexProperty.Value -isnot [long])) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance index is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance index is invalid.'
     }
     $sourceIndex = 0
     if (-not [int]::TryParse([string]$indexProperty.Value, [ref]$sourceIndex) -or $sourceIndex -lt 0) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance index is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance index is invalid.'
     }
     $nameProperty = $Instance.PSObject.Properties['Name']
     if ($null -eq $nameProperty -or $nameProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($nameProperty.Value)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance name is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance name is invalid.'
     }
     $sourceName = [string]$nameProperty.Value
     $installProperty = $Instance.PSObject.Properties['Install']
     if ($null -eq $installProperty -or $null -eq $installProperty.Value -or $installProperty.Value -isnot [pscustomobject]) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance install is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance install is invalid.'
     }
     $installRootProperty = $installProperty.Value.PSObject.Properties['InstallRoot']
     if ($null -eq $installRootProperty -or $installRootProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($installRootProperty.Value)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance install root is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance install root is invalid.'
     }
     $installRoot = ConvertTo-ToolkitFullPath -Path $installRootProperty.Value
     if ($null -eq $installRoot -or -not (Test-Path -LiteralPath $installRoot -PathType Container)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance install root is unavailable.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance install root is unavailable.'
     }
     if (-not (Test-ToolkitManagerFile -Path $manager -InstallRoot $installRoot)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone manager is not a valid MuMu manager inside the install root.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone manager is not a valid MuMu manager inside the install root.'
     }
     $vmsProperty = $installProperty.Value.PSObject.Properties['VmsPath']
     if ($null -eq $vmsProperty -or $vmsProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($vmsProperty.Value)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance VMS path is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance VMS path is invalid.'
     }
     $vmsPath = ConvertTo-ToolkitFullPath -Path $vmsProperty.Value
     if ($null -eq $vmsPath -or -not (Test-Path -LiteralPath $vmsPath -PathType Container)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance VMS path is unavailable.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance VMS path is unavailable.'
     }
     $versionProperty = $Instance.PSObject.Properties['AndroidVersion']
     $sourceVersionValue = $null
@@ -365,12 +365,12 @@ function New-InstanceClone {
     }
     $sourceVersion = ConvertTo-ToolkitAndroidVersion -Value $sourceVersionValue
     if ($null -eq $sourceVersion) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance Android version is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance Android version is invalid.'
     }
 
     $preRecords = @(Get-MuMuInstanceRecord -ManagerPath $manager -VersionArgument 'all' -Runner $Runner)
     if ($preRecords.Count -eq 0) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The MuMu manager did not report instance state.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The MuMu manager did not report instance state.'
     }
     $preIndexes = @{}
     $preNames = @()
@@ -379,7 +379,7 @@ function New-InstanceClone {
         $preIndexProperty = $preRecord.PSObject.Properties['index']
         $parsedIndex = 0
         if ($null -eq $preIndexProperty -or -not [int]::TryParse([string]$preIndexProperty.Value, [ref]$parsedIndex) -or $parsedIndex -lt 0) {
-            return New-InstanceCloneFailure -Journal $Journal -Message 'The MuMu manager returned an invalid instance index.'
+            return New-ToolkitInstanceFailure -Journal $Journal -Message 'The MuMu manager returned an invalid instance index.'
         }
         $preIndexes[[string]$parsedIndex] = $true
         $preNameProperty = $preRecord.PSObject.Properties['name']
@@ -389,46 +389,46 @@ function New-InstanceClone {
         }
     }
     if ($sourceRecords.Count -ne 1) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The MuMu manager did not report exactly one source instance.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The MuMu manager did not report exactly one source instance.'
     }
 
     $sourceRunning = Get-MuMuInstanceRunningState -Record $sourceRecords[0]
     if ($null -eq $sourceRunning) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance running state is unknown.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance running state is unknown.'
     }
     if ($sourceRunning) {
         $shutdown = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('control', '-v', [string]$sourceIndex, 'shutdown') -Runner $Runner
         if ($null -eq $shutdown -or $shutdown.ExitCode -ne 0) {
-            return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance did not accept a shutdown request.'
+            return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance did not accept a shutdown request.'
         }
     }
     if (-not (Wait-MuMuInstanceStopped -ManagerPath $manager -Index $sourceIndex -Runner $Runner)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The source instance did not reach a stable stopped state.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The source instance did not reach a stable stopped state.'
     }
 
     $clone = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('clone', '-v', [string]$sourceIndex, '-n', '1') -Runner $Runner
     if ($null -eq $clone -or $clone.ExitCode -ne 0) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The MuMu manager clone command failed.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The MuMu manager clone command failed.'
     }
 
     $postRecords = @(Get-MuMuInstanceRecord -ManagerPath $manager -VersionArgument 'all' -Runner $Runner)
     $newRecords = @($postRecords | Where-Object { -not $preIndexes.ContainsKey([string]$_.index) })
     if ($newRecords.Count -ne 1) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The MuMu manager did not report exactly one new instance after the clone.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The MuMu manager did not report exactly one new instance after the clone.'
     }
     $cloneRecord = $newRecords[0]
     $cloneIndex = 0
     if (-not [int]::TryParse([string]$cloneRecord.index, [ref]$cloneIndex) -or $cloneIndex -lt 0) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance index is invalid.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance index is invalid.'
     }
     $cloneNameProperty = $cloneRecord.PSObject.Properties['name']
     if ($null -eq $cloneNameProperty -or $cloneNameProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($cloneNameProperty.Value)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance name is missing.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance name is missing.'
     }
     $cloneName = [string]$cloneNameProperty.Value
     foreach ($preName in $preNames) {
         if ($preName -cne $sourceName -and $preName -ceq $cloneName) {
-            return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance name collides with an existing instance.'
+            return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance name collides with an existing instance.'
         }
     }
 
@@ -436,43 +436,43 @@ function New-InstanceClone {
     if (-not [string]::IsNullOrWhiteSpace($reportedVmsPath)) {
         $reportedRoot = Get-ToolkitMetadataPath -Path $reportedVmsPath -Root $vmsPath
         if ($null -eq $reportedRoot) {
-            return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance VMS path is invalid.'
+            return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance VMS path is invalid.'
         }
         if (-not (Test-ToolkitPathWithinRoot -Path $reportedRoot -Root $vmsPath)) {
-            return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance VMS path is outside the source install boundary.'
+            return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance VMS path is outside the source install boundary.'
         }
     }
     $cloneRoot = Get-MuMuInstanceRootPath -VmsPath $vmsPath -Index $cloneIndex -ReportedVmsPath $reportedVmsPath
     if ($null -eq $cloneRoot) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance VMS root is missing.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance VMS root is missing.'
     }
     if (-not (Test-ToolkitPathWithinRoot -Path $cloneRoot -Root $vmsPath)) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance VMS root is outside the source install boundary.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance VMS root is outside the source install boundary.'
     }
     $cloneVersion = ConvertTo-ToolkitAndroidVersion -Value (Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('android_version', 'androidVersion', 'system_version', 'systemVersion'))
     if ($null -eq $cloneVersion) {
         $cloneVersion = Get-ToolkitInstanceAndroidVersion -VmsPath $vmsPath -Index $cloneIndex
     }
     if ($null -eq $cloneVersion) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance Android version could not be verified.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance Android version could not be verified.'
     }
     if ($cloneVersion -cne $sourceVersion) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance Android version does not match the source instance.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance Android version does not match the source instance.'
     }
 
     $diskBytes = Measure-MuMuInstanceDiskBytes -InstanceRoot $cloneRoot
     if ($null -eq $diskBytes) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance disk could not be measured.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance disk could not be measured.'
     }
     if ($diskBytes -le 0) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance does not have a usable disk.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance does not have a usable disk.'
     }
     $cloneIsMain = ConvertTo-ToolkitBoolean -Value (Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('is_main'))
     if ($cloneIsMain -ne $false) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance is not a reported non-base instance.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance is not a reported non-base instance.'
     }
     if ((Get-MuMuInstanceRunningState -Record $cloneRecord) -ne $false) {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The clone instance is not reported in a stopped state.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The clone instance is not reported in a stopped state.'
     }
 
     $cloneData = @{
@@ -490,7 +490,7 @@ function New-InstanceClone {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message $cloneMessage -Data $cloneData
     }
     catch {
-        return New-InstanceCloneFailure -Journal $Journal -Message 'The verified clone could not be journaled.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'The verified clone could not be journaled.'
     }
     return Get-ToolkitResult -Status 'Success' -Message $cloneMessage -Data $cloneData
 }

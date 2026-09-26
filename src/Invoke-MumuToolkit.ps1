@@ -5,16 +5,19 @@ param(
     [int]$InstanceIndex = -1,
     [string]$StateRoot = '',
     [string[]]$Packages = @(),
+    [string]$Mode = '',
+    [object]$StartIndex = $null,
     [switch]$Confirmed,
     [switch]$NonInteractive,
     [switch]$SkipToolbar
 )
 
-$script:ToolkitActions = @('Detect', 'Verify', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
-$script:ToolkitDispatchedActions = @('Detect', 'Verify', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+$script:ToolkitActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+$script:ToolkitDispatchedActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
 $script:ToolkitActionDescriptions = @{
     Detect    = 'Discover MuMu installations and instances and report their state.'
     Verify    = 'Collect the read-only status report for the selected instance.'
+    Target    = 'Identify the instance to work on, or create or clone one. Identify changes nothing; Create and Clone need an explicit confirmation.'
     Root12    = 'Root an Android 12 instance with the pinned Kitsune release on a verified clone.'
     Root15    = 'Enable the built-in Android 15 root on a verified clone.'
     Conceal   = 'Apply the Root concealment template to explicitly selected apps on a verified clone.'
@@ -40,6 +43,7 @@ $script:ToolkitRecoveryGuidance = 'Recovery: run Verify for a read-only report, 
 . (Join-Path $PSScriptRoot 'Root12.ps1')
 . (Join-Path $PSScriptRoot 'Root15.ps1')
 . (Join-Path $PSScriptRoot 'Concealment.ps1')
+. (Join-Path $PSScriptRoot 'Target.ps1')
 
 function Get-ToolkitActionCatalog {
     $catalog = @()
@@ -313,6 +317,47 @@ function Invoke-ToolkitAdvertisements {
     return (Close-ToolkitActionJournal -Journal $journal -Result $suppressed)
 }
 
+function Invoke-ToolkitTarget {
+    param(
+        [object]$Install,
+        [string]$StateRoot,
+        [int]$InstanceIndex = -1,
+        [string]$Mode = '',
+        [object]$StartIndex = $null,
+        [switch]$Confirmed,
+        [scriptblock]$Prompt = $null,
+        [scriptblock]$Runner = $null
+    )
+
+    $targetMode = ''
+    if (-not [string]::IsNullOrWhiteSpace($Mode)) {
+        $targetMode = $Mode.Trim()
+    }
+    elseif ($null -ne $Prompt) {
+        $targetMode = ([string](& $Prompt 'Target mode: Identify, Create, or Clone')).Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($targetMode)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive target run requires an explicit mode. Pass -Mode Identify, -Mode Create, or -Mode Clone. No instance was created or changed.' -Data (@{ Code = 'TARGET_MODE_REQUIRED' })
+    }
+
+    $targetStartIndex = $StartIndex
+    if ($targetMode -ceq 'Create' -and $null -eq $targetStartIndex) {
+        if ($null -eq $Prompt) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive create target run requires an explicit -StartIndex. No instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_REQUIRED' })
+        }
+        $targetStartIndex = ([string](& $Prompt 'Free instance index for the new instance')).Trim()
+    }
+
+    $targetConfirmed = $Confirmed
+    if (-not $targetConfirmed -and $null -ne $Prompt -and $targetMode -cne 'Identify') {
+        $targetConfirmed = ([string](& $Prompt "Type CONFIRM to run the target mode $targetMode") -ceq 'CONFIRM')
+    }
+
+    $journal = New-ToolkitActionJournal -StateRoot $StateRoot -Operation 'Target' -Instance $Install
+    $result = Select-ToolkitTarget -Install $Install -Journal $journal -Mode $targetMode -InstanceIndex $InstanceIndex -StartIndex $targetStartIndex -Confirmed:$targetConfirmed -Prompt $Prompt -Runner $Runner
+    return (Close-ToolkitActionJournal -Journal $journal -Result $result)
+}
+
 function Invoke-ToolkitAction {
     param(
         [Parameter(Mandatory = $true)]
@@ -321,6 +366,8 @@ function Invoke-ToolkitAction {
         [int]$InstanceIndex = -1,
         [string]$StateRoot = '',
         [string[]]$Packages = @(),
+        [string]$Mode = '',
+        [object]$StartIndex = $null,
         [switch]$Confirmed,
         [scriptblock]$Prompt = $null,
         [scriptblock]$Runner = $null
@@ -343,6 +390,14 @@ function Invoke-ToolkitAction {
 
     if ($Action -ceq 'RemoveAds' -or $Action -ceq 'Restore') {
         return (Invoke-ToolkitAdvertisements -Install $install.Data -StateRoot $statePath -Restore:($Action -ceq 'Restore'))
+    }
+
+    if ($Action -ceq 'Target') {
+        return (Invoke-ToolkitTarget -Install $install.Data -StateRoot $statePath -InstanceIndex $InstanceIndex -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt -Runner $Runner)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Mode) -or -not [string]::IsNullOrWhiteSpace($StartIndex)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message "-Mode and -StartIndex belong to the Target action, so the $Action action was not started." -Data (@{ Code = 'TARGET_PARAMETER_MISUSE' })
     }
 
     $instance = Resolve-ToolkitInstance -Install $install.Data -InstanceIndex $InstanceIndex -Prompt $Prompt
@@ -443,6 +498,8 @@ function Invoke-MenuAction {
         [int]$InstanceIndex = -1,
         [string]$StateRoot = '',
         [string[]]$Packages = @(),
+        [string]$Mode = '',
+        [object]$StartIndex = $null,
         [switch]$Confirmed,
         [scriptblock]$Prompt = $null,
         [scriptblock]$Runner = $null,
@@ -460,7 +517,7 @@ function Invoke-MenuAction {
                 $result = & $Runner $Action
             }
             else {
-                $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $StateRoot -Packages $Packages -Confirmed:$Confirmed -Prompt $Prompt
+                $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt
             }
         }
         catch {
@@ -581,6 +638,8 @@ function Start-ToolkitController {
         [int]$InstanceIndex = -1,
         [string]$StateRoot = '',
         [string[]]$Packages = @(),
+        [string]$Mode = '',
+        [object]$StartIndex = $null,
         [switch]$Confirmed,
         [switch]$NonInteractive,
         [switch]$SkipToolbar,
@@ -615,7 +674,7 @@ function Start-ToolkitController {
             }
             return (Get-ToolkitExitCode $result)
         }
-        $result = Invoke-MenuAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $Packages -Confirmed:$Confirmed -LogPath $logPath
+        $result = Invoke-MenuAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -LogPath $logPath
         foreach ($line in @(Format-ToolkitResult -Result $result)) {
             & $write $line
         }
@@ -644,13 +703,20 @@ function Start-ToolkitController {
             if ($Choice -ceq 'Root15' -and -not $confirmed) {
                 $confirmed = ([string](& $ask 'Type CONFIRM to enable the built-in Android 15 root') -ceq 'CONFIRM')
             }
-            return (Invoke-ToolkitAction -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $selectedPackages -Confirmed:$confirmed -Prompt $ask)
+            $targetMode = ''
+            $targetStartIndex = $null
+            if ($Choice -ceq 'Target') {
+                $targetMode = $Mode
+                $targetStartIndex = $StartIndex
+            }
+            return (Invoke-ToolkitAction -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -Prompt $ask)
         }.GetNewClosure()
     }
 
     if (-not $SkipToolbar) {
         & $write 'MuMu Root Hide Toolkit'
         & $write 'Detect and Verify change nothing.'
+        & $write 'Target identifies the instance to work on, or creates or clones one. Identify changes nothing; Create and Clone ask for CONFIRM first and are the only ways this toolkit adds an instance.'
         & $write 'Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone. Conceal changes only the verified clone.'
         & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
         foreach ($entry in @(Get-ToolkitActionCatalog)) {
@@ -661,5 +727,5 @@ function Start-ToolkitController {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $StateRoot -Packages $Packages -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar)
+    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar)
 }

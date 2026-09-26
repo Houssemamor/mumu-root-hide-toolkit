@@ -964,7 +964,8 @@ function Get-MuMuRootSetting {
 function Get-MuMuInstances {
     param(
         [object]$Install,
-        [string]$ManagerPath
+        [string]$ManagerPath,
+        [scriptblock]$Runner = $null
     )
 
     if ($null -eq $Install -or $Install -is [Array]) {
@@ -1038,7 +1039,7 @@ function Get-MuMuInstances {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Manager paths conflict.'
     }
 
-    $managerResult = Invoke-CheckedProcess -FilePath $resolvedManagerPath -ArgumentList @('info', '-v', 'all')
+    $managerResult = Invoke-CheckedProcess -FilePath $resolvedManagerPath -ArgumentList @('info', '-v', 'all') -Runner $Runner
     if ($null -eq $managerResult -or $managerResult.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'MuMu manager query failed.'
     }
@@ -1155,7 +1156,7 @@ function Get-MuMuInstances {
             $null -ne $managerRecord.PSObject.Properties['rootSetting']
         $rootSetting = $null
         if ($hasReportedRootSetting -or $eligible) {
-            $rootSetting = Get-MuMuRootSetting -ManagerPath $resolvedManagerPath -Index $indexedRecord.Index -InfoRecord $managerRecord
+            $rootSetting = Get-MuMuRootSetting -ManagerPath $resolvedManagerPath -Index $indexedRecord.Index -InfoRecord $managerRecord -Runner $Runner
         }
         if (($hasReportedRootSetting -or $eligible) -and $null -eq $rootSetting) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'root_permission is invalid.'

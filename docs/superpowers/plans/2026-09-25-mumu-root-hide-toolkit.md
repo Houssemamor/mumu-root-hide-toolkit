@@ -43,6 +43,7 @@ The implementation will create these focused files:
 - `src/Root12.ps1`: Android 12 Kitsune preparation, guided system-partition installation, and verification.
 - `src/Root15.ps1`: Android 15 built-in root toggle and KernelSU verification.
 - `src/Concealment.ps1`: HMA/Vector installation, reusable Root template, selected-app scope, and KernelSU profile handoff.
+- `src/Target.ps1`: read-only instance choices, verified instance creation, and the Identify/Create/Clone target selection.
 - `src/Ads.ps1`: MuMu campaign suppression and exact restoration.
 - `src/Verification.ps1`: shared read-only root verification primitives, and from Task 9 the read-only status report.
 - `src/Manifest.json`: tested versions, official URLs, asset names, sizes, and SHA-256 values.
@@ -925,9 +926,22 @@ git commit -m "docs: add clean-room usage and CI safeguards"
 
 **Interfaces:**
 - Produces a read-only qualification result for one Android 12 instance and one Android 15 instance.
+- Produces a read-only `Target Identify` result naming the qualified target index, name, edition, and Android version.
 - Produces a clean Git working tree and a user-provided remote for publication.
 
-- [ ] **Step 1: Run a read-only preflight**
+- [ ] **Step 1: Qualify target selection before any root work**
+
+Target selection is a prerequisite, so it is qualified first and in this order:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Target -Mode Identify -NonInteractive
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Target -Mode Create -StartIndex 5 -Confirmed -NonInteractive
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Target -Mode Clone -InstanceIndex 2 -Confirmed -NonInteractive
+```
+
+Expected: `Identify` exits `0`, lists every discovered instance with its index, name, Android version, running state, and eligibility, and issues no manager command other than `info` and `setting`. `Create` and `Clone` exit `0` only after the explicit confirmation, add exactly one instance, and return a verified non-base instance with a readable Android version and a usable disk. Confirm that the noninteractive dispatcher never prompts and never auto-confirms: a `Target` run without `-Mode` returns `TARGET_MODE_REQUIRED`, and `Create` or `Clone` without `-Confirmed` changes nothing. Confirm that a refused `Create` over an existing `-StartIndex` index issues no `create` command, that an ambiguous new-index report is refused, and that no other instance is deleted, renamed, or changed. Record the reported target index; the later steps use it as `-InstanceIndex`. No root or concealment work runs in this step.
+
+- [ ] **Step 2: Run a read-only preflight**
 
 Run:
 
@@ -938,25 +952,25 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToo
 
 Expected: both commands exit `0`, list the discovered installation and instances, report the read-only status, and change nothing inside MuMu. They do create the toolkit state directory under `%LOCALAPPDATA%`, and a warning-level report appends a redacted line to the toolkit log. There is no `DryRun` action; `Verify` is the read-only action. Pass `-InstallRoot` or `-InstanceIndex` if more than one installation or eligible instance is discovered, because a noninteractive run refuses to guess.
 
-- [ ] **Step 2: Qualify a disposable Android 12 clone**
+- [ ] **Step 3: Qualify a disposable Android 12 clone**
 
 Run the interactive `Root12` action on a disposable Android 12 instance. It is the clone-first step: it stops the selected instance only to clone it, creates and verifies the clone, and reconfigures only that clone. Confirm that the workflow stops with `USER_CONFIRMATION_REQUIRED` when run as `-Action Root12 -NonInteractive`, that the menu pauses for the exact Kitsune choice `Install -> Direct Install into system partition`, and that the menu stays available after a recoverable error.
 
 Expected: the clone boots, Kitsune root verification passes on the clone, the verified clone remains available, and neither the selected instance nor any other instance is changed.
 
-- [ ] **Step 3: Qualify a disposable Android 15 clone**
+- [ ] **Step 4: Qualify a disposable Android 15 clone**
 
 Run the interactive `Root15` action, or `-Action Root15 -Confirmed -NonInteractive`, on a disposable Android 15 instance. It is also clone-first. Confirm that the built-in root toggle is used on the verified clone only, that KernelSU verification passes, that Kitsune is not downloaded, and that Hyper-V/VBS settings are unchanged.
 
 Expected: Android 15 root verification passes on the clone without a Kitsune installation, and the same verified clone record then allows `Conceal`.
 
-- [ ] **Step 4: Qualify concealment and ads**
+- [ ] **Step 5: Qualify concealment and ads**
 
 Use a test package selected explicitly by the user. Verify HMA scope, KernelSU `Umount modules`, backup and restore of MuMu campaign data, and exact file restoration.
 
 Expected: only the selected package is concealed and campaign bytes restore exactly.
 
-- [ ] **Step 5: Run final verification**
+- [ ] **Step 6: Run final verification**
 
 Run:
 
@@ -969,11 +983,11 @@ git log --oneline -10
 
 Expected: all tests pass, `git diff --check` is clean, and the working tree contains no uncommitted files.
 
-- [ ] **Step 6: Prepare the remote without inventing credentials**
+- [ ] **Step 7: Prepare the remote without inventing credentials**
 
 Ask the user for the GitHub owner and an existing empty repository URL or an authenticated `gh` session. Set the remote only after receiving it, run `git remote -v`, inspect the exact branch and commits, and never print or store a token.
 
-- [ ] **Step 7: Commit any final manifest qualification change**
+- [ ] **Step 8: Commit any final manifest qualification change**
 
 If and only if a dependency hash or tested-version statement changed:
 
@@ -988,7 +1002,7 @@ Do not create an empty commit when no file changed.
 
 ## Plan Self-Review
 
-- **Spec coverage:** Tasks 1-2 cover manifest pins, clean-room boundaries, journaling, redaction, structured results, and retries. Tasks 3-4 cover arbitrary paths, Global/Chinese discovery, explicit selection, UAC, clone verification, and file backups. Task 5 covers reversible MuMu-only ads. Task 6 covers the exact Android 12 system-partition flow. Task 7 covers Android 15 built-in KernelSU. Task 8 covers selected-app HMA/KernelSU concealment. Task 9 covers the persistent menu and verification. Task 10 covers tested links, attribution, MIT licensing, and CI. Task 11 covers disposable live qualification and remote publication.
+- **Spec coverage:** Tasks 1-2 cover manifest pins, clean-room boundaries, journaling, redaction, structured results, and retries. Tasks 3-4 cover arbitrary paths, Global/Chinese discovery, explicit selection, UAC, clone verification, and file backups. Task 5 covers reversible MuMu-only ads. Task 6 covers the exact Android 12 system-partition flow. Task 7 covers Android 15 built-in KernelSU. Task 8 covers selected-app HMA/KernelSU concealment. Task 9 covers the persistent menu and verification. Task 10 covers tested links, attribution, MIT licensing, and CI. Task 11 covers target selection, disposable live qualification, and remote publication.
 - **Completeness scan:** No unresolved markers or vague implementation steps remain. Every task names exact files, interfaces, commands, expected outcomes, and a commit.
 - **Type consistency:** `Get-ToolkitResult` is the common result shape; `Journal`, `Instance`, `Manifest`, and `ToolkitReport` names are reused consistently. Root12 and Root15 are separate version-specific functions. `Set-AppConcealment` consumes explicit package strings and never applies globally.
 - **Scope check:** The plan is one cohesive toolkit with shared discovery, backup, journal, and verification primitives. It does not split into unrelated projects.

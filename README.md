@@ -51,14 +51,16 @@ rights themselves yet, so there is no elevated phase today.
 
 1. Install MuMu Player yourself and create the instance you want to work on. The toolkit never
    installs, updates, or repairs MuMu.
-2. Run `Detect` and confirm that the reported edition, installation path, and instance index are
+2. Run the `Target` action to identify the instance you will work on, to create one, or to clone
+   an existing one. It reports the target index, and that index is what the later actions take.
+3. Run `Detect` and confirm that the reported edition, installation path, and instance index are
    the ones you intend to use.
-3. Run `Verify` for the read-only report. Fix anything it reports before you change anything.
-4. Run `Root12` for an Android 12 instance, or `Root15` for an Android 15 instance. Each one
+4. Run `Verify` for the read-only report. Fix anything it reports before you change anything.
+5. Run `Root12` for an Android 12 instance, or `Root15` for an Android 15 instance. Each one
    works on its own clone, never on the instance you selected.
-5. Run `Conceal` with the package names of the specific apps that must not see root.
-6. Run `RemoveAds` to suppress MuMu's own campaign advertisements.
-7. Run `Restore` when you want the advertisement files back.
+6. Run `Conceal` with the package names of the specific apps that must not see root.
+7. Run `RemoveAds` to suppress MuMu's own campaign advertisements.
+8. Run `Restore` when you want the advertisement files back.
 
 ## Actions
 
@@ -70,6 +72,7 @@ the menu and the `-Action` value is ignored, so every example below passes both.
 | --- | --- | --- |
 | `Detect` | nothing in MuMu; reports installations and instances | `Run-MumuToolkit.bat -Action Detect -NonInteractive` |
 | `Verify` | nothing in MuMu; reports the read-only status of the selected instance | `Run-MumuToolkit.bat -Action Verify -NonInteractive` |
+| `Target` | `Identify` changes nothing; `Create` and `Clone` add exactly one MuMu instance | `Run-MumuToolkit.bat -Action Target -Mode Identify -NonInteractive` |
 | `Root12` | the verified clone of an Android 12 instance | menu only; `-Action Root12 -NonInteractive` always returns `USER_CONFIRMATION_REQUIRED` |
 | `Root15` | the verified clone of an Android 15 instance | `Run-MumuToolkit.bat -Action Root15 -Confirmed -NonInteractive` |
 | `Conceal` | root visibility for explicitly selected apps on the verified clone | `Run-MumuToolkit.bat -Action Conceal -Packages com.example.app -NonInteractive` |
@@ -86,15 +89,54 @@ no one-command Android 12 root automation; use the menu for that action.
 instance, so a noninteractive `Conceal` follows either a menu `Root12` run or a noninteractive
 `Root15` run.
 
+## Target selection
+
+`Target` is the prerequisite step. It reports which instance the later actions would work on and
+it is the only action that can add a MuMu instance. It never starts root or concealment work, and
+it never guesses: when more than one eligible instance exists it requires an explicit
+`-InstanceIndex` or a menu choice.
+
+| Mode | What it changes | Confirmation |
+| --- | --- | --- |
+| `Identify` | nothing in MuMu; reports every discovered instance with its index, name, Android version, running state, and eligibility | not required, because it is read-only |
+| `Create` | adds exactly one new instance at the index you name | required: the menu asks for the free index and then for `CONFIRM`, the command line requires `-StartIndex` and `-Confirmed` |
+| `Clone` | adds exactly one clone of a source instance, after stopping that source instance | required: the menu asks for `CONFIRM`, the command line requires `-Confirmed` |
+
+The menu asks for the mode with the words `Identify`, `Create`, or `Clone`. A noninteractive run
+never prompts and never confirms anything, so it must carry the parameters itself:
+
+```text
+Run-MumuToolkit.bat -Action Target -Mode Identify -InstanceIndex 2 -NonInteractive
+Run-MumuToolkit.bat -Action Target -Mode Create -StartIndex 5 -Confirmed -NonInteractive
+Run-MumuToolkit.bat -Action Target -Mode Clone -InstanceIndex 2 -Confirmed -NonInteractive
+```
+
+`-Mode` and `-StartIndex` belong to `Target`; any other action refuses them. Without `-Mode` a
+noninteractive run changes nothing and reports `TARGET_MODE_REQUIRED`, and a noninteractive
+`Create` without `-StartIndex` reports `TARGET_START_INDEX_REQUIRED`.
+
+`Create` never overwrites an index. If `-StartIndex` names an index that already exists the action
+stops before the manager is called. After the manager reports the new instance, the action requires
+exactly one new index and verifies that it is a non-base instance with a readable Android version,
+a contained instance root, and a usable disk. `Clone` reuses the same verified clone flow that
+`Root12` and `Root15` use. Neither mode deletes, renames, or reconfigures any other instance, and
+both are recorded in the operation journal.
+
+The reported target index is the value to pass to `-InstanceIndex` for `Root12`, `Root15`, and
+`Conceal`. `Target` does not store that choice: the toolkit never picks an instance on your behalf
+in a later run.
+
 Command-line parameters:
 
 | Parameter | Meaning |
 | --- | --- |
 | `-InstallRoot <path>` | select one discovered installation without a prompt |
-| `-InstanceIndex <n>` | select one eligible instance without a prompt |
+| `-InstanceIndex <n>` | select one eligible instance without a prompt; the target index reported by `Target` |
 | `-StateRoot <path>` | override `%LOCALAPPDATA%\mumu-root-hide-toolkit` |
 | `-Packages <a,b>` | the exact package names to conceal; required by `Conceal` |
-| `-Confirmed` | the explicit confirmation required by `Root15` |
+| `-Mode <mode>` | the `Target` mode: `Identify`, `Create`, or `Clone` |
+| `-StartIndex <n>` | the free index the `Target Create` mode must use; it is verified as unused and never overwritten |
+| `-Confirmed` | the explicit confirmation required by `Root15`, `Target Create`, and `Target Clone` |
 | `-NonInteractive` | run one action and exit instead of opening the menu |
 | `-SkipToolbar` | omit the menu banner |
 
@@ -233,6 +275,11 @@ These are the honest limits of the current state of the code.
   the documented instance, clone, and root-setting responses, and on its bundled ADB accepting
   the commands the toolkit sends. A different manager version, a localized response, or a
   blocked port makes the action fail closed rather than guess.
+- `Target Create` and `Target Clone` are the only actions that add an instance, and both depend on
+  the manager accepting the `create` and `clone` commands with these exact arguments. The manager
+  may assign an index other than `-StartIndex`; the action verifies the index it actually reported
+  instead of assuming one. Neither mode has been exercised against a live MuMu installation from
+  this repository.
 - Root concealment reduces package and module visibility. It is not attestation bypass, and
   there is no guarantee about Play Integrity, device integrity, or any other hardware-backed
   signal.
