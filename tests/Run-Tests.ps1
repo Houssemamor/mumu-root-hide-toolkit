@@ -3769,6 +3769,7 @@ function New-Root12ManagerState {
         VersionName = '31.0-kitsune'
         VersionCode = '31000'
         DaemonPids = '4242'
+        DaemonExitCode = 0
         RootAllowed = $true
         RootShellText = 'uid=0(root) gid=0(root) groups=0(root)'
         JournalLockPath = ''
@@ -3965,7 +3966,7 @@ function New-Root12ManagerRunner {
                 }
             }
             if ($request -ceq 'shell pidof magiskd') {
-                return [pscustomobject]@{ ExitCode = 0; Text = $State.DaemonPids }
+                return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = $State.DaemonPids }
             }
             if ($request -ceq 'shell su -c id') {
                 if (-not $State.RootAllowed) {
@@ -4652,17 +4653,42 @@ function Invoke-Root12Tests {
         }
 
         foreach ($daemonCase in @(
-                [pscustomobject]@{ Pids = ''; Code = 'DAEMON_ABSENT' },
-                [pscustomobject]@{ Pids = '   '; Code = 'DAEMON_ABSENT' },
-                [pscustomobject]@{ Pids = "11`n22"; Code = 'DAEMON_DUPLICATE' }
+                [pscustomobject]@{ ExitCode = 0; Pids = ''; Code = 'DAEMON_ABSENT'; Label = 'exit 0 with no output' },
+                [pscustomobject]@{ ExitCode = 0; Pids = '   '; Code = 'DAEMON_ABSENT'; Label = 'exit 0 with blank output' },
+                [pscustomobject]@{ ExitCode = 1; Pids = ''; Code = 'DAEMON_ABSENT'; Label = 'exit 1 with empty output' },
+                [pscustomobject]@{ ExitCode = 1; Pids = " `n "; Code = 'DAEMON_ABSENT'; Label = 'exit 1 with blank output' },
+                [pscustomobject]@{ ExitCode = 0; Pids = '4242'; Code = 'OK'; Label = 'exit 0 with one daemon' },
+                [pscustomobject]@{ ExitCode = 0; Pids = "11`n22"; Code = 'DAEMON_DUPLICATE'; Label = 'exit 0 with two daemons' },
+                [pscustomobject]@{ ExitCode = 1; Pids = '4242'; Code = 'ADB_FAILED'; Label = 'exit 1 with output' },
+                [pscustomobject]@{ ExitCode = -201; Pids = ''; Code = 'ADB_FAILED'; Label = 'exit -201' },
+                [pscustomobject]@{ ExitCode = 3; Pids = ''; Code = 'ADB_FAILED'; Label = 'exit 3' }
             )) {
             $daemonState = New-Root12ManagerState -Install $install
-            $daemonState.DaemonPids = $daemonCase.Pids
+            $daemonState.DaemonExitCode = [int]$daemonCase.ExitCode
+            $daemonState.DaemonPids = [string]$daemonCase.Pids
             $daemonFailure = Invoke-Root12Case -State $daemonState -Instance $android12 -Manifest $manifest `
                 -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
-            Assert-Root12Failure -Result $daemonFailure.Result -Journal $daemonFailure.Journal -Code $daemonCase.Code -Message "An unexpected root daemon count was accepted: $($daemonCase.Code)."
-            Assert-Equal -1 (Get-Root12CallIndex -Calls $daemonState.Calls -Pattern '*root_permission*-val*false*') "An unexpected root daemon count disabled the temporary vendor root: $($daemonCase.Code)."
+            if ([string]$daemonCase.Code -ceq 'OK') {
+                Assert-True ($daemonFailure.Result.Status -eq 'Success') "A verified root daemon result was rejected ($($daemonCase.Label)): $($daemonFailure.Result.Message)"
+                Assert-Equal 1 $daemonFailure.Result.Data.DaemonCount "A verified root daemon was not reported as exactly one ($($daemonCase.Label))."
+                Assert-Equal $false $daemonState.RootSettings[[string]$daemonState.CloneIndex] "The temporary vendor root was not disabled after the verified daemon ($($daemonCase.Label))."
+                continue
+            }
+            Assert-Root12Failure -Result $daemonFailure.Result -Journal $daemonFailure.Journal -Code $daemonCase.Code -Message "An unexpected root daemon result was accepted ($($daemonCase.Label))."
+            Assert-True ($daemonFailure.Result.Message -match '(?i)daemon') "A root daemon result did not name the daemon ($($daemonCase.Label)): $($daemonFailure.Result.Message)"
+            Assert-Equal -1 (Get-Root12CallIndex -Calls $daemonState.Calls -Pattern '*root_permission*-val*false*') "An unexpected root daemon result disabled the temporary vendor root ($($daemonCase.Label))."
         }
+
+        $callerState = New-Root12ManagerState -Install $install
+        $callerState.DaemonExitCode = 1
+        $callerState.DaemonPids = ''
+        $callerCheck = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Runner (New-Root12ManagerRunner -State $callerState)
+        Assert-Equal 'CriticalError' $callerCheck.Status 'A pidof result that reported no running daemon was accepted by the shared root check.'
+        Assert-Equal 'DAEMON_ABSENT' $callerCheck.Data.Code 'The shared root check did not report the daemon as absent.'
+        Assert-Equal 0 $callerCheck.Data.DaemonCount 'The absent daemon result claimed a daemon count.'
+        Assert-Equal $false $callerCheck.Data.RootVerified 'The absent daemon result claimed a verified root.'
+        Assert-True ($callerCheck.Message -match '(?i)daemon') "The absent daemon result did not name the daemon: $($callerCheck.Message)"
+        Assert-Equal 0 @($callerState.Calls | Where-Object { (@($_) -join ' ') -like 'setting*' }).Count 'The shared root check changed the vendor root instead of leaving that to the caller.'
 
         foreach ($rootCase in @(
                 [pscustomobject]@{ Allowed = $false; Label = 'denied' },

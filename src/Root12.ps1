@@ -288,12 +288,36 @@ function Test-Android12Root {
     }
 
     $daemonCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell pidof magiskd' -Runner $Runner
-    if ($null -eq $daemonCall -or $daemonCall.ExitCode -ne 0) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED' })
+    $daemonPids = @()
+    $daemonExitCode = $null
+    if ($null -ne $daemonCall) {
+        $daemonExitCode = $daemonCall.ExitCode
+        $daemonPids = @(([string]$daemonCall.Text) -split '\s+' | Where-Object { $_ })
     }
-    $daemonPids = @(([string]$daemonCall.Text) -split '\s+' | Where-Object { $_ })
-    if ($daemonPids.Count -eq 0) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon is not running.' -Data (@{
+    if ($daemonExitCode -eq 0) {
+        if ($daemonPids.Count -eq 0) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon is not running.' -Data (@{
+                    Code = 'DAEMON_ABSENT'
+                    PackageName = $script:ToolkitKitsunePackageName
+                    VersionName = $versionName
+                    VersionCode = $versionCode
+                    DaemonCount = 0
+                    RootVerified = $false
+                })
+        }
+        if ($daemonPids.Count -ne 1) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message "The Kitsune root daemon is running $($daemonPids.Count) times instead of once." -Data (@{
+                    Code = 'DAEMON_DUPLICATE'
+                    PackageName = $script:ToolkitKitsunePackageName
+                    VersionName = $versionName
+                    VersionCode = $versionCode
+                    DaemonCount = $daemonPids.Count
+                    RootVerified = $false
+                })
+        }
+    }
+    elseif ($daemonExitCode -eq 1 -and $daemonPids.Count -eq 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query reported no running daemon.' -Data (@{
                 Code = 'DAEMON_ABSENT'
                 PackageName = $script:ToolkitKitsunePackageName
                 VersionName = $versionName
@@ -302,15 +326,8 @@ function Test-Android12Root {
                 RootVerified = $false
             })
     }
-    if ($daemonPids.Count -ne 1) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message "The Kitsune root daemon is running $($daemonPids.Count) times instead of once." -Data (@{
-                Code = 'DAEMON_DUPLICATE'
-                PackageName = $script:ToolkitKitsunePackageName
-                VersionName = $versionName
-                VersionCode = $versionCode
-                DaemonCount = $daemonPids.Count
-                RootVerified = $false
-            })
+    else {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED' })
     }
 
     $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
