@@ -2094,6 +2094,7 @@ function New-SafetyManagerState {
         CreateName = 'Created instance'
         CreateAndroid = '12.0'
         CreateIsMain = $false
+        CreateRootName = ''
         CreateCreatesRoot = $true
         CreateCreatesDisk = $true
         CreateVmsPath = ''
@@ -2189,7 +2190,14 @@ function New-SafetyManagerRunner {
                 if ([string]::IsNullOrWhiteSpace($createdVmsPath)) {
                     $createdVmsPath = [string]$State.VmsPath
                 }
-                $createdRoot = Join-Path $createdVmsPath ([string]$createdIndex)
+                $createdRootName = [string]$State.CreateRootName
+                if ([string]::IsNullOrWhiteSpace($createdRootName)) {
+                    $createdRootName = [string]$createdIndex
+                }
+                else {
+                    $createdRootName = $createdRootName -f $createdIndex
+                }
+                $createdRoot = Join-Path $createdVmsPath $createdRootName
                 if ($State.CreateCreatesRoot) {
                     New-Item -ItemType Directory -Path $createdRoot -Force | Out-Null
                     if ($State.CreateCreatesDisk) {
@@ -8494,6 +8502,42 @@ function Invoke-TargetTests {
         Assert-Equal 'Create' $createTarget.Data.Mode 'The create target mode did not report its mode.'
         Assert-Equal 5 $createTarget.Data.Index 'The create target mode did not report the created index.'
         Assert-Equal 'Global' $createTarget.Data.Edition 'The create target mode did not report the installation edition.'
+
+        $namedRootFixture = New-TargetFixture -Name 'named root' -InstanceIndexes @(0, 2)
+        foreach ($namedInstance in @('MuMuPlayerGlobal-12.0-3', 'MuMuPlayerGlobal-12.0-base', 'MuMuPlayer-15.0-4')) {
+            [void][IO.Directory]::CreateDirectory((Join-Path $namedRootFixture.Install.VmsPath $namedInstance))
+        }
+        $namedGlobalRoot = Get-MuMuInstanceRootPath -VmsPath $namedRootFixture.Install.VmsPath -Index 3 -ReportedVmsPath ''
+        Assert-Equal (Join-Path $namedRootFixture.Install.VmsPath 'MuMuPlayerGlobal-12.0-3') $namedGlobalRoot 'A named Global instance root was not resolved.'
+        $namedChineseRoot = Get-MuMuInstanceRootPath -VmsPath $namedRootFixture.Install.VmsPath -Index 4 -ReportedVmsPath ''
+        Assert-Equal (Join-Path $namedRootFixture.Install.VmsPath 'MuMuPlayer-15.0-4') $namedChineseRoot 'A named instance root of another edition naming was not resolved.'
+        Assert-Equal (Join-Path $namedRootFixture.Install.VmsPath '2') (Get-MuMuInstanceRootPath -VmsPath $namedRootFixture.Install.VmsPath -Index 2 -ReportedVmsPath '') 'A numeric instance root was not resolved.'
+        Assert-Equal $null (Get-MuMuInstanceRootPath -VmsPath $namedRootFixture.Install.VmsPath -Index 9 -ReportedVmsPath '') 'A base-only VMS root resolved an instance root for a missing index.'
+        [void][IO.Directory]::CreateDirectory((Join-Path $namedRootFixture.Install.VmsPath 'vms\MuMuPlayerGlobal-12.0-5'))
+        Assert-Equal (Join-Path $namedRootFixture.Install.VmsPath 'vms\MuMuPlayerGlobal-12.0-5') (Get-MuMuInstanceRootPath -VmsPath $namedRootFixture.Install.VmsPath -Index 5 -ReportedVmsPath '') 'A named instance root under a nested vms directory was not resolved.'
+        Assert-Equal $null (Get-MuMuInstanceRootPath -VmsPath $namedRootFixture.Install.VmsPath -Index 6 -ReportedVmsPath '') 'A named instance root in two locations for one index was merged silently.'
+        $ambiguousNamedFixture = New-TargetFixture -Name 'named root ambiguous' -InstanceIndexes @(0, 2)
+        foreach ($ambiguousName in @('MuMuPlayerGlobal-12.0-3', 'MuMuPlayerGlobal-15.0-3')) {
+            [void][IO.Directory]::CreateDirectory((Join-Path $ambiguousNamedFixture.Install.VmsPath $ambiguousName))
+        }
+        Assert-Equal $null (Get-MuMuInstanceRootPath -VmsPath $ambiguousNamedFixture.Install.VmsPath -Index 3 -ReportedVmsPath '') 'Two named instance roots for one index were merged silently.'
+        $ambiguousNamedCreateFixture = New-TargetFixture -Name 'named create ambiguous' -InstanceIndexes @(0, 2)
+        $ambiguousNamedCreateFixture.State.CreateIndexes = @('5')
+        $ambiguousNamedCreateFixture.State.CreateRootName = 'MuMuPlayerGlobal-12.0-{0}'
+        [void][IO.Directory]::CreateDirectory((Join-Path $ambiguousNamedCreateFixture.Install.VmsPath 'MuMuPlayerGlobal-15.0-5'))
+        $ambiguousNamedCreateJournal = New-TargetJournal -Instance $ambiguousNamedCreateFixture.Install
+        $ambiguousNamedCreate = New-MuMuInstance -ManagerPath $ambiguousNamedCreateFixture.Install.ManagerPath -Install $ambiguousNamedCreateFixture.Install -Journal $ambiguousNamedCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $ambiguousNamedCreateFixture.State)
+        Assert-Equal 'CriticalError' $ambiguousNamedCreate.Status 'A create whose instance root matched two named directories was accepted.'
+
+        $namedCreateFixture = New-TargetFixture -Name 'named create' -InstanceIndexes @(0, 2)
+        $namedCreateFixture.State.CreateIndexes = @('5')
+        $namedCreateFixture.State.CreateRootName = 'MuMuPlayerGlobal-12.0-{0}'
+        $namedCreateJournal = New-TargetJournal -Instance $namedCreateFixture.Install
+        $namedCreate = New-MuMuInstance -ManagerPath $namedCreateFixture.Install.ManagerPath -Install $namedCreateFixture.Install -Journal $namedCreateJournal -Confirmed -Runner (New-SafetyManagerRunner -State $namedCreateFixture.State)
+        Assert-Equal 'Success' $namedCreate.Status "A create into a named instance root failed: $($namedCreate.Message)"
+        Assert-Equal 5 $namedCreate.Data.Index 'A create into a named instance root reported the wrong index.'
+        Assert-Equal (Join-Path $namedCreateFixture.Install.VmsPath 'MuMuPlayerGlobal-12.0-5') $namedCreate.Data.VmsPath 'A create into a named instance root did not report the named instance root.'
+        Assert-True ([long]$namedCreate.Data.DiskBytes -gt 0) 'A create into a named instance root reported no usable disk.'
 
         $createFailureFixture = New-TargetFixture -Name 'create failure'
         $createFailureFixture.State.CreateExitCode = 1

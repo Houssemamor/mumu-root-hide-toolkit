@@ -187,6 +187,34 @@ function Get-MuMuInstanceRunningState {
     return ConvertTo-ToolkitBoolean -Value (Get-ToolkitFirstProperty -InputObject $Record -PropertyNames @('is_process_started', 'is_android_started', 'running'))
 }
 
+function Get-ToolkitNamedInstanceRoots {
+    param(
+        [string]$Root,
+        [int]$Index
+    )
+
+    $namedRoots = @()
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path -LiteralPath $Root -PathType Container)) {
+        return $namedRoots
+    }
+    $childDirectories = @()
+    try {
+        $childDirectories = @([IO.Directory]::GetDirectories($Root))
+    }
+    catch {
+        return $namedRoots
+    }
+    $indexPattern = '(?i)-' + [regex]::Escape([string]$Index) + '$'
+    foreach ($childDirectory in $childDirectories) {
+        $childName = [IO.Path]::GetFileName($childDirectory)
+        if ($childName -match '(?i)(^|-)base$' -or $childName -notmatch $indexPattern) {
+            continue
+        }
+        $namedRoots += $childDirectory
+    }
+    return $namedRoots
+}
+
 function Get-MuMuInstanceRootPath {
     param(
         [string]$VmsPath,
@@ -201,19 +229,37 @@ function Get-MuMuInstanceRootPath {
             return $null
         }
     }
-    foreach ($candidate in @((Join-Path $root ([string]$Index)), (Join-Path (Join-Path $root 'vms') ([string]$Index)))) {
-        $instanceRoot = ConvertTo-ToolkitFullPath -Path $candidate
-        if ($null -eq $instanceRoot) {
+    $baseDirectories = @($root, (Join-Path $root 'vms'))
+    foreach ($baseDirectory in $baseDirectories) {
+        $candidate = ConvertTo-ToolkitFullPath -Path (Join-Path $baseDirectory ([string]$Index))
+        if ($null -eq $candidate) {
             continue
         }
-        if (-not (Test-ToolkitPathWithinRoot -Path $instanceRoot -Root $VmsPath)) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+            continue
+        }
+        if (-not (Test-ToolkitPathWithinRoot -Path $candidate -Root $VmsPath)) {
             return $null
         }
-        if (Test-Path -LiteralPath $instanceRoot -PathType Container) {
-            return $instanceRoot
+        return $candidate
+    }
+    $namedRoots = @()
+    foreach ($baseDirectory in $baseDirectories) {
+        foreach ($namedRoot in @(Get-ToolkitNamedInstanceRoots -Root $baseDirectory -Index $Index)) {
+            $namedFullPath = ConvertTo-ToolkitFullPath -Path $namedRoot
+            if ($null -eq $namedFullPath) {
+                continue
+            }
+            if (-not (Test-ToolkitPathWithinRoot -Path $namedFullPath -Root $VmsPath)) {
+                return $null
+            }
+            $namedRoots += $namedFullPath
         }
     }
-    return $null
+    if ($namedRoots.Count -ne 1) {
+        return $null
+    }
+    return $namedRoots[0]
 }
 
 function Measure-MuMuInstanceDiskBytes {
