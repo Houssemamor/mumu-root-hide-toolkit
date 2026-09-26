@@ -37,12 +37,15 @@ not treated as compatible until it has been tested and pinned again.
 | NeoZygisk | v2.3 | pinned for future use; no action installs it yet | [NeoZygisk release](https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.3) |
 | CorePatch | 4.9 | pinned for future use; no action installs it yet | [CorePatch release](https://github.com/LSPosed/CorePatch/releases/tag/4.9) |
 
-Vector is the current name of the LSPosed project; the pinned artifact comes from the
-`JingMatrix/Vector` repository, not from the retired `JingMatrix/LSPosed` path.
+Vector is the current name of the LSPosed project. The pinned artifact comes from the
+`JingMatrix/Vector` repository, whose v2.0 release page is the canonical link; the older
+`JingMatrix/LSPosed` release path only redirects there.
 
 Dependencies are downloaded at run time from those official release pages into
 `%LOCALAPPDATA%\mumu-root-hide-toolkit\assets`, and each one is verified against its pinned size
-and SHA-256 hash before it is used. No dependency is downloaded after an elevated step begins.
+and SHA-256 hash before it is used. Design intent: a dependency is never fetched from an
+elevated phase, so nothing is downloaded after rights are raised. The actions do not raise
+rights themselves yet, so there is no elevated phase today.
 
 ## Setup order
 
@@ -59,18 +62,29 @@ and SHA-256 hash before it is used. No dependency is downloaded after an elevate
 
 ## Actions
 
-Double-click `Run-MumuToolkit.bat` for the interactive menu, or pass a single action on the
-command line for automation.
+Double-click `Run-MumuToolkit.bat` to open the interactive menu. On the command line `-Action`
+is honored only together with `-NonInteractive`; without `-NonInteractive` the launcher opens
+the menu and the `-Action` value is ignored, so every example below passes both.
 
-| Action | What it changes | Command |
+| Action | What it changes | Noninteractive command |
 | --- | --- | --- |
-| `Detect` | nothing; reports installations and instances | `Run-MumuToolkit.bat -Action Detect` |
-| `Verify` | nothing; reports the read-only status of the selected instance | `Run-MumuToolkit.bat -Action Verify` |
-| `Root12` | the verified clone of an Android 12 instance | `Run-MumuToolkit.bat -Action Root12` |
-| `Root15` | the verified clone of an Android 15 instance | `Run-MumuToolkit.bat -Action Root15` |
-| `Conceal` | root visibility for explicitly selected apps on the verified clone | `Run-MumuToolkit.bat -Action Conceal -Packages com.example.app` |
-| `RemoveAds` | MuMu campaign display flags inside the selected installation | `Run-MumuToolkit.bat -Action RemoveAds` |
-| `Restore` | the MuMu campaign files, from the toolkit restore point | `Run-MumuToolkit.bat -Action Restore` |
+| `Detect` | nothing in MuMu; reports installations and instances | `Run-MumuToolkit.bat -Action Detect -NonInteractive` |
+| `Verify` | nothing in MuMu; reports the read-only status of the selected instance | `Run-MumuToolkit.bat -Action Verify -NonInteractive` |
+| `Root12` | the verified clone of an Android 12 instance | menu only; `-Action Root12 -NonInteractive` always returns `USER_CONFIRMATION_REQUIRED` |
+| `Root15` | the verified clone of an Android 15 instance | `Run-MumuToolkit.bat -Action Root15 -Confirmed -NonInteractive` |
+| `Conceal` | root visibility for explicitly selected apps on the verified clone | `Run-MumuToolkit.bat -Action Conceal -Packages com.example.app -NonInteractive` |
+| `RemoveAds` | MuMu campaign display flags inside the selected installation | `Run-MumuToolkit.bat -Action RemoveAds -NonInteractive` |
+| `Restore` | the MuMu campaign files, from the toolkit restore point | `Run-MumuToolkit.bat -Action Restore -NonInteractive` |
+
+`Root12` is menu-only. A noninteractive `Root12` run resolves the installation and the instance,
+verifies the pinned Kitsune artifact, and then returns `USER_CONFIRMATION_REQUIRED` without
+creating a clone and without changing anything, because the exact Kitsune choice must be
+confirmed by a person and the noninteractive dispatcher carries no confirmation token. There is
+no one-command Android 12 root automation; use the menu for that action.
+
+`Conceal` needs a verified clone record from a completed `Root12` or `Root15` run for the same
+instance, so a noninteractive `Conceal` follows either a menu `Root12` run or a noninteractive
+`Root15` run.
 
 Command-line parameters:
 
@@ -86,7 +100,8 @@ Command-line parameters:
 
 ## Android 12: the exact Kitsune choice
 
-`Root12` verifies the pinned Kitsune artifact, creates and verifies a clone, enables the
+`Root12` is an interactive action; run it from the menu. It verifies the pinned Kitsune artifact,
+creates and verifies a clone, enables the
 temporary MuMu vendor root on that clone only, installs the Kitsune app, and starts it. The
 workflow then pauses and waits for you, in the Kitsune app on the clone, to choose exactly:
 
@@ -161,7 +176,8 @@ third-party advertisement.
 
 To restore:
 
-1. Run `Run-MumuToolkit.bat -Action Restore` and select the same installation.
+1. Run `Run-MumuToolkit.bat -Action Restore -NonInteractive` and select the same installation
+   with `-InstallRoot` if more than one is discovered.
 2. The newest restore point for that installation is applied, and the restored files and their
    read-only state are reported.
 3. Every restored path is re-validated against the installation root, the restore boundary the
@@ -185,7 +201,9 @@ Current behavior: if an action needs rights the current process does not have, i
 The action stops, the operation journal records the failure, nothing is retried automatically,
 and no configuration is left half-written on purpose. Start `Run-MumuToolkit.bat` from an
 elevated console (Run as administrator) for the actions that write into the MuMu installation.
-`Detect` and `Verify` are read-only and do not need elevation.
+`Detect` and `Verify` never change MuMu and do not need elevation; they still
+create the toolkit state directory, and a non-success result appends a redacted line to the
+toolkit log.
 
 ## Noninteractive exit codes
 
@@ -199,7 +217,9 @@ With `-NonInteractive` the process runs one action and exits with:
 | `RecoverableError` | `2` |
 | `CriticalError` | `1` |
 
-In the interactive menu a failed action returns to the menu, prints the log path and the
+A noninteractive `Root12` therefore always exits `1` with `USER_CONFIRMATION_REQUIRED`; that is
+the intended fail-closed result, not a defect. In the interactive menu a failed action returns to
+the menu, prints the log path and the
 recovery guidance, and never closes the window.
 
 ## Limitations

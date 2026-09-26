@@ -747,7 +747,7 @@ git commit -m "feat: add selected-app root concealment"
 - Produces `Get-ToolkitReport -Install <object> -Instance <object> -Journal <object>` returning a read-only report object, added to the `src/Verification.ps1` that Task 7 created with the shared read-only primitives.
 - Produces `Invoke-ToolkitAction -Action <string>` dispatching one named operation and returning its structured result.
 - Produces `Invoke-MenuAction -Action <string> [-Runner <scriptblock>]` returning one structured action result and never throwing into the interactive loop.
-- `Invoke-MumuToolkit.ps1` accepts `-Action`, `-InstanceIndex`, `-NonInteractive`, and `-SkipToolbar`, dispatches one action, and keeps the menu alive after action errors.
+- `Invoke-MumuToolkit.ps1` accepts `-Action`, `-InstanceIndex`, `-NonInteractive`, and `-SkipToolbar`, dispatches one action, and keeps the menu alive after action errors. `-Action` is honored only together with `-NonInteractive`; without it the launcher opens the menu and ignores the action.
 - `Run-MumuToolkit.bat` invokes PowerShell without self-elevating and leaves the window open when the controller returns an interactive error.
 - The `RemoveAds` and `Restore` actions pass the selected installation's campaign root to `Restore-MuMuAds -AllowedRoot`; the boundary always comes from the selected install and never from a restore-point manifest, and a restore that cannot resolve one is refused rather than run without a boundary.
 
@@ -850,7 +850,7 @@ git commit -m "feat: add persistent menu and verification"
 - Test: `tests/Run-Tests.ps1`
 
 **Interfaces:**
-- Produces a documented command surface for `Detect`, `DryRun`, `Backup`, `Root12`, `Root15`, `Hide`, `RemoveAds`, `Verify`, and `Restore`.
+- Produces a documented command surface for `Detect`, `Verify`, `Root12`, `Root15`, `Conceal`, `RemoveAds`, and `Restore`. `Root12` is menu-only, because the noninteractive dispatcher carries no confirmation token for the Kitsune system-partition choice.
 - Produces a clean-room attribution file naming the original project and all upstream dependencies without implying endorsement.
 
 - [ ] **Step 1: Write failing documentation checks**
@@ -863,13 +863,21 @@ foreach ($url in @(
     'https://www.mumuplayer.com/download/',
     'https://github.com/Jordan231111/KitsuneMagisk/releases/tag/v31.0-25fa2159',
     'https://github.com/frknkrc44/HMA-OSS/releases/tag/oss-161',
-    'https://github.com/JingMatrix/LSPosed/releases/tag/v2.0',
+    'https://github.com/JingMatrix/Vector/releases/tag/v2.0',
     'https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.3',
     'https://github.com/LSPosed/CorePatch/releases/tag/4.9'
 )) { Assert-True ($readme.Contains($url)) "README is missing tested link: $url" }
 Assert-True ($readme -match 'Direct Install into system partition') 'README lacks the exact Kitsune choice.'
 Assert-True ($readme -match 'Global.*Chinese') 'README does not state supported editions.'
 ```
+
+The Vector release page is the canonical `JingMatrix/Vector` URL that the manifest pins; the older
+`JingMatrix/LSPosed` release path only redirects to it. Bind the Kitsune phrase assertion to
+`$script:ToolkitKitsuneChoice` from `src/Root12.ps1` after the module is loaded, so the check
+cannot drift from the product constant, and bind the documented action set to
+`$script:ToolkitActions` with a negative assertion for `DryRun`, `Backup`, and `Hide`.
+`-Action` is honored only together with `-NonInteractive`, and `Root12` is menu-only, so every
+documented example must be accurate about both.
 
 - [ ] **Step 2: Run documentation tests and verify failure**
 
@@ -925,22 +933,22 @@ Run:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Detect -NonInteractive
-powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action DryRun -NonInteractive
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Verify -NonInteractive
 ```
 
-Expected: both commands exit `0`, list the discovered installation and instances, and write no configuration changes.
+Expected: both commands exit `0`, list the discovered installation and instances, report the read-only status, and change nothing inside MuMu. They do create the toolkit state directory under `%LOCALAPPDATA%`, and a warning-level report appends a redacted line to the toolkit log. There is no `DryRun` action; `Verify` is the read-only action. Pass `-InstallRoot` or `-InstanceIndex` if more than one installation or eligible instance is discovered, because a noninteractive run refuses to guess.
 
 - [ ] **Step 2: Qualify a disposable Android 12 clone**
 
-Run the interactive `Backup` and `Root12` actions. Confirm that the script selects `Install -> Direct Install into system partition`, creates a clone before changes, verifies the Kitsune package and root daemon, and leaves the menu available after a recoverable error.
+Run the interactive `Root12` action on a disposable Android 12 instance. It is the clone-first step: it stops the selected instance only to clone it, creates and verifies the clone, and reconfigures only that clone. Confirm that the workflow stops with `USER_CONFIRMATION_REQUIRED` when run as `-Action Root12 -NonInteractive`, that the menu pauses for the exact Kitsune choice `Install -> Direct Install into system partition`, and that the menu stays available after a recoverable error.
 
-Expected: the instance boots, root verification passes, the backup clone remains available, and no other instance is changed.
+Expected: the clone boots, Kitsune root verification passes on the clone, the verified clone remains available, and neither the selected instance nor any other instance is changed.
 
 - [ ] **Step 3: Qualify a disposable Android 15 clone**
 
-Run the interactive `Backup` and `Root15` actions. Confirm that the built-in root toggle is used, KernelSU verification passes, Kitsune is not downloaded, and Hyper-V/VBS settings are unchanged.
+Run the interactive `Root15` action, or `-Action Root15 -Confirmed -NonInteractive`, on a disposable Android 15 instance. It is also clone-first. Confirm that the built-in root toggle is used on the verified clone only, that KernelSU verification passes, that Kitsune is not downloaded, and that Hyper-V/VBS settings are unchanged.
 
-Expected: Android 15 root verification passes without a Kitsune installation.
+Expected: Android 15 root verification passes on the clone without a Kitsune installation, and the same verified clone record then allows `Conceal`.
 
 - [ ] **Step 4: Qualify concealment and ads**
 

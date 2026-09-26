@@ -10,6 +10,7 @@ permissions:
 jobs:
   tests:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: PowerShell parser checks

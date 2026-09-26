@@ -7947,10 +7947,17 @@ function Invoke-DocsTests {
         Assert-True ($readme.Contains($mumuLink)) "README is missing a tested reference link: $mumuLink"
     }
     Assert-True ($readme.Contains([string]$manifest.mumu.testedVersion)) "README does not state the tested MuMu version: $([string]$manifest.mumu.testedVersion)"
-    Assert-True ($readme -notmatch 'github\.com/JingMatrix/LSPosed/releases') 'README documents a Vector release page under the retired LSPosed repository path instead of the pinned Vector source.'
+    Assert-True ($readme.Contains('https://github.com/JingMatrix/Vector/releases/tag/v2.0')) 'README does not link the canonical Vector release page that the manifest pins.'
+
+    # The exact Kitsune phrase is taken from the product constant, not retyped here.
+    $kitsuneChoice = [string]$script:ToolkitKitsuneChoice
+    $kitsunePrompt = [string]$script:ToolkitKitsunePrompt
+    Assert-True (-not [string]::IsNullOrWhiteSpace($kitsuneChoice)) 'The Kitsune system-partition choice constant is unavailable.'
+    Assert-True ($kitsunePrompt.Contains($kitsuneChoice)) 'The Kitsune prompt constant does not carry the accepted choice.'
+    Assert-True ($readme.Contains($kitsunePrompt)) "README lacks the exact Kitsune instruction from the product constant: $kitsunePrompt"
+    Assert-True ($readme.Contains($kitsuneChoice)) "README lacks the exact Kitsune system-partition choice from the product constant: $kitsuneChoice"
 
     foreach ($statement in @(
-            @{ Pattern = 'Direct Install into system partition'; Message = 'README lacks the exact Kitsune system-partition choice.' }
             @{ Pattern = 'Global.*Chinese'; Message = 'README does not state the supported MuMu editions.' }
             @{ Pattern = 'Android 12'; Message = 'README does not state the Android 12 behavior.' }
             @{ Pattern = 'Android 15'; Message = 'README does not state the Android 15 behavior.' }
@@ -7969,6 +7976,11 @@ function Invoke-DocsTests {
             @{ Pattern = '(?i)AllowedRoot'; Message = 'README does not state the advertisement restore boundary.' }
             @{ Pattern = '-Action Restore'; Message = 'README does not document the advertisement restore command.' }
             @{ Pattern = '-NonInteractive'; Message = 'README does not document the noninteractive mode.' }
+            @{ Pattern = '(?i)only .*with.*-NonInteractive|only .*together with.*-NonInteractive'; Message = 'README does not state that -Action is honored only together with -NonInteractive.' }
+            @{ Pattern = '(?i)USER_CONFIRMATION_REQUIRED'; Message = 'README does not document the fail-closed code reported by a noninteractive Root12 run.' }
+            @{ Pattern = '(?i)menu only|menu-only'; Message = 'README does not mark Root12 as a menu-only action.' }
+            @{ Pattern = '(?i)creates the toolkit state directory|create the toolkit state directory'; Message = 'README does not state that the read-only actions still create local toolkit state.' }
+            @{ Pattern = '(?i)Design intent'; Message = 'README does not mark the unelevated-phase download rule as design intent.' }
             @{ Pattern = '(?m)Success.*\b0\b'; Message = 'README does not map Success to exit code 0.' }
             @{ Pattern = '(?m)Warning.*\b0\b'; Message = 'README does not map Warning to exit code 0.' }
             @{ Pattern = '(?m)RecoverableError.*\b2\b'; Message = 'README does not map RecoverableError to exit code 2.' }
@@ -7981,8 +7993,20 @@ function Invoke-DocsTests {
         )) {
         Assert-True ($readme -match $statement.Pattern) $statement.Message
     }
-    foreach ($action in @('Detect', 'Verify', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')) {
-        Assert-True ($readme -match ('(?i)-Action ' + $action + '\b')) "README does not document the implemented action: $action"
+
+    # The documented action set is bound to the dispatcher catalog, and every example must be accurate.
+    $nonInteractiveActions = @('Detect', 'Verify', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+    foreach ($implementedAction in @($script:ToolkitActions)) {
+        Assert-True ($readme -match ('(?i)-Action ' + [regex]::Escape([string]$implementedAction) + '\b')) "README does not document the implemented action: $implementedAction"
+        if ($nonInteractiveActions -notcontains [string]$implementedAction) {
+            continue
+        }
+        $example = [regex]::Match($readme, '(?m)^.*-Action ' + [regex]::Escape([string]$implementedAction) + '\b.*$')
+        Assert-True ($example.Success) "README has no example command for the noninteractive action: $implementedAction"
+        Assert-True ($example.Value -match '-NonInteractive') "The README example for $implementedAction omits -NonInteractive, so the command would only open the menu."
+    }
+    foreach ($removedAction in @('DryRun', 'Backup', 'Hide')) {
+        Assert-True ($readme -notmatch ('(?i)-Action ' + $removedAction + '\b')) "README documents the removed action as a command: $removedAction"
     }
 
     Assert-True ($license -match 'MIT License') 'LICENSE is not the MIT license.'
@@ -7997,7 +8021,14 @@ function Invoke-DocsTests {
     Assert-True ($workflow -match '(?m)^\s*runs-on:\s*windows') 'The workflow does not run on Windows.'
     Assert-True ($workflow -match 'actions/checkout@v[0-9]+') 'The workflow does not check out the repository with a pinned action.'
     Assert-True ($workflow -match '\[System\.Management\.Automation\.Language\.Parser\]') 'The workflow does not run PowerShell parser checks.'
-    Assert-True ($workflow -match '-Suite All') 'The workflow does not run the full test suite.'
+    Assert-True ($workflow -match '-Suite All') 'The workflow does not run the full suite.'
+    Assert-True ($workflow -match '(?m)^on:\s*$') 'The workflow does not declare its triggers.'
+    foreach ($trigger in @('push', 'pull_request')) {
+        Assert-True ($workflow -match ('(?m)^\s{2}' + $trigger + ':\s*$')) "The workflow does not run on the $trigger trigger."
+    }
+    Assert-True ($workflow -match '(?m)^\s*permissions:\s*$') 'The workflow does not declare token permissions.'
+    Assert-True ($workflow -match '(?m)^\s{2}contents:\s*read\s*$') 'The workflow does not restrict the workflow token to read-only contents.'
+    Assert-True ($workflow -match '(?m)^\s*timeout-minutes:\s*[0-9]+\s*$') 'The workflow does not bound the job with timeout-minutes.'
     foreach ($forbidden in @(
             'upload-artifact'
             'actions/setup-'
@@ -8012,7 +8043,7 @@ function Invoke-DocsTests {
             'dotnet'
             'pip install'
             'npm install'
-            'MuMu'
+            '(?i)mumu'
             '(?i)\badb\b'
         )) {
         Assert-True ($workflow -notmatch $forbidden) "The workflow uses a forbidden construct for a checkout-only build: $forbidden"
