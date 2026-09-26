@@ -550,6 +550,8 @@ The disable is not the end of the verification. Disabling the MuMu vendor root r
 - rollback verified: `Status` is `Warning` with code `ROOT_AFTER_DISABLE_ROLLED_BACK`, `VendorRootRetained = $true`, `RootVerified = $true`, and a message stating that Kitsune System Mode on MuMu 6.8 requires the vendor root. The journal is completed as a warning. It is never a `Success` root result, so a script must read `Status` rather than the process exit code, which is `0` for a `Warning`.
 - rollback refused, unreadable, or still unverified: `Status` is `CriticalError` with code `ROOT_RECOVERY_FAILED`, the journal is failed, and no root is claimed. `VendorRootRetained` is set only where a readback proved the vendor root is enabled.
 
+The daemon count is sampled until it settles instead of read once. A root shell probe can briefly leave a second process also named `magiskd`, so `pidof magiskd` returning two PIDs once is not a duplicate daemon. The check takes up to `ToolkitAndroid12DaemonSampleAttempts` samples, `ToolkitAndroid12DaemonSettleMilliseconds` apart, accepts only a count of exactly one, and reports `DAEMON_ABSENT` or `DAEMON_DUPLICATE` from the last sample when the count never settles. The root shell probe is issued once, after the daemon settled, so the check cannot respawn the helper it is waiting for. `DaemonCount` and `DaemonSamples` are returned and journaled.
+
 The Android 15 flow is unaffected and never disables its vendor root.
 
 ```powershell

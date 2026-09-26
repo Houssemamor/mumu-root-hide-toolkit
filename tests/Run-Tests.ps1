@@ -3778,7 +3778,8 @@ function New-Root12ManagerState {
         VersionCode = '31000'
         DaemonPids = '4242'
         DaemonExitCode = 0
-        DaemonPidsAfterDisable = $null
+        DaemonPidSequence = @()
+        DaemonSamples = @{}
         RootAllowedAfterDisable = $null
         RootAllowedAfterRollback = $null
         RootDisableCount = @{}
@@ -4021,8 +4022,11 @@ function New-Root12ManagerRunner {
                 }
             }
             if ($request -ceq 'shell pidof magiskd') {
-                if ($null -ne $State.DaemonPidsAfterDisable -and [int]$State.RootDisableCount[$index] -gt 0) {
-                    return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = $State.DaemonPidsAfterDisable }
+                $sampleIndex = [int]$State.DaemonSamples[$index]
+                $State.DaemonSamples[$index] = $sampleIndex + 1
+                if (@($State.DaemonPidSequence).Count -gt 0) {
+                    $sequenceIndex = [Math]::Min($sampleIndex, @($State.DaemonPidSequence).Count - 1)
+                    return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = [string]$State.DaemonPidSequence[$sequenceIndex] }
                 }
                 return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = $State.DaemonPids }
             }
@@ -4229,8 +4233,10 @@ function Invoke-Root12Tests {
     $bootAttemptsVariable = Get-Variable -Name 'ToolkitBootPollAttempts' -Scope Script -ErrorAction SilentlyContinue
     $bootDelayVariable = Get-Variable -Name 'ToolkitBootPollDelaySeconds' -Scope Script -ErrorAction SilentlyContinue
     $defaultPromptVariable = Get-Variable -Name 'ToolkitKitsuneDefaultPrompt' -Scope Script -ErrorAction SilentlyContinue
+    $daemonDelayVariable = Get-Variable -Name 'ToolkitAndroid12DaemonSettleMilliseconds' -Scope Script -ErrorAction SilentlyContinue
     $script:ToolkitBootPollAttempts = 2
     $script:ToolkitBootPollDelaySeconds = 0
+    $script:ToolkitAndroid12DaemonSettleMilliseconds = 0
     try {
         $prompt = Get-Android12KitsunePrompt
         Assert-Equal 'Install -> Direct Install into system partition' $prompt 'The Kitsune prompt is not the exact system-partition instruction.'
@@ -4900,6 +4906,44 @@ function Invoke-Root12Tests {
             Assert-Equal 1 @($recoveryState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*false*' }).Count "A failed rollback disabled the vendor root more than once ($($recoveryCase.Label))."
         }
 
+        foreach ($daemonSampleCase in @(
+                [pscustomobject]@{ Sequence = @('1118 3463', '1118'); Label = 'a duplicate that settles to one'; Code = 'OK'; Count = 1; Samples = 2; Status = 'Success' },
+                [pscustomobject]@{ Sequence = @('1118 3463'); Label = 'a persistent duplicate'; Code = 'DAEMON_DUPLICATE'; Count = 2; Samples = 3; Status = 'CriticalError' },
+                [pscustomobject]@{ Sequence = @('', '1118'); Label = 'a first read with no daemon'; Code = 'OK'; Count = 1; Samples = 2; Status = 'Success' },
+                [pscustomobject]@{ Sequence = @(''); Label = 'a daemon that never appears'; Code = 'DAEMON_ABSENT'; Count = 0; Samples = 3; Status = 'CriticalError' }
+            )) {
+            $daemonSampleState = New-Root12ManagerState -Install $install
+            $daemonSampleState.DaemonPidSequence = $daemonSampleCase.Sequence
+            $daemonSampleRunner = New-Root12ManagerRunner -State $daemonSampleState
+            $daemonSampleChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Runner $daemonSampleRunner
+            Assert-Equal $daemonSampleCase.Status $daemonSampleChecks.Status "The daemon settling poll accepted $($daemonSampleCase.Label)."
+            Assert-Equal $daemonSampleCase.Code $daemonSampleChecks.Data.Code "The daemon settling poll reported the wrong code for $($daemonSampleCase.Label)."
+            Assert-Equal $daemonSampleCase.Count $daemonSampleChecks.Data.DaemonCount "The daemon settling poll reported the wrong final count for $($daemonSampleCase.Label)."
+            Assert-Equal $daemonSampleCase.Samples $daemonSampleChecks.Data.DaemonSamples "The daemon settling poll took the wrong number of samples for $($daemonSampleCase.Label)."
+            Assert-Equal $daemonSampleCase.Samples @($daemonSampleState.Calls | Where-Object { (@($_) -join ' ') -like '*pidof magiskd*' }).Count "The daemon settling poll issued the wrong number of daemon reads for $($daemonSampleCase.Label)."
+            if ($daemonSampleCase.Status -ceq 'Success') {
+                Assert-Equal 1 @($daemonSampleState.Calls | Where-Object { (@($_) -join ' ') -like '*su -c id*' }).Count "The daemon settling poll issued a root shell probe per sample for $($daemonSampleCase.Label)."
+            }
+            else {
+                Assert-Equal -1 (Get-Root12CallIndex -Calls $daemonSampleState.Calls -Pattern '*su -c id*') "An unsettled daemon was accepted and probed for a root shell ($($daemonSampleCase.Label))."
+            }
+        }
+
+        $settledDuplicateState = New-Root12ManagerState -Install $install
+        $settledDuplicateState.DaemonPidSequence = @('1118 3463', '1118')
+        $settledDuplicateChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Runner (New-Root12ManagerRunner -State $settledDuplicateState)
+        Assert-True ((Get-Root12CallIndex -Calls $settledDuplicateState.Calls -Pattern '*su -c id*') -gt (Get-Root12LastCallIndex -Calls $settledDuplicateState.Calls -Pattern '*pidof magiskd*')) 'The root shell probe ran before the daemon settled.'
+
+        $duplicateRollbackState = New-Root12ManagerState -Install $install
+        $duplicateRollbackState.RootAllowedAfterDisable = $false
+        $duplicateRollbackState.DaemonPidSequence = @('1118', '1118 3463', '1118')
+        $duplicateRollback = Invoke-Root12Case -State $duplicateRollbackState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Warning -Result $duplicateRollback.Result -Journal $duplicateRollback.Journal -Code 'ROOT_AFTER_DISABLE_ROLLED_BACK' `
+            -Message 'A transient duplicate daemon count poisoned the rollback re-verification.'
+        Assert-Equal $true $duplicateRollback.Result.Data.VendorRootRetained 'A transient duplicate daemon count lost the retained vendor root record.'
+        Assert-Equal 1 $duplicateRollback.Result.Data.DaemonCount 'The rollback re-verification reported the wrong daemon count after a transient duplicate.'
+
         $callerState = New-Root12ManagerState -Install $install
         $callerState.DaemonExitCode = 1
         $callerState.DaemonPids = ''
@@ -5231,6 +5275,9 @@ function Invoke-Root12Tests {
         }
         if ($null -ne $bootDelayVariable) {
             $script:ToolkitBootPollDelaySeconds = $bootDelayVariable.Value
+        }
+        if ($null -ne $daemonDelayVariable) {
+            $script:ToolkitAndroid12DaemonSettleMilliseconds = $daemonDelayVariable.Value
         }
     }
 }

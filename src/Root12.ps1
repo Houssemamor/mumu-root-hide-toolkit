@@ -6,6 +6,13 @@ $script:ToolkitKitsunePrompt = 'Install -> Direct Install into system partition'
 $script:ToolkitKitsuneChoice = 'Direct Install into system partition'
 $script:ToolkitKitsuneRejection = 'Do not choose the ordinary Direct Install or Select and Patch a File option.'
 $script:ToolkitKitsuneLaunchCommand = 'shell monkey -p io.github.huskydg.magisk -c android.intent.category.LAUNCHER 1'
+# A root shell probe can briefly leave a second process named magiskd, so one sample is not enough to judge the daemon.
+if (-not (Test-Path variable:script:ToolkitAndroid12DaemonSampleAttempts)) {
+    $script:ToolkitAndroid12DaemonSampleAttempts = 3
+}
+if (-not (Test-Path variable:script:ToolkitAndroid12DaemonSettleMilliseconds)) {
+    $script:ToolkitAndroid12DaemonSettleMilliseconds = 400
+}
 $script:ToolkitKitsuneDefaultPrompt = {
     param([string]$PromptText)
 
@@ -287,12 +294,29 @@ function Test-Android12Root {
             })
     }
 
-    $daemonCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell pidof magiskd' -Runner $Runner
     $daemonPids = @()
     $daemonExitCode = $null
-    if ($null -ne $daemonCall) {
-        $daemonExitCode = $daemonCall.ExitCode
-        $daemonPids = @(([string]$daemonCall.Text) -split '\s+' | Where-Object { $_ })
+    $daemonSamples = 0
+    for ($attempt = 1; $attempt -le $script:ToolkitAndroid12DaemonSampleAttempts; $attempt++) {
+        $daemonCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell pidof magiskd' -Runner $Runner
+        $daemonSamples = $attempt
+        $daemonExitCode = $null
+        $daemonPids = @()
+        if ($null -ne $daemonCall) {
+            $daemonExitCode = $daemonCall.ExitCode
+            $daemonPids = @(([string]$daemonCall.Text) -split '\s+' | Where-Object { $_ })
+        }
+        if ($daemonExitCode -eq 0 -and $daemonPids.Count -eq 1) {
+            break
+        }
+        # Only a readable count is resampled, so the helper process has time to exit. A transport failure is classified from its own sample.
+        $readableCount = ($daemonExitCode -eq 0 -or ($daemonExitCode -eq 1 -and $daemonPids.Count -eq 0))
+        if (-not $readableCount) {
+            break
+        }
+        if ($attempt -lt $script:ToolkitAndroid12DaemonSampleAttempts) {
+            Start-Sleep -Milliseconds $script:ToolkitAndroid12DaemonSettleMilliseconds
+        }
     }
     if ($daemonExitCode -eq 0) {
         if ($daemonPids.Count -eq 0) {
@@ -302,6 +326,7 @@ function Test-Android12Root {
                     VersionName = $versionName
                     VersionCode = $versionCode
                     DaemonCount = 0
+                    DaemonSamples = $daemonSamples
                     RootVerified = $false
                 })
         }
@@ -312,6 +337,7 @@ function Test-Android12Root {
                     VersionName = $versionName
                     VersionCode = $versionCode
                     DaemonCount = $daemonPids.Count
+                    DaemonSamples = $daemonSamples
                     RootVerified = $false
                 })
         }
@@ -323,11 +349,12 @@ function Test-Android12Root {
                 VersionName = $versionName
                 VersionCode = $versionCode
                 DaemonCount = 0
+                DaemonSamples = $daemonSamples
                 RootVerified = $false
             })
     }
     else {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED' })
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED'; DaemonSamples = $daemonSamples })
     }
 
     $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
@@ -339,6 +366,7 @@ function Test-Android12Root {
                 VersionName = $versionName
                 VersionCode = $versionCode
                 DaemonCount = $daemonPids.Count
+                DaemonSamples = $daemonSamples
                 RootVerified = $false
             }
     }
@@ -349,6 +377,7 @@ function Test-Android12Root {
             VersionName = $versionName
             VersionCode = $versionCode
             DaemonCount = $daemonPids.Count
+            DaemonSamples = $daemonSamples
             RootVerified = $true
         })
 }
