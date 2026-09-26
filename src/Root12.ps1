@@ -485,21 +485,31 @@ function Install-Android12Root {
     if ($null -eq $enableRoot -or $enableRoot.ExitCode -ne 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The temporary vendor root could not be enabled on the clone.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_ENABLE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
-    $enabledSetting = Get-ToolkitRootSetting -ManagerPath $manager -Index $cloneIndex -Runner $Runner
-    if ($enabledSetting.Status -ne 'Success') {
-        return New-ToolkitRootFailure -Journal $Journal -Message ('The clone did not report a readable vendor root setting after the change. ' + $enabledSetting.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    $writableSystem = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$cloneIndex), '-k', 'system_disk_readonly', '-val', 'false') -Runner $Runner
+    if ($null -eq $writableSystem -or $writableSystem.ExitCode -ne 0) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone system disk could not be made writable, which Kitsune needs for a system partition install. The temporary vendor root was left enabled.' -Data (New-Android12Recovery -Code 'SYSTEM_DISK_ENABLE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
-    if ($enabledSetting.Data.Value -ne $true) {
+    $enabledSettings = Get-ToolkitInstanceSettings -ManagerPath $manager -Index $cloneIndex -Keys @('root_permission', 'system_disk_readonly') -Runner $Runner
+    if ($enabledSettings.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The clone did not report readable preparation settings after the change. ' + $enabledSettings.Message) -Data (New-Android12Recovery -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
+    $enabledRootValue = Get-ToolkitRecordValue -Record $enabledSettings.Data -PropertyNames @('root_permission')
+    if ($enabledRootValue -ne $true) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not report the enabled vendor root after the change.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_NOT_ENABLED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
+    $enabledSystemDiskValue = Get-ToolkitRecordValue -Record $enabledSettings.Data -PropertyNames @('system_disk_readonly')
+    if ($enabledSystemDiskValue -ne $false) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone still reports a read-only system disk, so Kitsune cannot install into the system partition. The temporary vendor root was left enabled.' -Data (New-Android12Recovery -Code 'SYSTEM_DISK_NOT_WRITABLE' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
     try {
-        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The temporary vendor root is enabled on the clone and is disabled again only after root verification.' -Data (@{
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The temporary vendor root is enabled on the clone and its system disk is writable, which Kitsune needs for a system partition install. The vendor root is disabled again only after root verification.' -Data (@{
                 PreviousRootSetting = [string]$previousRootValue
                 RootSetting = 'true'
+                SystemDiskReadonly = 'false'
             })
     }
     catch {
-        return New-ToolkitRootFailure -Journal $Journal -Message 'The enabled vendor root could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The enabled preparation settings could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
     $preInstallLaunch = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('control', '-v', ([string]$cloneIndex), 'launch') -Runner $Runner

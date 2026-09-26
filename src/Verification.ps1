@@ -20,6 +20,63 @@ function Invoke-ToolkitManagerAdb {
     return Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('adb', '-v', ([string]$InstanceIndex), '-c', $Command) -Runner $Runner
 }
 
+function Get-ToolkitInstanceSettings {
+    param(
+        [string]$ManagerPath,
+        [int]$Index,
+        [string[]]$Keys,
+        [scriptblock]$Runner = $null
+    )
+
+    $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
+    if ($null -eq $manager -or $Index -lt 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance setting query is invalid.' -Data (@{ Code = 'MANAGER_UNAVAILABLE' })
+    }
+    $keyList = @()
+    foreach ($key in @($Keys)) {
+        if ($key -isnot [string] -or $key -notmatch '^[a-z][a-z0-9_]*$') {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance setting query key is invalid.' -Data (@{ Code = 'SETTING_KEY_INVALID' })
+        }
+        $keyList += $key
+    }
+    if ($keyList.Count -eq 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance setting query key is invalid.' -Data (@{ Code = 'SETTING_KEY_INVALID' })
+    }
+
+    $argumentList = @('setting', '-v', ([string]$Index))
+    foreach ($key in $keyList) {
+        $argumentList += @('-k', $key)
+    }
+    $call = Invoke-CheckedProcess -FilePath $manager -ArgumentList $argumentList -Runner $Runner
+    if ($null -eq $call -or $call.ExitCode -ne 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance settings could not be read.' -Data (@{ Code = 'SETTING_QUERY_FAILED' })
+    }
+    $parsed = $null
+    try {
+        $parsed = ([string]$call.Text) | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance settings could not be read.' -Data (@{ Code = 'SETTING_QUERY_FAILED' })
+    }
+    if ($null -eq $parsed -or $parsed -is [string] -or $parsed -is [ValueType]) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance settings could not be read.' -Data (@{ Code = 'SETTING_QUERY_FAILED' })
+    }
+
+    $values = @{}
+    foreach ($key in $keyList) {
+        $property = $parsed.PSObject.Properties[$key]
+        if ($null -eq $property) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance settings could not be read.' -Data (@{ Code = 'SETTING_QUERY_FAILED' })
+        }
+        $value = ConvertTo-ToolkitBoolean -Value $property.Value
+        if ($null -eq $value) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance settings could not be read.' -Data (@{ Code = 'SETTING_QUERY_FAILED' })
+        }
+        $values[$key] = $value
+    }
+    return Get-ToolkitResult -Status 'Success' -Message 'The instance settings were read.' -Data $values
+}
+
 function Wait-ToolkitBootCompleted {
     param(
         [string]$ManagerPath,

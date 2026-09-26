@@ -3621,6 +3621,8 @@ $script:Root12Codes = @(
     'VENDOR_ROOT_SETTING_UNREADABLE',
     'VENDOR_ROOT_DISABLE_FAILED',
     'VENDOR_ROOT_NOT_DISABLED',
+    'SYSTEM_DISK_ENABLE_FAILED',
+    'SYSTEM_DISK_NOT_WRITABLE',
     'PREINSTALL_LAUNCH_FAILED',
     'PREINSTALL_BOOT_TIMEOUT',
     'APK_INSTALL_FAILED',
@@ -3746,6 +3748,9 @@ function New-Root12ManagerState {
         RootSettingQueries = 0
         RootSettingFailValue = ''
         RootSettingText = ''
+        SystemDiskReadonly = $true
+        SystemDiskWriteExitCode = 0
+        SystemDiskQueryMode = 'normal'
         AdbFailPattern = ''
         AdbThrowPattern = ''
         AdbFailExitCode = 1
@@ -3873,16 +3878,36 @@ function New-Root12ManagerRunner {
         }
         if ($command -eq 'setting') {
             $index = $arguments[2]
+            $keyFlags = @()
+            for ($flagIndex = 0; $flagIndex -lt $arguments.Count; $flagIndex++) {
+                if ($arguments[$flagIndex] -eq '-k' -and ($flagIndex + 1) -lt $arguments.Count) {
+                    $keyFlags += [string]$arguments[$flagIndex + 1]
+                }
+            }
             $valueIndex = [array]::IndexOf($arguments, '-val')
             if ($valueIndex -ge 0) {
                 $requestedValue = $arguments[$valueIndex + 1] -ceq 'true'
-                if ($State.RootSettingExitCode -ne 0 -and
-                    (([string]$State.RootSettingFailValue).Length -eq 0 -or [string]$State.RootSettingFailValue -ceq $arguments[$valueIndex + 1])) {
-                    return [pscustomobject]@{ ExitCode = $State.RootSettingExitCode; Text = '{"error_code":1}' }
+                $requestedKey = ''
+                if ($keyFlags.Count -gt 0) {
+                    $requestedKey = $keyFlags[0]
                 }
-                $ignored = ($requestedValue -and $State.IgnoreRootEnable) -or ((-not $requestedValue) -and $State.IgnoreRootDisable)
-                if (-not $ignored) {
-                    $State.RootSettings[$index] = $requestedValue
+                if ($requestedKey -ceq 'system_disk_readonly') {
+                    if ($State.SystemDiskWriteExitCode -ne 0) {
+                        return [pscustomobject]@{ ExitCode = $State.SystemDiskWriteExitCode; Text = '{"error_code":1}' }
+                    }
+                    if ([string]$State.SystemDiskQueryMode -cne 'stuck') {
+                        $State.SystemDiskReadonly = $requestedValue
+                    }
+                }
+                else {
+                    if ($State.RootSettingExitCode -ne 0 -and
+                        (([string]$State.RootSettingFailValue).Length -eq 0 -or [string]$State.RootSettingFailValue -ceq $arguments[$valueIndex + 1])) {
+                        return [pscustomobject]@{ ExitCode = $State.RootSettingExitCode; Text = '{"error_code":1}' }
+                    }
+                    $ignored = ($requestedValue -and $State.IgnoreRootEnable) -or ((-not $requestedValue) -and $State.IgnoreRootDisable)
+                    if (-not $ignored) {
+                        $State.RootSettings[$index] = $requestedValue
+                    }
                 }
             }
             if ($State.RootSettingQueryExitCode -ne 0 -or
@@ -3902,7 +3927,23 @@ function New-Root12ManagerRunner {
             if ($State.RootSettings.ContainsKey($index)) {
                 $current = [bool]$State.RootSettings[$index]
             }
-            return [pscustomobject]@{ ExitCode = 0; Text = ('{"root_permission":"' + $(if ($current) { 'true' } else { 'false' }) + '"}') }
+            $reported = [ordered]@{}
+            foreach ($reportedKey in $keyFlags) {
+                if ($reportedKey -ceq 'system_disk_readonly') {
+                    if ([string]$State.SystemDiskQueryMode -ceq 'omit') {
+                        continue
+                    }
+                    if ([string]$State.SystemDiskQueryMode -ceq 'malformed') {
+                        $reported['system_disk_readonly'] = 'unknown'
+                        continue
+                    }
+                    $reported['system_disk_readonly'] = [string]$State.SystemDiskReadonly
+                }
+                else {
+                    $reported[$reportedKey] = [string]$current
+                }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Text = (ConvertTo-Json -InputObject ([pscustomobject]$reported) -Compress) }
         }
         if ($command -eq 'adb') {
             $index = $arguments[2]
@@ -4678,6 +4719,73 @@ function Invoke-Root12Tests {
             Assert-True ($daemonFailure.Result.Message -match '(?i)daemon') "A root daemon result did not name the daemon ($($daemonCase.Label)): $($daemonFailure.Result.Message)"
             Assert-Equal -1 (Get-Root12CallIndex -Calls $daemonState.Calls -Pattern '*root_permission*-val*false*') "An unexpected root daemon result disabled the temporary vendor root ($($daemonCase.Label))."
         }
+
+        $systemDiskState = New-Root12ManagerState -Install $install
+        $systemDiskCase = Invoke-Root12Case -State $systemDiskState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-True ($systemDiskCase.Result.Status -eq 'Success') "The Android 12 workflow failed with a read-only system disk: $($systemDiskCase.Result.Message)"
+        $systemDiskWriteCalls = @($systemDiskState.Calls | Where-Object { ((@($_) -join ' ') -like 'setting*-v*-k*system_disk_readonly*') -and ((@($_) -join ' ') -like '*-val*') })
+        Assert-Equal 1 $systemDiskWriteCalls.Count "The workflow did not write the system disk setting exactly once: $(@(Get-Root12CallIndex -Calls $systemDiskState.Calls -Pattern '*system_disk_readonly*'))"
+        $systemDiskWriteArguments = [string[]]@($systemDiskWriteCalls[0])
+        Assert-Equal 7 $systemDiskWriteArguments.Count 'The system disk setting request carried an unexpected argument count.'
+        Assert-Equal 'setting' $systemDiskWriteArguments[0] 'The system disk setting request is not a manager setting request.'
+        Assert-Equal ([string]$systemDiskState.CloneIndex) $systemDiskWriteArguments[2] 'The system disk setting request did not target the clone.'
+        Assert-Equal '-k' $systemDiskWriteArguments[3] 'The system disk setting request lost its key flag.'
+        Assert-Equal 'system_disk_readonly' $systemDiskWriteArguments[4] 'The system disk setting request named the wrong key.'
+        Assert-Equal '-val' $systemDiskWriteArguments[5] 'The system disk setting request lost its value flag.'
+        Assert-Equal 'false' $systemDiskWriteArguments[6] 'The system disk setting request did not request a writable system disk.'
+        Assert-Equal $false $systemDiskState.SystemDiskReadonly 'The system disk setting was left read-only.'
+        foreach ($systemDiskCall in $systemDiskWriteCalls) {
+            $systemDiskCallArguments = [string[]]@($systemDiskCall)
+            Assert-True ($systemDiskCallArguments[2] -ceq [string]$systemDiskState.CloneIndex) 'The system disk setting was written on an instance other than the clone.'
+        }
+        $systemDiskReadIndex = Get-Root12CallIndex -Calls $systemDiskState.Calls -Pattern '*system_disk_readonly*'
+        $systemDiskInstallIndex = Get-Root12CallIndex -Calls $systemDiskState.Calls -Pattern ('*' + $kitsuneAssetPath + '*')
+        Assert-True ($systemDiskReadIndex -ge 0 -and $systemDiskReadIndex -lt $systemDiskInstallIndex) 'The workflow did not read back the system disk setting before the APK install.'
+        $systemDiskEvents = @((Get-OperationJournal -Path $systemDiskCase.Journal.JournalPath).Checkpoints | Where-Object { [string]$_.Message -match 'system disk is writable' })
+        Assert-Equal 1 $systemDiskEvents.Count 'The workflow did not journal both preparation settings.'
+        $systemDiskEventText = [string](@($systemDiskEvents[0].Data.PSObject.Properties | ForEach-Object { $_.Name }) -join ',')
+        Assert-True ($systemDiskEventText -match 'RootSetting') "The preparation journal event does not record the vendor root setting: $systemDiskEventText"
+        Assert-True ($systemDiskEventText -match 'SystemDiskReadonly') "The preparation journal event does not record the system disk setting: $systemDiskEventText"
+        Assert-True ((Get-Root12CallIndex -Calls $systemDiskState.Calls -Pattern 'setting*-k*root_permission*-k*system_disk_readonly*') -ge 0) 'The workflow did not read both preparation settings in one manager request.'
+
+        foreach ($systemDiskCase in @(
+                [pscustomobject]@{ QueryMode = 'omit'; Label = 'a missing system disk setting' },
+                [pscustomobject]@{ QueryMode = 'malformed'; Label = 'a malformed system disk setting' }
+            )) {
+            $unreadableState = New-Root12ManagerState -Install $install
+            $unreadableState.SystemDiskQueryMode = $systemDiskCase.QueryMode
+            $unreadableCase = Invoke-Root12Case -State $unreadableState -Instance $android12 -Manifest $manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Root12Failure -Result $unreadableCase.Result -Journal $unreadableCase.Journal -Code 'VENDOR_ROOT_SETTING_UNREADABLE' -Message "An unreadable preparation setting was accepted ($($systemDiskCase.Label))."
+            Assert-Equal -1 (Get-Root12CallIndex -Calls $unreadableState.Calls -Pattern 'adb*-v*-c*install*') "An unreadable preparation setting still reached the APK install ($($systemDiskCase.Label))."
+            Assert-Equal 0 (Get-Root12LaunchCount -Calls $unreadableState.Calls) "An unreadable preparation setting still launched the clone ($($systemDiskCase.Label))."
+            Assert-Equal $true $unreadableState.RootSettings[[string]$unreadableState.CloneIndex] "An unreadable preparation setting did not leave the temporary vendor root enabled ($($systemDiskCase.Label))."
+        }
+
+        $readOnlyWriteState = New-Root12ManagerState -Install $install
+        $readOnlyWriteState.IgnoreRootEnable = $true
+        $readOnlyWriteCase = Invoke-Root12Case -State $readOnlyWriteState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $readOnlyWriteCase.Result -Journal $readOnlyWriteCase.Journal -Code 'VENDOR_ROOT_NOT_ENABLED' -Message 'A wrong vendor root readback was accepted.'
+
+        $stuckSystemDiskState = New-Root12ManagerState -Install $install
+        $stuckSystemDiskState.SystemDiskQueryMode = 'stuck'
+        $stuckSystemDiskCase = Invoke-Root12Case -State $stuckSystemDiskState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $stuckSystemDiskCase.Result -Journal $stuckSystemDiskCase.Journal -Code 'SYSTEM_DISK_NOT_WRITABLE' -Message 'A wrong system disk readback was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $stuckSystemDiskState.Calls -Pattern 'adb*-v*-c*install*') 'A wrong system disk readback still reached the APK install.'
+        Assert-Equal 0 (Get-Root12LaunchCount -Calls $stuckSystemDiskState.Calls) 'A wrong system disk readback still launched the clone.'
+        Assert-Equal $true $stuckSystemDiskState.RootSettings[[string]$stuckSystemDiskState.CloneIndex] 'A wrong system disk readback did not leave the temporary vendor root enabled.'
+
+        $systemDiskWriteFailureState = New-Root12ManagerState -Install $install
+        $systemDiskWriteFailureState.SystemDiskWriteExitCode = 1
+        $systemDiskWriteFailureCase = Invoke-Root12Case -State $systemDiskWriteFailureState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $systemDiskWriteFailureCase.Result -Journal $systemDiskWriteFailureCase.Journal -Code 'SYSTEM_DISK_ENABLE_FAILED' -Message 'A failed system disk write was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $systemDiskWriteFailureState.Calls -Pattern 'adb*-v*-c*install*') 'A failed system disk write still reached the APK install.'
+        Assert-Equal 0 (Get-Root12LaunchCount -Calls $systemDiskWriteFailureState.Calls) 'A failed system disk write still launched the clone.'
+        Assert-Equal $true $systemDiskWriteFailureState.RootSettings[[string]$systemDiskWriteFailureState.CloneIndex] 'A failed system disk write did not leave the temporary vendor root enabled.'
 
         $callerState = New-Root12ManagerState -Install $install
         $callerState.DaemonExitCode = 1
