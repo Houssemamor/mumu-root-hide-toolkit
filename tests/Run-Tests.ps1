@@ -1454,6 +1454,64 @@ function Invoke-DiscoveryTests {
     $staleProcessVms = Find-MuMuInstallations -Edition 'Global' -RegistryRoots @() -ProcessSnapshot @([pscustomobject]@{ ExecutablePath = $globalRelocatedManager; CommandLine = '"' + $globalRelocatedManager + '"'; InstallRoot = $globalFixture.InstallRoot; Edition = 'Global'; VmsPath = $staleVmsPath }) -FallbackRoots @()
     Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $staleProcessVms) 'Stale explicit process VMS path was ignored.'
 
+    # A real uninstall row can carry no VMS value at all; that means infer it, not reject the row.
+    $liveRowRoot = Join-Path $discoveryRoot 'Live Row\MuMuPlayer'
+    $liveRowVms = Join-Path $liveRowRoot 'vms'
+    $liveRowFixture = New-DiscoveryInstallFixture -InstallRoot $liveRowRoot -VmsPath $liveRowVms
+    $script:discoveryRegistryEntries = @($script:discoveryRegistryEntries) + @(
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\LiveNoVmsPath'
+            DisplayName = 'MuMuPlayer'
+            Publisher = 'NetEase'
+            InstallLocation = $liveRowFixture.InstallRoot
+            Edition = 'Chinese'
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\LiveBlankVmsPath'
+            DisplayName = 'MuMuPlayer'
+            Publisher = 'NetEase'
+            InstallLocation = $liveRowFixture.InstallRoot
+            Edition = 'Chinese'
+            VmsPath = ''
+        },
+        [pscustomobject]@{
+            Root = 'FixtureRegistry:\LiveNonStringVmsPath'
+            DisplayName = 'MuMuPlayer'
+            Publisher = 'NetEase'
+            InstallLocation = $liveRowFixture.InstallRoot
+            Edition = 'Chinese'
+            VmsPath = 42
+        }
+    )
+    $absentPropertySnapshot = ConvertFrom-ToolkitUninstallSnapshot -Snapshot ([pscustomobject]@{
+            InstallLocation = $liveRowFixture.InstallRoot
+            DisplayName = 'MuMuPlayer'
+            Publisher = 'NetEase'
+            Edition = 'Chinese'
+        })
+    Assert-Equal '' $absentPropertySnapshot.VmsPath 'A snapshot without a VmsPath property did not normalize to an empty value.'
+    $liveRowAppData = $env:APPDATA
+    $env:APPDATA = Join-Path $fixtureProfileRoot 'empty'
+    try {
+        foreach ($absentVmsRoot in @('FixtureRegistry:\LiveNoVmsPath', 'FixtureRegistry:\LiveBlankVmsPath')) {
+            $absentVmsResult = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots @($absentVmsRoot) -ProcessSnapshot @() -FallbackRoots @())
+            $absentVmsStatus = Get-DiscoveryResultStatus $absentVmsResult[0]
+            $absentVmsMessage = ''
+            if ($absentVmsStatus -eq 'CriticalError') {
+                $absentVmsMessage = ': ' + $absentVmsResult[0].Message
+            }
+            Assert-Equal 1 $absentVmsResult.Count "A registry row without a usable VMS value was not discovered$absentVmsMessage"
+            Assert-True ($absentVmsStatus -ne 'CriticalError') "A registry row without a usable VMS value was rejected$absentVmsMessage"
+            Assert-Equal $liveRowVms $absentVmsResult[0].VmsPath "A registry row without a usable VMS value did not use the inferred VMS path$absentVmsMessage"
+            Assert-Equal 'Chinese' $absentVmsResult[0].Edition "A registry row without a usable VMS value lost its edition$absentVmsMessage"
+        }
+    }
+    finally {
+        $env:APPDATA = $liveRowAppData
+    }
+    $nonStringVmsResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\LiveNonStringVmsPath') -ProcessSnapshot @() -FallbackRoots @()
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $nonStringVmsResult) 'A non-string registry VMS value was accepted.'
+
     $conflictingVmsRoot = Join-Path $discoveryRoot 'Conflicting VMS\MuMu Global'
     $conflictingVmsManager = Join-Path $conflictingVmsRoot 'shell\MuMuManager.exe'
     New-Item -ItemType Directory -Path (Split-Path -Parent $conflictingVmsManager) -Force | Out-Null

@@ -538,10 +538,12 @@ function Find-MuMuInstallations {
             $vmsCandidate = ''
             $vmsCandidateProperty = $entry.PSObject.Properties['VmsPath']
             if ($null -ne $vmsCandidateProperty) {
-                if ($vmsCandidateProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($vmsCandidateProperty.Value)) {
+                if ($vmsCandidateProperty.Value -isnot [string]) {
                     return Get-ToolkitResult -Status 'CriticalError' -Message 'Registry VMS path is invalid.'
                 }
-                $vmsCandidate = $vmsCandidateProperty.Value
+                if (-not [string]::IsNullOrWhiteSpace($vmsCandidateProperty.Value)) {
+                    $vmsCandidate = $vmsCandidateProperty.Value
+                }
             }
             try {
                 $candidateEdition = Get-ToolkitEdition -Text ($displayName + ' ' + $installRoot) -ExplicitEdition $explicitEdition -AllowGenericMuMu
