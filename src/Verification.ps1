@@ -179,3 +179,371 @@ function New-ToolkitRootFailure {
     }
     return $result
 }
+
+function Get-ToolkitRecordValue {
+    param(
+        [AllowNull()]
+        [object]$Record,
+        [string[]]$PropertyNames
+    )
+
+    if ($null -eq $Record) {
+        return $null
+    }
+    if ($Record -is [Collections.IDictionary]) {
+        foreach ($propertyName in $PropertyNames) {
+            if ($Record.Contains($propertyName)) {
+                return $Record[$propertyName]
+            }
+        }
+        return $null
+    }
+    return Get-ToolkitFirstProperty -InputObject $Record -PropertyNames $PropertyNames
+}
+
+function Get-ToolkitJournalRecords {
+    param([string]$StateRoot)
+
+    $records = @()
+    if ([string]::IsNullOrWhiteSpace($StateRoot)) {
+        return $records
+    }
+    $journalRoot = ConvertTo-ToolkitFullPath -Path ([IO.Path]::Combine($StateRoot, 'journals'))
+    if ($null -eq $journalRoot -or -not [IO.Directory]::Exists($journalRoot)) {
+        return $records
+    }
+    foreach ($path in @([IO.Directory]::GetFiles($journalRoot, '*.json', [IO.SearchOption]::TopDirectoryOnly))) {
+        $record = $null
+        try {
+            $record = Get-OperationJournal -Path $path
+        }
+        catch {
+            $record = $null
+        }
+        if ($null -ne $record) {
+            $records += $record
+        }
+    }
+    return @($records | Sort-Object -Property StartedAt -Descending)
+}
+
+function Get-ToolkitVerifiedClone {
+    param(
+        [string]$StateRoot,
+        [object]$Install,
+        [int]$Index = -1
+    )
+
+    if ($null -eq $Install -or $Install -is [Array] -or $Install -isnot [pscustomobject]) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'A verified instance clone record is required, and the selected installation is invalid.' -Data (@{ Code = 'CLONE_RECORD_MISSING' })
+    }
+    $installRootProperty = $Install.PSObject.Properties['InstallRoot']
+    $installRoot = $null
+    if ($null -ne $installRootProperty -and $installRootProperty.Value -is [string]) {
+        $installRoot = ConvertTo-ToolkitFullPath -Path $installRootProperty.Value
+    }
+    if ($null -eq $installRoot -or $Index -lt 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'A verified instance clone record is required, and the selected installation or instance is invalid. Complete the matching Android 12 or Android 15 root action first.' -Data (@{ Code = 'CLONE_RECORD_MISSING' })
+    }
+
+    foreach ($record in @(Get-ToolkitJournalRecords -StateRoot $StateRoot)) {
+        if ([string]$record.Operation -cnotmatch '^(Root12|Root15)$' -or [string]$record.State -cne 'Completed') {
+            continue
+        }
+        if ($null -eq $record.Result) {
+            continue
+        }
+        $data = Get-ToolkitRecordValue -Record $record.Result -PropertyNames @('Data')
+        $cloneIndex = Get-ToolkitRecordValue -Record $data -PropertyNames @('CloneIndex')
+        $cloneName = Get-ToolkitRecordValue -Record $data -PropertyNames @('CloneName')
+        $sourceIndex = Get-ToolkitRecordValue -Record $data -PropertyNames @('SourceIndex')
+        if ($null -eq $cloneIndex -or [string]::IsNullOrWhiteSpace([string]$cloneName)) {
+            continue
+        }
+        $parsedCloneIndex = 0
+        if (-not [int]::TryParse([string]$cloneIndex, [ref]$parsedCloneIndex) -or $parsedCloneIndex -lt 0) {
+            continue
+        }
+        if ($null -ne $sourceIndex) {
+            $parsedSourceIndex = 0
+            if (-not [int]::TryParse([string]$sourceIndex, [ref]$parsedSourceIndex) -or $parsedSourceIndex -ne $Index) {
+                continue
+            }
+        }
+        $recordInstallRoot = $null
+        $recordedInstall = Get-ToolkitRecordValue -Record $record.Instance -PropertyNames @('Install')
+        $recordedRoot = Get-ToolkitRecordValue -Record $recordedInstall -PropertyNames @('InstallRoot')
+        if ($recordedRoot -is [string]) {
+            $recordInstallRoot = ConvertTo-ToolkitFullPath -Path $recordedRoot
+        }
+        if ($null -eq $recordInstallRoot -or -not $recordInstallRoot.Equals($installRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        return Get-ToolkitResult -Status 'Success' -Message "A verified instance clone record for the instance at index $Index was recovered at index $parsedCloneIndex." -Data $data
+    }
+
+    return Get-ToolkitResult -Status 'CriticalError' -Message "No verified instance clone record for the instance at index $Index was found in the operation journal. The selected instance is never changed without one, so the change was refused. Complete the matching Android 12 or Android 15 root action first." -Data (@{ Code = 'CLONE_RECORD_MISSING' })
+}
+
+function Get-ToolkitVirtualizationState {
+    try {
+        $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if ($null -eq $computer -or $null -eq $computer.PSObject.Properties['HypervisorPresent']) {
+            return 'Unknown'
+        }
+        $present = ConvertTo-ToolkitBoolean -Value $computer.HypervisorPresent
+        if ($null -eq $present) {
+            return 'Unknown'
+        }
+        if ([bool]$present) {
+            return 'Enabled'
+        }
+        return 'Disabled'
+    }
+    catch {
+        return 'Unknown'
+    }
+}
+
+function Get-ToolkitGuestState {
+    param(
+        [string]$ManagerPath,
+        [int]$InstanceIndex,
+        [string]$AndroidVersion,
+        [scriptblock]$Runner = $null
+    )
+
+    $guest = [ordered]@{
+        Root = 'Unknown'
+        Code = 'GUEST_UNREAD'
+        RootPermission = $null
+        Kitsune = ''
+        KernelSU = ''
+        DaemonCount = -1
+        HmaInstalled = $false
+        VectorModuleInstalled = $false
+        Failure = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($ManagerPath) -or $InstanceIndex -lt 0) {
+        $guest['Failure'] = 'The guest state was not read because no manager or instance is selected.'
+        return $guest
+    }
+
+    $checks = $null
+    if ($AndroidVersion -ceq '12.0') {
+        $checks = Test-Android12Root -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
+        if ($null -ne $checks -and $null -ne $checks.Data) {
+            $guest['Kitsune'] = [string](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('VersionName'))
+            $guest['DaemonCount'] = [int](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('DaemonCount'))
+        }
+    }
+    elseif ($AndroidVersion -ceq '15.0') {
+        $checks = Test-Android15Root -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
+        if ($null -ne $checks -and $null -ne $checks.Data) {
+            $guest['RootPermission'] = [bool](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('RootPermission'))
+            $guest['KernelSU'] = [string](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('KernelSUVersion'))
+        }
+    }
+    else {
+        $guest['Root'] = 'Unsupported'
+        $guest['Code'] = 'ANDROID_VERSION_UNSUPPORTED'
+        $guest['Failure'] = "The root state of Android version $AndroidVersion is not read because only Android 12 and Android 15 instances are supported."
+        return $guest
+    }
+
+    if ($null -ne $checks -and [string]$checks.Status -ceq 'Success') {
+        $guest['Root'] = 'Verified'
+        $guest['Code'] = 'OK'
+    }
+    else {
+        $guest['Root'] = 'Unverified'
+        $guest['Code'] = 'GUEST_UNREAD'
+        if ($null -ne $checks) {
+            $guest['Code'] = [string](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('Code'))
+            $guest['Failure'] = [string]$checks.Message
+        }
+        else {
+            $guest['Failure'] = 'The guest root state could not be read.'
+        }
+    }
+
+    $packages = Get-ConcealmentPackageList -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
+    if ([string]$packages.Status -ceq 'Success') {
+        $guest['HmaInstalled'] = @($packages.Data) -ccontains [string]$script:ConcealmentHmaPackage
+    }
+    elseif ([string]::IsNullOrWhiteSpace([string]$guest['Failure'])) {
+        $guest['Failure'] = [string]$packages.Message
+    }
+    $module = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell su -c "ls ' + [string]$script:ConcealmentVectorModulePath + '"') -Runner $Runner
+    if ($null -ne $module -and $module.ExitCode -eq 0) {
+        $guest['VectorModuleInstalled'] = $true
+    }
+    return $guest
+}
+
+function Get-ToolkitReport {
+    param(
+        [object]$Install,
+        [object]$Instance,
+        [object]$Journal,
+        [string]$StateRoot = '',
+        [scriptblock]$Runner = $null
+    )
+
+    $failures = @()
+    $guestDefaults = [ordered]@{
+        Root = 'Unknown'
+        Code = 'GUEST_UNREAD'
+        RootPermission = $null
+        Kitsune = ''
+        KernelSU = ''
+        DaemonCount = -1
+        HmaInstalled = $false
+        VectorModuleInstalled = $false
+        Failure = ''
+    }
+    $report = [ordered]@{
+        Install = [ordered]@{
+            Edition = 'Unknown'
+            InstallRoot = ''
+            VmsPath = ''
+            ManagerPath = ''
+            Source = 'Unknown'
+        }
+        ManagerVersion = 'Unknown'
+        Instances = @()
+        Instance = $null
+        Virtualization = 'Unknown'
+        Guest = $guestDefaults
+        Ads = [ordered]@{
+            CampaignFiles = @()
+            RestorePoint = 'Unknown'
+        }
+        Backups = [ordered]@{
+            CloneIndex = -1
+            CloneName = ''
+        }
+        JournalState = 'None'
+        JournalOperation = ''
+        JournalId = ''
+        Failures = @()
+        Mutated = $false
+    }
+
+    if ($null -ne $Journal -and $null -ne $Journal.PSObject.Properties['State']) {
+        $report['JournalState'] = [string]$Journal.State
+        $report['JournalOperation'] = [string](Get-ToolkitRecordValue -Record $Journal -PropertyNames @('Operation'))
+        $report['JournalId'] = [string](Get-ToolkitRecordValue -Record $Journal -PropertyNames @('Id'))
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($StateRoot)) {
+        $latest = @(Get-ToolkitJournalRecords -StateRoot $StateRoot)
+        if ($latest.Count -gt 0) {
+            $report['JournalState'] = [string]$latest[0].State
+            $report['JournalOperation'] = [string]$latest[0].Operation
+            $report['JournalId'] = [string]$latest[0].Id
+        }
+    }
+
+    if ($null -eq $Install -or $Install -is [Array] -or $Install -isnot [pscustomobject]) {
+        $report['Failures'] = @('No installation was selected, so no installation or guest state was read.')
+        return [pscustomobject]$report
+    }
+
+    $installRoot = $null
+    foreach ($fieldName in @('Edition', 'InstallRoot', 'VmsPath', 'ManagerPath', 'Source')) {
+        $value = ''
+        $property = $Install.PSObject.Properties[$fieldName]
+        if ($null -ne $property -and $property.Value -is [string]) {
+            $value = [string]$property.Value
+        }
+        $report['Install'][$fieldName] = $value
+        if ($fieldName -eq 'InstallRoot') {
+            $installRoot = ConvertTo-ToolkitFullPath -Path $value
+        }
+    }
+
+    $managerPath = [string]$report['Install']['ManagerPath']
+    if ([IO.File]::Exists($managerPath)) {
+        try {
+            $managerItem = Get-Item -LiteralPath $managerPath -Force -ErrorAction Stop
+            $managerVersion = [string]$managerItem.VersionInfo.ProductVersion
+            if (-not [string]::IsNullOrWhiteSpace($managerVersion)) {
+                $report['ManagerVersion'] = $managerVersion
+            }
+        }
+        catch {
+            $failures += 'The manager version could not be read.'
+        }
+    }
+    else {
+        $failures += 'The MuMu manager could not be located, so no manager version or instance state was read.'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($managerPath)) {
+        $discovered = @(Get-MuMuInstances -Install $Install -ManagerPath $managerPath)
+        if ($discovered.Count -eq 1 -and $null -ne $discovered[0].PSObject.Properties['Status']) {
+            $failures += "The instance list could not be read. $($discovered[0].Message)"
+        }
+        else {
+            $summaries = @()
+            foreach ($record in $discovered) {
+                $summaries += [ordered]@{
+                    Index = [int](Get-ToolkitRecordValue -Record $record -PropertyNames @('Index'))
+                    Name = [string](Get-ToolkitRecordValue -Record $record -PropertyNames @('Name'))
+                    AndroidVersion = [string](Get-ToolkitRecordValue -Record $record -PropertyNames @('AndroidVersion'))
+                    Running = Get-ToolkitRecordValue -Record $record -PropertyNames @('Running')
+                    RootSetting = Get-ToolkitRecordValue -Record $record -PropertyNames @('RootSetting')
+                    Eligible = Get-ToolkitRecordValue -Record $record -PropertyNames @('Eligible')
+                }
+            }
+            $report['Instances'] = $summaries
+        }
+    }
+
+    $selectedIndex = -1
+    if ($null -ne $Instance -and $null -ne $Instance.PSObject -and $null -ne $Instance.PSObject.Properties['Index']) {
+        $parsedIndex = 0
+        if ([int]::TryParse([string]$Instance.Index, [ref]$parsedIndex) -and $parsedIndex -ge 0) {
+            $selectedIndex = $parsedIndex
+        }
+    }
+    if ($selectedIndex -ge 0) {
+        $selected = @(@($report['Instances']) | Where-Object { [int]$_.Index -eq $selectedIndex })
+        if ($selected.Count -eq 0) {
+            $failures += "The selected instance at index $selectedIndex is not reported by the MuMu manager."
+        }
+        else {
+            $report['Instance'] = $selected[0]
+            $guest = Get-ToolkitGuestState -ManagerPath $managerPath -InstanceIndex $selectedIndex -AndroidVersion ([string]$selected[0].AndroidVersion) -Runner $Runner
+            $report['Guest'] = $guest
+            if (-not [string]::IsNullOrWhiteSpace([string]$guest['Failure'])) {
+                $failures += [string]$guest['Failure']
+            }
+            $clone = Get-ToolkitVerifiedClone -StateRoot $StateRoot -Install $Install -Index $selectedIndex
+            if ([string]$clone.Status -ceq 'Success') {
+                $report['Backups']['CloneIndex'] = [int]$clone.Data.CloneIndex
+                $report['Backups']['CloneName'] = [string]$clone.Data.CloneName
+            }
+        }
+    }
+
+    $report['Virtualization'] = Get-ToolkitVirtualizationState
+
+    $campaign = Get-MuMuCampaignPaths -Install $Install
+    if ([string]$campaign.Status -ceq 'Success') {
+        $report['Ads']['CampaignFiles'] = @($campaign.Data)
+    }
+    else {
+        $failures += [string]$campaign.Message
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StateRoot)) {
+        $restorePointPath = [IO.Path]::Combine($StateRoot, 'campaigns', [string]$script:ToolkitCampaignRestorePointFile)
+        $report['Ads']['RestorePoint'] = if ([IO.File]::Exists($restorePointPath)) { 'Present' } else { 'Missing' }
+    }
+    if ($null -eq $installRoot) {
+        $failures += 'The installation root could not be resolved.'
+    }
+
+    $report['Failures'] = $failures
+    return [pscustomobject]$report
+}

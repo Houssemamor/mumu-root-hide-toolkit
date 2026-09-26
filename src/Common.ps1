@@ -258,3 +258,64 @@ function Get-ToolkitLogPath {
         'mumu-root-hide-toolkit.log'
     )
 }
+
+function Get-ToolkitStateRoot {
+    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        throw 'LOCALAPPDATA is not available.'
+    }
+
+    [IO.Path]::Combine(
+        $env:LOCALAPPDATA,
+        'mumu-root-hide-toolkit'
+    )
+}
+
+function Write-ToolkitLogEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Info', 'Warning', 'Error')]
+        [string]$Level,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Message,
+        [string]$LogPath = ''
+    )
+
+    $path = $LogPath
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        $path = Get-ToolkitLogPath
+    }
+    $text = Protect-ToolkitText $Message
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $text = 'The action reported no detail.'
+    }
+    $level = Protect-ToolkitText $Level
+    $entry = '[' + [DateTime]::UtcNow.ToString('o') + '] [' + $level + '] ' + $text + [Environment]::NewLine
+    $directory = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($path))
+    [void][IO.Directory]::CreateDirectory($directory)
+    [IO.File]::AppendAllText([IO.Path]::GetFullPath($path), $entry, (New-Object Text.UTF8Encoding($false)))
+    return [IO.Path]::GetFullPath($path)
+}
+
+function Get-ToolkitExitCode {
+    param([object]$Result)
+
+    if ($null -eq $Result -or $Result -is [Array] -or $Result -isnot [pscustomobject]) {
+        return 1
+    }
+    $propertyNames = @($Result.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($propertyNames.Count -ne 3 -or
+        $propertyNames -cnotcontains 'Status' -or
+        $propertyNames -cnotcontains 'Message' -or
+        $propertyNames -cnotcontains 'Data') {
+        return 1
+    }
+    switch ([string]$Result.Status) {
+        'Success' { return 0 }
+        'AlreadyApplied' { return 0 }
+        'Warning' { return 0 }
+        'RecoverableError' { return 2 }
+        'CriticalError' { return 1 }
+        default { return 1 }
+    }
+}

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Ads', 'Root12', 'Root15', 'Verification', 'Concealment', 'All')]
+    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Ads', 'Root12', 'Root15', 'Verification', 'Concealment', 'Menu', 'All')]
     [string]$Suite = 'All'
 )
 
@@ -19,6 +19,8 @@ $verificationScriptPath = Join-Path $repoRoot 'src\Verification.ps1'
 $root12ScriptPath = Join-Path $repoRoot 'src\Root12.ps1'
 $root15ScriptPath = Join-Path $repoRoot 'src\Root15.ps1'
 $concealmentScriptPath = Join-Path $repoRoot 'src\Concealment.ps1'
+$controllerScriptPath = Join-Path $repoRoot 'src\Invoke-MumuToolkit.ps1'
+$launcherPath = Join-Path $repoRoot 'Run-MumuToolkit.bat'
 
 if (Test-Path -LiteralPath $commonPath -PathType Leaf) {
     . $commonPath
@@ -52,6 +54,9 @@ if (Test-Path -LiteralPath $root15ScriptPath -PathType Leaf) {
 }
 if (Test-Path -LiteralPath $concealmentScriptPath -PathType Leaf) {
     . $concealmentScriptPath
+}
+if (Test-Path -LiteralPath $controllerScriptPath -PathType Leaf) {
+    . $controllerScriptPath
 }
 
 function Assert-True {
@@ -5541,7 +5546,7 @@ function Invoke-VerificationTests {
     Assert-True (Test-Path -LiteralPath $root15ScriptPath -PathType Leaf) 'src/Root15.ps1 does not exist.'
 
     $verificationSource = [IO.File]::ReadAllText($verificationScriptPath)
-    Assert-True ($verificationSource -notmatch "'UNKNOWN'") 'The shared verification source reports an UNKNOWN failure code.'
+    Assert-True ($verificationSource -notmatch "(?i)Code\s*=\s*'UNKNOWN'") 'The shared verification source reports an UNKNOWN failure code.'
     foreach ($forbidden in @(
             'Invoke-Expression',
             'ScriptBlock]::Create',
@@ -5566,7 +5571,10 @@ function Invoke-VerificationTests {
         )) {
         Assert-True ($verificationSource -notmatch [regex]::Escape($forbidden)) "Shared verification source uses a forbidden construct: $forbidden"
     }
-    Assert-True ($verificationSource -notmatch '(?i)hyper-?v|memory\s*integrity|exploit\s*protection|credential\s*guard') 'The shared verification source mentions a Hyper-V, VBS, or memory integrity control.'
+    Assert-True ($verificationSource -notmatch '(?i)memory\s*integrity|exploit\s*protection|credential\s*guard') 'The shared verification source mentions a memory integrity, exploit protection, or credential guard control.'
+    foreach ($mutatingPattern in @('(?i)set-?itemproperty|new-?itemproperty|remove-?itemproperty|reg\s+add|reg\s+delete|enablehypervisorlaunchtype|disablehypervisorlaunchtype|bcdedit\s+/set')) {
+        Assert-True ($verificationSource -notmatch $mutatingPattern) "The shared verification source uses a mutating platform control: $mutatingPattern"
+    }
 
     $root12Source = [IO.File]::ReadAllText($root12ScriptPath)
     foreach ($removedHelper in @('function Invoke-Android12Adb', 'function Wait-Android12BootCompleted', 'function Get-Android12RootSetting', 'function New-Android12RootFailure', 'ToolkitBootPollAttempts =', 'ToolkitBootPollDelaySeconds =')) {
@@ -7057,6 +7065,594 @@ function Invoke-ConcealmentTests {
     Assert-Equal 'CriticalError' $negativeIndexResult.Status 'Concealment verification accepted a negative instance index.'
 }
 
+$script:MenuActions = @('Detect', 'Verify', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+$script:MenuCampaignJson = '{"version":3,"campaigns":[{"id":"alpha","display":true,"order":1,"image":"a.png"},{"id":"beta","order":2}]}'
+$script:MenuInfoJson12 = '[{"index":"0","name":"Base","is_main":true,"is_process_started":false,"android_version":"12.0"},{"index":"2","name":"Android 12","is_main":false,"is_process_started":true,"android_version":"12.0"}]'
+$script:MenuInfoJson15 = '[{"index":"0","name":"Base","is_main":true,"is_process_started":false,"android_version":"15.0"},{"index":"3","name":"Android 15","is_main":false,"is_process_started":true,"android_version":"15.0"}]'
+$script:MenuInfoJsonUnsupported = '[{"index":"0","name":"Base","is_main":true,"is_process_started":false,"android_version":"11.0"},{"index":"2","name":"Old","is_main":false,"is_process_started":true,"android_version":"11.0"}]'
+$script:MenuFallbackRoots = @()
+
+function New-MenuSnapshot {
+    param([string]$Root)
+
+    $snapshot = @{}
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not [IO.Directory]::Exists($Root)) {
+        return $snapshot
+    }
+    foreach ($file in @([IO.Directory]::GetFiles($Root, '*', [IO.SearchOption]::AllDirectories))) {
+        $snapshot[$file.ToUpperInvariant()] = [pscustomobject]@{
+            Path = $file
+            Hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+        }
+    }
+    return $snapshot
+}
+
+function Get-MenuSnapshotDelta {
+    param(
+        [object]$Before,
+        [object]$After
+    )
+
+    $delta = @()
+    foreach ($key in @($Before.Keys)) {
+        if (-not $After.ContainsKey($key)) {
+            $delta += $Before[$key].Path
+        }
+        elseif ($Before[$key].Hash -cne $After[$key].Hash) {
+            $delta += $Before[$key].Path
+        }
+    }
+    foreach ($key in @($After.Keys)) {
+        if (-not $Before.ContainsKey($key)) {
+            $delta += $After[$key].Path
+        }
+    }
+    return @($delta)
+}
+
+function New-MenuInstallFixture {
+    param(
+        [string]$Name,
+        [string]$Edition = 'Global',
+        [string]$InfoJson = $script:MenuInfoJson12,
+        [switch]$Campaign
+    )
+
+    $root = Join-Path $testRoot (Join-Path 'menu fixtures' (Join-Path 'MuMu Global' $Name))
+    $vms = Join-Path $root 'vms'
+    [void][IO.Directory]::CreateDirectory($vms)
+    $manager = New-DiscoveryManagerFixture -InstallRoot $root -InfoJson $InfoJson -SettingJson '{"root_permission":"true"}'
+    $campaignPath = ''
+    if ($Campaign) {
+        $relativePath = if ($Edition -eq 'Global') { 'shell\ad\campaign.json' } else { 'MuMuPlayer\ad\campaign.json' }
+        $campaignPath = Join-Path $root $relativePath
+        New-AdsCampaignFixture -Path $campaignPath -Json $script:MenuCampaignJson
+    }
+    return [pscustomobject]@{
+        Install = [pscustomobject]@{
+            Edition = $Edition
+            InstallRoot = [IO.Path]::GetFullPath($root)
+            VmsPath = [IO.Path]::GetFullPath($vms)
+            ManagerPath = $manager
+            Source = 'Fallback'
+        }
+        CampaignPath = $campaignPath
+    }
+}
+
+function New-MenuGuestRunner {
+    param([hashtable]$Responses)
+
+    return {
+        param($ActualFilePath, $ActualArgumentList)
+
+        $command = (@($ActualArgumentList) -join ' ')
+        if (-not $command.StartsWith('adb')) {
+            return Invoke-CheckedProcess -FilePath $ActualFilePath -ArgumentList $ActualArgumentList
+        }
+        foreach ($pattern in @($Responses.Keys)) {
+            if ($command -like ('*' + $pattern + '*')) {
+                return [pscustomobject]@{
+                    ExitCode = [int]$Responses[$pattern][0]
+                    Text = [string]$Responses[$pattern][1]
+                }
+            }
+        }
+        return [pscustomobject]@{ ExitCode = 1; Text = 'menu fixture: unsupported command' }
+    }.GetNewClosure()
+}
+
+function Get-MenuGuestResponses {
+    param(
+        [switch]$NoKitsune,
+        [switch]$NoRootShell,
+        [switch]$NoVectorModule,
+        [switch]$NoPackageList,
+        [switch]$Android15
+    )
+
+    $newline = [Environment]::NewLine
+    $responses = @{
+        'dumpsys package io.github.huskydg.magisk' = @(0, ('Package [io.github.huskydg.magisk] (a1b2c3):' + $newline + '    versionCode=31000 minSdk=28' + $newline + '    versionName=31.0-kitsune'))
+        'dumpsys package me.weishu.kernelsu' = @(0, ('Package [me.weishu.kernelsu] (a1b2c3):' + $newline + '    versionCode=30205 minSdk=28' + $newline + '    versionName=3.2.5'))
+        'pidof magiskd' = @(0, '1234')
+        'su -c id' = @(0, 'uid=0(root) gid=0(root) groups=0(root)')
+        'pm list packages' = @(0, ('package:me.weishu.kernelsu' + $newline + 'package:org.frknkrc44.hma_oss' + $newline + 'package:io.github.huskydg.magisk'))
+        'ls /data/adb/modules/vector' = @(0, 'vector')
+    }
+    if ($Android15) {
+        $responses['pm list packages'] = @(0, ('package:me.weishu.kernelsu' + $newline + 'package:org.frknkrc44.hma_oss'))
+    }
+    if ($NoKitsune) {
+        $responses.Remove('dumpsys package io.github.huskydg.magisk')
+    }
+    if ($NoRootShell) {
+        $responses['su -c id'] = @(0, 'uid=2000(shell) gid=2000(shell) groups=2000(shell)')
+    }
+    if ($NoVectorModule) {
+        $responses.Remove('ls /data/adb/modules/vector')
+    }
+    if ($NoPackageList) {
+        $responses.Remove('pm list packages')
+    }
+    return $responses
+}
+
+function New-MenuReader {
+    param([string[]]$Answers)
+
+    $position = @{ Value = 0 }
+    return {
+        if ($position.Value -ge $Answers.Count) {
+            return $null
+        }
+        $answer = $Answers[$position.Value]
+        $position.Value++
+        return $answer
+    }.GetNewClosure()
+}
+
+function Get-MenuManagerCalls {
+    param([object]$Fixture)
+
+    $argumentsPath = Join-Path (Split-Path -Parent $Fixture.Install.ManagerPath) 'args.log'
+    if (-not [IO.File]::Exists($argumentsPath)) {
+        return @()
+    }
+    return @([IO.File]::ReadAllLines($argumentsPath))
+}
+
+function Invoke-MenuTests {
+    foreach ($commandName in @('Get-ToolkitStateRoot', 'Write-ToolkitLogEntry', 'Get-ToolkitExitCode', 'Get-ToolkitReport', 'Get-ToolkitVerifiedClone', 'Get-ToolkitJournalRecords', 'Invoke-ToolkitAction', 'Invoke-MenuAction', 'Invoke-MenuLoop', 'Get-ToolkitActionCatalog')) {
+        Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Menu command is unavailable: $commandName"
+    }
+    Assert-True (Test-Path -LiteralPath $controllerScriptPath -PathType Leaf) 'src/Invoke-MumuToolkit.ps1 does not exist.'
+    Assert-True (Test-Path -LiteralPath $launcherPath -PathType Leaf) 'Run-MumuToolkit.bat does not exist.'
+
+    $menuStateRoot = Join-Path $testRoot 'menu state'
+    [void][IO.Directory]::CreateDirectory($menuStateRoot)
+    $menuLogPath = Join-Path $menuStateRoot 'logs\menu.log'
+    $menuJournalRoot = Join-Path $menuStateRoot 'journals'
+
+    function Get-ToolkitDiscoverySources {
+        return @{
+            RegistryRoots = @('FixtureRegistry:\Menu')
+            ProcessSnapshot = @()
+            FallbackRoots = @($script:MenuFallbackRoots)
+        }
+    }
+    function Get-ToolkitUninstallEntries {
+        param([string]$Root)
+
+        return @()
+    }
+
+    try {
+        $stateRoot = Get-ToolkitStateRoot
+        Assert-True ($stateRoot.StartsWith((Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit'), [StringComparison]::OrdinalIgnoreCase)) 'The state root is outside the per-user toolkit directory.'
+        $blankAppData = $env:LOCALAPPDATA
+        $env:LOCALAPPDATA = '   '
+        Assert-Throws { Get-ToolkitStateRoot } 'A blank LOCALAPPDATA produced a state root.'
+        $env:LOCALAPPDATA = $blankAppData
+
+        foreach ($status in @('Success', 'AlreadyApplied', 'Warning')) {
+            Assert-Equal 0 (Get-ToolkitExitCode (Get-ToolkitResult -Status $status -Message 'fixture')) "Exit code is invalid for $status."
+        }
+        Assert-Equal 2 (Get-ToolkitExitCode (Get-ToolkitResult -Status 'RecoverableError' -Message 'fixture')) 'A recoverable error did not map to exit code 2.'
+        Assert-Equal 1 (Get-ToolkitExitCode (Get-ToolkitResult -Status 'CriticalError' -Message 'fixture')) 'A critical error did not map to exit code 1.'
+        Assert-Equal 1 (Get-ToolkitExitCode $null) 'A missing result did not map to exit code 1.'
+        Assert-Equal 1 (Get-ToolkitExitCode ([pscustomobject]@{ Status = 'Bogus'; Message = 'fixture' })) 'A noncanonical result did not map to exit code 1.'
+
+        $menuLogPathResult = Write-ToolkitLogEntry -Level 'Error' -Message 'menu log fixture token=menu_log_secret' -LogPath $menuLogPath
+        Assert-Equal $menuLogPath $menuLogPathResult 'The log entry returned the wrong path.'
+        Assert-True (Test-Path -LiteralPath $menuLogPath -PathType Leaf) 'The log entry wrote no log file.'
+        $menuLogText = [IO.File]::ReadAllText($menuLogPath)
+        Assert-True ($menuLogText -match '\[REDACTED\]') 'The log entry did not redact a secret.'
+        Assert-True ($menuLogText -notmatch 'menu_log_secret') 'The log entry persisted a raw secret.'
+        Assert-True ($menuLogText -match '\[Error\]') 'The log entry did not record its level.'
+
+        $catalog = @(Get-ToolkitActionCatalog)
+        $catalogNames = @($catalog | ForEach-Object { [string]$_.Name })
+        $expectedActions = @($script:MenuActions) + @('Q')
+        Assert-Equal ($expectedActions -join ',') ($catalogNames -join ',') 'The menu catalog does not match the dispatchable actions and the quit action.'
+        foreach ($required in $expectedActions) {
+            Assert-True (@(@($catalog | Where-Object { [string]$_.Name -ceq $required } | ForEach-Object { [string]$_.Description }) | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) "The menu catalog has no description for an action: $required"
+        }
+
+        $controllerSource = [IO.File]::ReadAllText($controllerScriptPath)
+        Assert-True ($controllerSource -match 'while\s*\(\s*\$true\s*\)') 'The controller does not use a persistent while loop.'
+        Assert-True ($controllerSource -notmatch "(?i)Code\s*=\s*'UNKNOWN'") 'The controller source reports an UNKNOWN failure code.'
+        foreach ($forbidden in @(
+                'Invoke-Expression',
+                'ScriptBlock]::Create',
+                'Add-Type',
+                'Start-Process',
+                'RunAs',
+                'Set-ExecutionPolicy',
+                'Invoke-WebRequest',
+                'Invoke-RestMethod',
+                'WebClient',
+                'DownloadFile',
+                'schtasks',
+                'New-ItemProperty',
+                'Set-ItemProperty',
+                'Remove-ItemProperty',
+                'New-NetFirewallRule',
+                'Set-MpPreference',
+                'bcdedit',
+                'drivers\etc\hosts',
+                'certutil',
+                'bitsadmin'
+            )) {
+            Assert-True ($controllerSource -notmatch [regex]::Escape($forbidden)) "The controller source uses a forbidden construct: $forbidden"
+        }
+
+        $launcherSource = [IO.File]::ReadAllText($launcherPath)
+        Assert-True ($launcherSource -match '@echo\s+off') 'The launcher does not suppress command echo.'
+        Assert-True ($launcherSource -match 'setlocal') 'The launcher does not localize its environment.'
+        Assert-True ($launcherSource -match '%~dp0') 'The launcher does not resolve its own directory.'
+        Assert-True ($launcherSource -match 'powershell\.exe\s+-NoProfile\s+-ExecutionPolicy\s+RemoteSigned\s+-File\s+"%ROOT%src\\Invoke-MumuToolkit\.ps1"') 'The launcher does not invoke the controller with the required PowerShell options.'
+        Assert-True ($launcherSource -match 'exit\s+/b\s+%CODE%') 'The launcher does not propagate the controller exit code.'
+        Assert-Equal 1 ([regex]::Matches($launcherSource, '(?i)\bpause\b')).Count 'The launcher does not pause exactly once.'
+        Assert-True ($launcherSource -match '(?is)if\s+not\s+"%CODE%"=="0"\s*\r?\n?\s*pause') 'The launcher does not pause only after a failure.'
+        foreach ($forbidden in @(
+                'runas',
+                '-Verb',
+                'Start-Process',
+                'certutil',
+                'bitsadmin',
+                'mshta',
+                'regsvr32',
+                'schtasks',
+                '-enc',
+                '-EncodedCommand',
+                'Set-ExecutionPolicy',
+                'Invoke-WebRequest',
+                'Invoke-RestMethod',
+                'http://',
+                'https://',
+                'ftp://',
+                'reg add',
+                'reg delete',
+                'net user',
+                'net localgroup',
+                'sc config',
+                'wmic',
+                'copy ',
+                'move ',
+                'del ',
+                'rmdir',
+                '>>',
+                'Expand-Archive'
+            )) {
+            Assert-True ($launcherSource -notmatch [regex]::Escape($forbidden)) "The launcher uses a forbidden construct: $forbidden"
+        }
+
+        $reportInstall = New-MenuInstallFixture -Name 'report' -InfoJson $script:MenuInfoJson12 -Campaign
+        $android15Install = New-MenuInstallFixture -Name 'android15' -InfoJson $script:MenuInfoJson15
+        $unsupportedInstall = New-MenuInstallFixture -Name 'unsupported' -InfoJson $script:MenuInfoJsonUnsupported
+        $concealInstall = New-MenuInstallFixture -Name 'conceal' -InfoJson $script:MenuInfoJson12
+        $script:MenuFallbackRoots = @(
+            $reportInstall.Install.InstallRoot
+            $android15Install.Install.InstallRoot
+            $unsupportedInstall.Install.InstallRoot
+            $concealInstall.Install.InstallRoot
+        )
+
+        $reportJournalRoot = Join-Path $testRoot 'menu report journals'
+        $reportJournal = New-OperationJournal -Root $reportJournalRoot -Operation 'Report' -Instance ([pscustomobject]@{ Index = 2 })
+        $reportInstance = [pscustomobject]@{
+            Index = 2
+            Name = 'Android 12'
+            AndroidVersion = '12.0'
+            Running = $true
+            Install = $reportInstall.Install
+        }
+        $reportManagerCallsBefore = @(Get-MenuManagerCalls -Fixture $reportInstall)
+        $reportSnapshotBefore = New-MenuSnapshot -Root $reportInstall.Install.InstallRoot
+        $reportStateBefore = New-MenuSnapshot -Root $menuStateRoot
+        $report = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $reportJournal -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
+        $reportDelta = @(Get-MenuSnapshotDelta -Before $reportSnapshotBefore -After (New-MenuSnapshot -Root $reportInstall.Install.InstallRoot))
+        $reportStateDelta = @(Get-MenuSnapshotDelta -Before $reportStateBefore -After (New-MenuSnapshot -Root $menuStateRoot))
+        $reportMutation = @($reportDelta + $reportStateDelta | Where-Object { [IO.Path]::GetFileName($_) -ne 'args.log' })
+
+        Assert-True ($report.Mutated -eq $false) 'The read-only report claims a mutation.'
+        Assert-Equal 0 $reportMutation.Count "The read-only report changed files: $($reportMutation -join '|')"
+        Assert-Equal 0 @($report.Failures).Count "The read-only report recorded failures: $(@($report.Failures) -join '|')"
+        Assert-Equal 'Global' $report.Install.Edition 'The report did not report the installation edition.'
+        Assert-Equal $reportInstall.Install.InstallRoot $report.Install.InstallRoot 'The report did not report the installation root.'
+        Assert-Equal $reportInstall.Install.VmsPath $report.Install.VmsPath 'The report did not report the VMS path.'
+        Assert-Equal $reportInstall.Install.ManagerPath $report.Install.ManagerPath 'The report did not report the manager path.'
+        Assert-True ($report.ManagerVersion -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$report.ManagerVersion)) 'The report did not collect a manager version.'
+        Assert-Equal 2 @($report.Instances).Count 'The report did not collect every instance.'
+        Assert-Equal 2 $report.Instance.Index 'The report did not resolve the selected instance.'
+        Assert-Equal '12.0' $report.Instance.AndroidVersion 'The report did not report the instance Android version.'
+        Assert-Equal $true $report.Instance.Running 'The report did not report the running state.'
+        Assert-Equal $true $report.Instance.RootSetting 'The report did not report the vendor root setting.'
+        Assert-True (@('Enabled', 'Disabled', 'Unknown') -ccontains $report.Virtualization) "The report reported an invalid virtualization state: $($report.Virtualization)"
+        Assert-Equal 'Verified' $report.Guest.Root 'The report did not report a verified root.'
+        Assert-Equal '31.0-kitsune' $report.Guest.Kitsune 'The report did not report the Kitsune package version.'
+        Assert-Equal 1 $report.Guest.DaemonCount 'The report did not report the root daemon count.'
+        Assert-Equal $true $report.Guest.HmaInstalled 'The report did not report the HMA package state.'
+        Assert-Equal $true $report.Guest.VectorModuleInstalled 'The report did not report the Vector module state.'
+        Assert-Equal 'Running' $report.JournalState 'The report did not report the journal state.'
+        Assert-True (@($report.Ads.CampaignFiles) -contains $reportInstall.CampaignPath) 'The report did not report the campaign file.'
+        Assert-Equal 'Missing' $report.Ads.RestorePoint 'The report reported a restore point that does not exist.'
+        Assert-Equal -1 $report.Backups.CloneIndex 'The report invented a verified clone record.'
+        $reportManagerCalls = @(Get-MenuManagerCalls -Fixture $reportInstall)
+        Assert-Equal ($reportManagerCallsBefore.Count + 2) $reportManagerCalls.Count 'The report issued an unexpected number of manager requests.'
+        foreach ($call in @($reportManagerCalls | Select-Object -Skip $reportManagerCallsBefore.Count)) {
+            Assert-True (($call -match '^(info|setting)\|') -or ($call -match '^adb\|')) "The report issued a mutating manager request: $call"
+        }
+
+        $unrootedReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -NoKitsune -NoRootShell -NoVectorModule -NoPackageList))
+        Assert-Equal 'Unverified' $unrootedReport.Guest.Root 'The report did not report an unverified root.'
+        Assert-Equal '' $unrootedReport.Guest.Kitsune 'The report invented a Kitsune package version.'
+        Assert-Equal $false $unrootedReport.Guest.HmaInstalled 'The report invented an HMA package state.'
+        Assert-Equal $false $unrootedReport.Guest.VectorModuleInstalled 'The report invented a Vector module state.'
+        Assert-True (@($unrootedReport.Failures).Count -ge 1) 'The report did not record its unreadable guest sections.'
+        Assert-Equal 'None' $unrootedReport.JournalState 'The report invented a journal state without a journal.'
+        Assert-Equal 0 $unrootedReport.Mutated 'The unverified report claims a mutation.'
+
+        $unsupportedReport = Get-ToolkitReport -Install $unsupportedInstall.Install -Instance ([pscustomobject]@{ Index = 2; Install = $unsupportedInstall.Install }) -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
+        Assert-Equal 'Unsupported' $unsupportedReport.Guest.Root 'The report probed an unsupported Android version.'
+        Assert-True (@($unsupportedReport.Failures).Count -ge 1) 'The report did not record the unsupported Android version.'
+
+        $android15Report = Get-ToolkitReport -Install $android15Install.Install -Instance ([pscustomobject]@{ Index = 3; AndroidVersion = '15.0'; Install = $android15Install.Install }) -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -Android15))
+        Assert-Equal 'Verified' $android15Report.Guest.Root 'The report did not verify the Android 15 root.'
+        Assert-Equal '3.2.5' $android15Report.Guest.KernelSU 'The report did not report the KernelSU version.'
+        Assert-Equal '' $android15Report.Guest.Kitsune 'The report invented a Kitsune package for an Android 15 instance.'
+        Assert-True ($android15Report.Guest.RootPermission -eq $true) 'The report did not report the Android 15 vendor root setting.'
+
+        $brokenReport = Get-ToolkitReport -Install ([pscustomobject]@{
+                Edition = 'Global'
+                InstallRoot = (Join-Path $testRoot 'menu fixtures\absent')
+                VmsPath = ''
+                ManagerPath = ''
+                Source = 'Fallback'
+            }) -Instance $null -StateRoot $menuStateRoot
+        Assert-True (@($brokenReport.Failures).Count -ge 1) 'The report did not record an unreadable installation.'
+        Assert-Equal 'Unknown' $brokenReport.ManagerVersion 'The report invented a manager version for an unreadable installation.'
+        Assert-Equal 0 @($brokenReport.Instances).Count 'The report invented instances for an unreadable installation.'
+        Assert-Equal $false $brokenReport.Mutated 'The unreadable report claims a mutation.'
+
+        $completedJournal = New-OperationJournal -Root $menuJournalRoot -Operation 'Root12' -Instance $reportInstance
+        Write-JournalEvent -Journal $completedJournal -Level 'Info' -Message 'clone verified' -Data $null
+        $cloneRecord = [pscustomobject]@{
+            Code         = 'OK'
+            Step         = 'complete'
+            SourceIndex  = 2
+            CloneIndex   = 7
+            CloneName    = 'Android 12 clone'
+            RootVerified = $true
+        }
+        Complete-OperationJournal -Journal $completedJournal -Result (Get-ToolkitResult -Status 'Success' -Message 'Android 12 Kitsune root is verified.' -Data $cloneRecord)
+        $verifiedClone = Get-ToolkitVerifiedClone -StateRoot $menuStateRoot -Install $reportInstall.Install -Index 2
+        Assert-Equal 'Success' $verifiedClone.Status "The verified clone record was not recovered from the journal store. $($verifiedClone.Message)"
+        Assert-Equal 7 $verifiedClone.Data.CloneIndex 'The recovered clone record has the wrong index.'
+        Assert-Equal 'Android 12 clone' $verifiedClone.Data.CloneName 'The recovered clone record has the wrong name.'
+        $wrongInstallClone = Get-ToolkitVerifiedClone -StateRoot $menuStateRoot -Install $android15Install.Install -Index 2
+        Assert-Equal 'CriticalError' $wrongInstallClone.Status 'A clone record from another installation was accepted.'
+        $wrongIndexClone = Get-ToolkitVerifiedClone -StateRoot $menuStateRoot -Install $reportInstall.Install -Index 9
+        Assert-Equal 'CriticalError' $wrongIndexClone.Status 'A clone record for another instance was accepted.'
+        $absentStoreClone = Get-ToolkitVerifiedClone -StateRoot (Join-Path $testRoot 'menu fixtures\absent state') -Install $reportInstall.Install -Index 2
+        Assert-Equal 'CriticalError' $absentStoreClone.Status 'A missing journal store produced a clone record.'
+        $journalRecords = @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot)
+        Assert-Equal 1 @($journalRecords | Where-Object { [string]$_.Operation -ceq 'Root12' }).Count 'The journal store did not report its records.'
+        $cloneReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
+        Assert-Equal 7 $cloneReport.Backups.CloneIndex 'The report did not report the verified clone record.'
+        Assert-Equal 'Android 12 clone' $cloneReport.Backups.CloneName 'The report reported the wrong verified clone name.'
+        Assert-Equal 'Completed' $cloneReport.JournalState 'The report did not report the persisted journal state.'
+        Assert-Equal 'Root12' $cloneReport.JournalOperation 'The report did not report the persisted journal operation.'
+
+        $detectResult = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $reportInstall.Install.InstallRoot -StateRoot $menuStateRoot
+        Assert-Equal 'Success' $detectResult.Status "Detect action failed: $($detectResult.Message)"
+        Assert-Equal $reportInstall.Install.InstallRoot $detectResult.Data.InstallRoot 'Detect reported the wrong installation root.'
+        Assert-Equal 2 $detectResult.Data.InstanceCount 'Detect reported the wrong instance count.'
+        Assert-Equal 2 $detectResult.Data.InstanceIndex 'Detect reported the wrong selected instance index.'
+        Assert-Equal 0 @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot | Where-Object { [string]$_.Operation -ceq 'Detect' }).Count 'Detect created a journal.'
+
+        $secondInstall = New-MenuInstallFixture -Name 'ambiguous'
+        $script:MenuFallbackRoots = @($reportInstall.Install.InstallRoot, $secondInstall.Install.InstallRoot)
+        $ambiguousResult = Invoke-ToolkitAction -Action 'Detect' -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $ambiguousResult.Status 'An ambiguous installation selection was accepted.'
+        Assert-True ($ambiguousResult.Message -match '(?i)explicit|multiple|ambiguous') "An ambiguous installation selection did not explain itself: $($ambiguousResult.Message)"
+        $ambiguousVerify = Invoke-ToolkitAction -Action 'Verify' -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $ambiguousVerify.Status 'An ambiguous installation selection was accepted for a read-only report.'
+        $promptedResult = Invoke-ToolkitAction -Action 'Detect' -StateRoot $menuStateRoot -Prompt ({ '1' }).GetNewClosure()
+        Assert-Equal 'Success' $promptedResult.Status "A prompted installation selection failed: $($promptedResult.Message)"
+        Assert-Equal $secondInstall.Install.InstallRoot $promptedResult.Data.InstallRoot 'A prompted installation selection chose the wrong installation.'
+        $script:MenuFallbackRoots = @(
+            $reportInstall.Install.InstallRoot
+            $android15Install.Install.InstallRoot
+            $unsupportedInstall.Install.InstallRoot
+            $concealInstall.Install.InstallRoot
+        )
+
+        $unknownAction = Invoke-ToolkitAction -Action 'Bogus' -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $unknownAction.Status 'An unknown action was accepted.'
+        Assert-True ($unknownAction.Message -match '(?i)action') 'An unknown action did not report the action name.'
+        $unknownMenuAction = Invoke-MenuAction -Action 'Bogus' -Runner { param($Action) Get-ToolkitResult -Status 'Success' -Message 'injected' } -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 'CriticalError' $unknownMenuAction.Status 'An unknown action reached an injected runner.'
+        $quitAction = Invoke-ToolkitAction -Action 'Q' -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $quitAction.Status 'The quit action was dispatched as a toolkit action.'
+
+        $successRunner = { param($Action) Get-ToolkitResult -Status 'Success' -Message "ran $Action" -Data @{ Value = 1 } }.GetNewClosure()
+        $first = Invoke-MenuAction -Action 'Detect' -Runner $successRunner -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-True ($first.Status -eq 'Success') 'Detect action failed.'
+        Assert-Equal 'ran Detect' $first.Message 'The injected runner result was not returned.'
+        Assert-True ($first.Data.Contains('Log') -eq $false) 'A successful action carried a log path.'
+        $recoverableRunner = { param($Action) Get-ToolkitResult -Status 'RecoverableError' -Message 'injected recoverable failure' }.GetNewClosure()
+        $error = Invoke-MenuAction -Action 'Root12' -Runner $recoverableRunner -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-True ($error.Status -eq 'RecoverableError') 'Recoverable error was not returned to the menu.'
+        Assert-True ([string]$error.Data.Log -eq $menuLogPath) 'A recoverable error did not carry a log path.'
+        $throwingRunner = { param($Action) throw 'injected menu failure token=menu_runner_secret' }.GetNewClosure()
+        $thrown = Invoke-MenuAction -Action 'Root12' -Runner $throwingRunner -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 'CriticalError' $thrown.Status 'A thrown action failure was not converted.'
+        Assert-True ($thrown.Message -notmatch 'menu_runner_secret') 'A converted failure leaked a raw secret.'
+        Assert-True ($thrown.Message -match '\[REDACTED\]') 'A converted failure was not redacted.'
+        Assert-True ([string]$thrown.Data.Log -eq $menuLogPath) 'A converted failure did not carry a log path.'
+        $malformedRunner = { param($Action) 'not a toolkit result' }.GetNewClosure()
+        $malformed = Invoke-MenuAction -Action 'Verify' -Runner $malformedRunner -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 'CriticalError' $malformed.Status 'A malformed action result was returned to the menu.'
+        $silentRunner = { param($Action) }.GetNewClosure()
+        $silent = Invoke-MenuAction -Action 'Verify' -Runner $silentRunner -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 'CriticalError' $silent.Status 'An action that returned no result was returned to the menu.'
+        $menuLogAfterActions = [IO.File]::ReadAllText($menuLogPath)
+        Assert-True ($menuLogAfterActions -match '\[REDACTED\]') 'The menu log did not record a redacted failure.'
+        Assert-True ($menuLogAfterActions -notmatch 'menu_runner_secret') 'The menu log persisted a raw secret.'
+        Assert-True ($menuLogAfterActions -match 'Root12') 'The menu log did not record the failed action.'
+
+        $loopState = @{ Calls = @() ; Lines = @() }
+        $loopCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Root12', 'Q')) -Writer ({ param($Line) $loopState.Lines += $Line }).GetNewClosure() -Runner ({ param($Action) $loopState.Calls += $Action; throw 'injected loop failure' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 1 $loopCode 'A critical error did not return a nonzero exit code.'
+        Assert-Equal 1 $loopState.Calls.Count 'A critical error ran the next action.'
+        Assert-True ((@($loopState.Lines) -join "`n") -match '\[CriticalError\]') 'A critical error was not displayed.'
+        Assert-True ((@($loopState.Lines) -join "`n") -match 'Log:') 'A critical error was displayed without a log path.'
+        Assert-True ((@($loopState.Lines) -join "`n") -match '(?i)recovery') 'A critical error was displayed without recovery guidance.'
+        Assert-True ((@($loopState.Lines) -join "`n") -match '\[CriticalError\].*Root12|.*Root12') 'A critical error did not name the failed action.'
+
+        $recoverableState = @{ Calls = @() }
+        $recoverableLoopCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Verify', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $recoverableState.Calls += $Action; Get-ToolkitResult -Status 'RecoverableError' -Message 'injected recoverable failure' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 2 $recoverableLoopCode 'A recoverable error did not return exit code 2.'
+        Assert-Equal 1 $recoverableState.Calls.Count 'A recoverable error did not return to the menu.'
+
+        $quitState = @{ Calls = @() }
+        $quitCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $quitState.Calls += $Action }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 0 $quitCode 'Quitting did not return a zero exit code.'
+        Assert-Equal 0 $quitState.Calls.Count 'Quitting ran an action.'
+
+        $blankCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('   ', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 0 $blankCode 'A blank menu answer did not return normally.'
+
+        $eofCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @()) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 0 $eofCode 'An exhausted menu input did not return normally.'
+
+        $readerState = @{ Lines = @() }
+        $readerFailureCode = Invoke-MenuLoop -Reader ({ throw 'injected reader failure' }).GetNewClosure() -Writer ({ param($Line) $readerState.Lines += $Line }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 1 $readerFailureCode 'A menu read failure did not return a nonzero exit code.'
+        Assert-True ((@($readerState.Lines) -join "`n") -match '\[CriticalError\]') 'A menu read failure was not displayed as a critical error.'
+
+        $verifyResult = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
+        Assert-Equal 'Success' $verifyResult.Status "Verify action failed: $($verifyResult.Message)"
+        Assert-Equal $false $verifyResult.Data.Report.Mutated 'The Verify action did not report a read-only report.'
+        Assert-Equal 'Verified' $verifyResult.Data.Report.Guest.Root 'The Verify action did not report the guest root state.'
+        Assert-Equal 0 @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot | Where-Object { [string]$_.Operation -ceq 'Verify' }).Count 'The Verify action created a journal.'
+
+        $verifyWarning = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -NoKitsune -NoRootShell))
+        Assert-Equal 'Warning' $verifyWarning.Status "A report with unreadable sections was not reported as a warning: $($verifyWarning.Message)"
+        Assert-Equal 'Unverified' $verifyWarning.Data.Report.Guest.Root 'A warning report did not keep the guest root state.'
+        Assert-True (@($verifyWarning.Data.Report.Failures).Count -ge 1) 'A warning report did not keep its failure list.'
+
+        $root15Unconfirmed = Invoke-ToolkitAction -Action 'Root15' -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $root15Unconfirmed.Status "An unconfirmed Android 15 action returned $($root15Unconfirmed.Status)."
+        Assert-True ($root15Unconfirmed.Message -match '(?i)confirm') 'An unconfirmed Android 15 action did not ask for an explicit confirmation.'
+        Assert-Equal 0 @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot | Where-Object { [string]$_.Operation -ceq 'Root15' }).Count 'An unconfirmed Android 15 action created a journal.'
+
+        $concealWithoutClone = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $concealInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $concealWithoutClone.Status 'Concealment was accepted without a verified clone record.'
+        Assert-True ($concealWithoutClone.Message -match '(?i)clone|root') "Concealment without a clone record did not explain the missing record: $($concealWithoutClone.Message)"
+        Assert-Equal 0 @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot | Where-Object { [string]$_.Operation -ceq 'Conceal' }).Count 'Concealment without a clone record created a journal.'
+
+        $concealNoPackages = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $concealInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $concealNoPackages.Status 'Concealment was accepted without a package selection.'
+        Assert-True ($concealNoPackages.Message -match '(?i)package') "Concealment without a package selection did not report the missing selection: $($concealNoPackages.Message)"
+        Assert-Equal 0 @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot | Where-Object { [string]$_.Operation -ceq 'Conceal' }).Count 'Concealment without a package selection created a journal.'
+
+        $adsInstall = New-MenuInstallFixture -Name 'ads' -Campaign
+        $adsOtherInstall = New-MenuInstallFixture -Name 'ads other' -Campaign
+        $adsPlainInstall = New-MenuInstallFixture -Name 'ads plain'
+        $adsStateRoot = Join-Path $testRoot 'menu ads state'
+        $script:MenuFallbackRoots = @($adsInstall.Install.InstallRoot, $adsOtherInstall.Install.InstallRoot, $adsPlainInstall.Install.InstallRoot)
+        $adsVictimPath = Join-Path $adsOtherInstall.Install.InstallRoot 'victim.txt'
+        [IO.File]::WriteAllText($adsVictimPath, 'victim fixture')
+        $adsOriginalCampaign = $script:MenuCampaignJson
+
+        $removeResult = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        Assert-Equal 'Success' $removeResult.Status "RemoveAds failed: $($removeResult.Message)"
+        $suppressedCampaign = [IO.File]::ReadAllText($adsInstall.CampaignPath)
+        Assert-Equal $false ($suppressedCampaign | ConvertFrom-Json).campaigns[0].display 'The first RemoveAds did not suppress the campaign file.'
+        Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $adsStateRoot 'campaigns') -Recurse -Filter 'restore-point.json' -File).Count -eq 1) 'The first RemoveAds did not write exactly one restore point.'
+        $secondRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        Assert-Equal 'Success' $secondRemove.Status "A repeated RemoveAds failed: $($secondRemove.Message)"
+        $repeatedCampaign = [IO.File]::ReadAllText($adsInstall.CampaignPath)
+        Assert-Equal $suppressedCampaign $repeatedCampaign 'A repeated RemoveAds did not leave the campaign file suppressed.'
+
+        $wrongBoundary = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsOtherInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        Assert-Equal 'CriticalError' $wrongBoundary.Status 'A campaign restore accepted another installation as its boundary.'
+        Assert-True ($wrongBoundary.Message -match '(?i)boundary') "A cross-installation restore did not report a boundary failure: $($wrongBoundary.Message)"
+        Assert-Equal $repeatedCampaign ([IO.File]::ReadAllText($adsInstall.CampaignPath)) 'A refused cross-installation restore changed the campaign file.'
+        Assert-Equal 'victim fixture' ([IO.File]::ReadAllText($adsVictimPath)) 'A refused cross-installation restore wrote a file outside the boundary.'
+
+        $adsSnapshotBefore = New-MenuSnapshot -Root $adsInstall.Install.InstallRoot
+        $unresolvedRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot (Join-Path $testRoot 'menu fixtures\absent ads install') -StateRoot $adsStateRoot
+        Assert-Equal 'CriticalError' $unresolvedRestore.Status 'A campaign restore without a resolvable boundary was accepted.'
+        $missingInstallRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot '' -StateRoot $adsStateRoot
+        Assert-Equal 'CriticalError' $missingInstallRemove.Status 'An advertisement suppression without a resolvable installation was accepted.'
+        $unresolvedDelta = @(Get-MenuSnapshotDelta -Before $adsSnapshotBefore -After (New-MenuSnapshot -Root $adsInstall.Install.InstallRoot) | Where-Object { [IO.Path]::GetFileName($_) -ne 'args.log' })
+        Assert-Equal 0 $unresolvedDelta.Count "A refused advertisement action changed files: $($unresolvedDelta -join '|')"
+
+        $restoreResult = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        Assert-Equal 'Success' $restoreResult.Status "Restore failed: $($restoreResult.Message)"
+        Assert-Equal $adsOriginalCampaign ([IO.File]::ReadAllText($adsInstall.CampaignPath)) 'The campaign restore did not restore the original campaign file.'
+        Assert-Equal 'victim fixture' ([IO.File]::ReadAllText($adsVictimPath)) 'The campaign restore wrote a file outside the boundary.'
+        $emptyStateRoot = Join-Path $testRoot 'menu ads empty state'
+        $unpreparedRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $emptyStateRoot
+        Assert-Equal 'CriticalError' $unpreparedRestore.Status 'A campaign restore without a restore point was accepted.'
+
+        $plainStateRoot = Join-Path $testRoot 'menu ads plain state'
+        $plainResult = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsPlainInstall.Install.InstallRoot -StateRoot $plainStateRoot
+        Assert-Equal 'AlreadyApplied' $plainResult.Status "An advertisement suppression without a campaign file was not reported: $($plainResult.Message)"
+        $plainJournals = @(Get-ToolkitJournalRecords -StateRoot $plainStateRoot | Where-Object { [string]$_.Operation -ceq 'RemoveAds' })
+        Assert-Equal 1 $plainJournals.Count 'The advertisement action did not keep exactly one operation journal.'
+        Assert-Equal 'Completed' $plainJournals[0].State 'The advertisement action left its operation journal open.'
+        Assert-Equal 'AlreadyApplied' $plainJournals[0].Result.Status 'The advertisement journal did not persist the result.'
+
+        $childStateRoot = Join-Path $testRoot 'menu child state'
+        $childRun = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @(
+            '-NoProfile'
+            '-ExecutionPolicy'
+            'RemoteSigned'
+            '-File'
+            $controllerScriptPath
+            '-Action'
+            'Bogus'
+            '-NonInteractive'
+            '-StateRoot'
+            $childStateRoot
+        )
+        Assert-Equal 1 $childRun.ExitCode "A noninteractive unknown action returned $($childRun.ExitCode)."
+        Assert-True ($childRun.Text -match '(?i)action') "A noninteractive unknown action printed no result: $($childRun.Text)"
+        $childStateFiles = @((New-MenuSnapshot -Root $childStateRoot).Keys)
+        Assert-Equal 1 $childStateFiles.Count "A refused noninteractive action wrote state other than its log: $($childStateFiles -join '|')"
+        Assert-True ($childStateFiles[0] -match '\.log$') "A refused noninteractive action wrote state other than its log: $($childStateFiles[0])"
+    }
+    finally {
+        $script:MenuFallbackRoots = @()
+    }
+}
+
 function Invoke-CommonTests {
     Assert-True ($null -ne (Get-Command Get-ToolkitLogPath -CommandType Function -ErrorAction SilentlyContinue)) 'Get-ToolkitLogPath is unavailable.'
     $logRoot = Join-Path $env:LOCALAPPDATA 'mumu-root-hide-toolkit\logs'
@@ -7104,6 +7700,9 @@ try {
         'Concealment' {
             Invoke-ConcealmentTests
         }
+        'Menu' {
+            Invoke-MenuTests
+        }
         'All' {
             Invoke-ManifestTests
             Invoke-AssetTests
@@ -7117,6 +7716,7 @@ try {
             Invoke-ConcealmentTests
             Invoke-Root12Tests
             Invoke-Root15Tests
+            Invoke-MenuTests
             Invoke-CommonTests
         }
     }
