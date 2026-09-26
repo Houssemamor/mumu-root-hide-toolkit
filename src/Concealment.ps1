@@ -24,10 +24,11 @@ $script:ConcealmentMaximumPackageLength = 255
 $script:ConcealmentMaximumGuestPathLength = 255
 $script:ConcealmentJsonDepth = 12
 $script:ConcealmentStateFields = @(
-    'Code', 'Step', 'InstanceIndex', 'Packages', 'TemplateName', 'TemplatePackages',
-    'IsWhitelist', 'HmaConfigVersion', 'InScope', 'Installed', 'AlreadyPresent',
-    'KernelSUInstalled', 'AllowlistPresent', 'AllowlistLength', 'ProfileStateObserved',
-    'BackupPath', 'ConfigPath', 'Handoff'
+    'Code', 'Step', 'InstanceIndex', 'CloneIndex', 'CloneName', 'Packages', 'OutOfScope',
+    'TemplateName', 'TemplatePackages', 'TemplateFound', 'IsWhitelist', 'HmaConfigVersion',
+    'InScope', 'Installed', 'AlreadyPresent', 'InstalledCount', 'KernelSUInstalled',
+    'AllowlistPresent', 'AllowlistLength', 'ProfileStateObserved', 'BackupPath',
+    'BackupVerified', 'ConfigPath', 'Handoff'
 )
 $script:ConcealmentUiHandoffSteps = @(
     'Open the Hide My Applist OSS app on the selected instance.',
@@ -49,9 +50,13 @@ function New-ConcealmentState {
         Code                 = $Code
         Step                 = $Step
         InstanceIndex        = $InstanceIndex
+        CloneIndex           = -1
+        CloneName            = ''
         Packages             = @()
+        OutOfScope           = @()
         TemplateName         = [string]$script:ConcealmentTemplateName
         TemplatePackages     = @()
+        TemplateFound        = $false
         IsWhitelist          = $false
         HmaConfigVersion     = -1
         InScope              = @()
@@ -62,6 +67,7 @@ function New-ConcealmentState {
         AllowlistLength      = -1
         ProfileStateObserved = $false
         BackupPath           = ''
+        BackupVerified       = $false
         ConfigPath           = [string]$script:ConcealmentConfigPath
         Handoff              = @()
     }
@@ -78,12 +84,13 @@ function New-ConcealmentState {
 function New-ConcealmentHandoff {
     param(
         [object]$Journal,
-        [hashtable]$State
+        [hashtable]$State,
+        [string]$Reason
     )
 
     $state = $State
     $state['Steps'] = @($script:ConcealmentUiHandoffSteps)
-    $message = 'The installed HMA configuration is not a supported schema, so no configuration was written and no app scope changed. Configure it in the supported UI instead: ' + (@($script:ConcealmentUiHandoffSteps) -join ' ')
+    $message = $Reason + ' No configuration was written and no app scope changed. Configure the supported UI instead: ' + (@($script:ConcealmentUiHandoffSteps) -join ' ')
     $result = Get-ToolkitResult -Status 'Warning' -Message $message -Data $state
     $journalState = $null
     if ($null -ne $Journal -and $null -ne $Journal.PSObject -and $null -ne $Journal.PSObject.Properties['State']) {
@@ -101,6 +108,65 @@ function New-ConcealmentHandoff {
     return $result
 }
 
+function Get-ConcealmentTextSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($sha.ComputeHash((New-Object Text.UTF8Encoding($false)).GetBytes($Text))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-ConcealmentJsonDepth {
+    param(
+        [AllowNull()]
+        [object]$Value,
+        [int]$Level = 1
+    )
+
+    if ($Level -gt $script:ConcealmentJsonDepth) {
+        return $Level
+    }
+    if ($Value -is [pscustomobject]) {
+        $deepest = $Level
+        foreach ($property in @($Value.PSObject.Properties)) {
+            $child = Get-ConcealmentJsonDepth -Value $property.Value -Level ($Level + 1)
+            if ($child -gt $deepest) {
+                $deepest = $child
+            }
+        }
+        return $deepest
+    }
+    if ($Value -is [Collections.IDictionary]) {
+        $deepest = $Level
+        foreach ($key in $Value.Keys) {
+            $child = Get-ConcealmentJsonDepth -Value $Value[$key] -Level ($Level + 1)
+            if ($child -gt $deepest) {
+                $deepest = $child
+            }
+        }
+        return $deepest
+    }
+    if ($Value -is [Array]) {
+        $deepest = $Level
+        foreach ($item in $Value) {
+            $child = Get-ConcealmentJsonDepth -Value $item -Level ($Level + 1)
+            if ($child -gt $deepest) {
+                $deepest = $child
+            }
+        }
+        return $deepest
+    }
+    return $Level
+}
+
 function Test-ConcealmentPackageName {
     param(
         [AllowNull()]
@@ -113,6 +179,39 @@ function Test-ConcealmentPackageName {
         return $false
     }
     return ($Name -cmatch $script:ConcealmentPackagePattern)
+}
+
+function Test-ConcealmentGuestPath {
+    param([string]$Path)
+
+    if ($Path -isnot [string] -or $Path -notmatch '^/[A-Za-z0-9._/-]+$' -or
+        $Path -match '//' -or $Path -match '(^|/)\.\.(/|$)' -or
+        $Path.Length -gt $script:ConcealmentMaximumGuestPathLength) {
+        return $false
+    }
+    return $true
+}
+
+function Get-ConcealmentRecordField {
+    param(
+        [object]$Record,
+        [string]$Name
+    )
+
+    if ($null -eq $Record) {
+        return $null
+    }
+    if ($Record -is [Collections.IDictionary]) {
+        if (-not $Record.Contains($Name)) {
+            return $null
+        }
+        return $Record[$Name]
+    }
+    $property = $Record.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
 }
 
 function Get-ConcealmentPackageScope {
@@ -201,17 +300,112 @@ function Resolve-ConcealmentInstance {
     }
     $installRootProperty = $installProperty.Value.PSObject.Properties['InstallRoot']
     $installManagerProperty = $installProperty.Value.PSObject.Properties['ManagerPath']
+    $installVmsProperty = $installProperty.Value.PSObject.Properties['VmsPath']
     if ($null -eq $installRootProperty -or $installRootProperty.Value -isnot [string] -or
-        $null -eq $installManagerProperty -or $installManagerProperty.Value -isnot [string]) {
+        $null -eq $installManagerProperty -or $installManagerProperty.Value -isnot [string] -or
+        $null -eq $installVmsProperty -or $installVmsProperty.Value -isnot [string]) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The selected instance install is invalid.' -Data (New-ConcealmentState -Code 'INSTANCE_INVALID' -Step 'instance' -InstanceIndex $instanceIndex)
     }
     $installRoot = ConvertTo-ToolkitFullPath -Path $installRootProperty.Value
     $manager = ConvertTo-ToolkitFullPath -Path $installManagerProperty.Value
+    $vmsPath = ConvertTo-ToolkitFullPath -Path $installVmsProperty.Value
     if ($null -eq $manager -or $null -eq $installRoot -or
         -not (Test-ToolkitManagerFile -Path $manager -InstallRoot $installRoot)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The MuMu manager is not a valid manager inside the selected install root.' -Data (New-ConcealmentState -Code 'MANAGER_UNAVAILABLE' -Step 'instance' -InstanceIndex $instanceIndex)
     }
-    return Get-ToolkitResult -Status 'Success' -Message 'The selected instance is usable.' -Data @{ Manager = $manager; Index = $instanceIndex }
+    if ($null -eq $vmsPath -or -not (Test-Path -LiteralPath $vmsPath -PathType Container)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The selected instance VMS path is unavailable.' -Data (New-ConcealmentState -Code 'INSTANCE_INVALID' -Step 'instance' -InstanceIndex $instanceIndex)
+    }
+    return Get-ToolkitResult -Status 'Success' -Message 'The selected instance is usable.' -Data @{ Manager = $manager; Index = $instanceIndex; VmsPath = $vmsPath; AndroidVersion = [string](Get-ToolkitFirstProperty -InputObject $Instance -PropertyNames @('AndroidVersion')) }
+}
+
+function Assert-ConcealmentVerifiedClone {
+    param(
+        [hashtable]$Resolved,
+        [object]$VerifiedClone,
+        [scriptblock]$Runner = $null
+    )
+
+    $manager = [string]$Resolved['Manager']
+    $sourceIndex = [int]$Resolved['Index']
+    $vmsPath = [string]$Resolved['VmsPath']
+
+    $invalid = {
+        param([string]$Reason)
+
+        return Get-ToolkitResult -Status 'CriticalError' -Message $Reason -Data (New-ConcealmentState -Code 'CLONE_RECORD_INVALID' -Step 'clone' -InstanceIndex $sourceIndex)
+    }
+    $unverified = {
+        param([string]$Reason, [int]$CloneIndex = -1, [string]$CloneName = '')
+
+        return Get-ToolkitResult -Status 'CriticalError' -Message $Reason -Data (New-ConcealmentState -Code 'CLONE_UNVERIFIED' -Step 'clone' -InstanceIndex $sourceIndex -Fields @{ CloneIndex = $CloneIndex; CloneName = $CloneName })
+    }
+    if ($null -eq $VerifiedClone -or $VerifiedClone -is [Array] -or
+        ($VerifiedClone -isnot [pscustomobject] -and $VerifiedClone -isnot [Collections.IDictionary])) {
+        return (& $invalid 'A verified instance clone record is required before a concealment change. The selected instance is never changed and no second clone is created here.')
+    }
+    $reportedIndex = Get-ConcealmentRecordField -Record $VerifiedClone -Name 'CloneIndex'
+    $cloneIndex = 0
+    if ($reportedIndex -isnot [string] -and $reportedIndex -isnot [int] -and $reportedIndex -isnot [long]) {
+        return (& $invalid 'The verified instance clone record has no usable clone index. The selected instance is never changed and no second clone is created here.')
+    }
+    if (-not [int]::TryParse([string]$reportedIndex, [ref]$cloneIndex) -or $cloneIndex -lt 0) {
+        return (& $invalid 'The verified instance clone record has no usable clone index. The selected instance is never changed and no second clone is created here.')
+    }
+    $reportedName = Get-ConcealmentRecordField -Record $VerifiedClone -Name 'CloneName'
+    if ($reportedName -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedName)) {
+        return (& $invalid 'The verified instance clone record has no usable clone name. The selected instance is never changed and no second clone is created here.')
+    }
+    $cloneName = [string]$reportedName
+    $reportedSource = Get-ConcealmentRecordField -Record $VerifiedClone -Name 'SourceIndex'
+    if ($null -ne $reportedSource) {
+        $recordSourceIndex = 0
+        if (($reportedSource -isnot [string] -and $reportedSource -isnot [int] -and $reportedSource -isnot [long]) -or
+            -not [int]::TryParse([string]$reportedSource, [ref]$recordSourceIndex) -or $recordSourceIndex -ne $sourceIndex) {
+            return (& $invalid "The verified instance clone record belongs to another selected instance. The selected instance is never changed and no second clone is created here.")
+        }
+    }
+
+    $records = @(Get-MuMuInstanceRecord -ManagerPath $manager -VersionArgument ([string]$cloneIndex) -Runner $Runner)
+    if ($records.Count -ne 1) {
+        return (& $unverified "The recorded clone at index $cloneIndex is not reported by the MuMu manager, so no guest change was started." $cloneIndex $cloneName)
+    }
+    $cloneRecord = $records[0]
+    $managerIndex = 0
+    if (-not [int]::TryParse([string](Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('index')), [ref]$managerIndex) -or $managerIndex -ne $cloneIndex) {
+        return (& $unverified "The recorded clone at index $cloneIndex is not the instance the MuMu manager reports, so no guest change was started." $cloneIndex $cloneName)
+    }
+    if ((ConvertTo-ToolkitBoolean -Value (Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('is_main'))) -ne $false) {
+        return (& $unverified "The recorded clone at index $cloneIndex is not a reported non-base instance, so no guest change was started." $cloneIndex $cloneName)
+    }
+    $managerName = [string](Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('name'))
+    if ([string]::IsNullOrWhiteSpace($managerName) -or $managerName -cne $cloneName) {
+        return (& $unverified "The recorded clone name does not match the MuMu manager, so no guest change was started." $cloneIndex $cloneName)
+    }
+    $managerVersion = ConvertTo-ToolkitAndroidVersion -Value (Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('android_version', 'androidVersion', 'system_version', 'systemVersion'))
+    $expectedVersion = ConvertTo-ToolkitAndroidVersion -Value ([string]$Resolved['AndroidVersion'])
+    if ($null -eq $expectedVersion) {
+        $expectedVersion = ConvertTo-ToolkitAndroidVersion -Value $managerVersion
+    }
+    if ($null -eq $expectedVersion -or $null -eq $managerVersion -or $managerVersion -cne $expectedVersion) {
+        return (& $unverified "The recorded clone does not report the selected instance Android version, so no guest change was started." $cloneIndex $cloneName)
+    }
+    $reportedVmsPath = [string](Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('vms_path', 'vmsPath'))
+    $cloneRoot = Get-MuMuInstanceRootPath -VmsPath $vmsPath -Index $cloneIndex -ReportedVmsPath $reportedVmsPath
+    if ($null -eq $cloneRoot -or -not (Test-ToolkitPathWithinRoot -Path $cloneRoot -Root $vmsPath)) {
+        return (& $unverified "The recorded clone is outside its installation boundary, so no guest change was started." $cloneIndex $cloneName)
+    }
+    $diskBytes = Measure-MuMuInstanceDiskBytes -InstanceRoot $cloneRoot
+    if ($null -eq $diskBytes -or $diskBytes -le 0) {
+        return (& $unverified "The recorded clone does not have a usable disk, so no guest change was started." $cloneIndex $cloneName)
+    }
+    return Get-ToolkitResult -Status 'Success' -Message 'The recorded instance clone is the verified clone of the selected instance.' -Data @{
+        Manager       = $manager
+        Index         = $cloneIndex
+        Name          = $cloneName
+        SourceIndex   = $sourceIndex
+        AndroidVersion = $expectedVersion
+    }
 }
 
 function Read-ConcealmentHmaConfig {
@@ -228,7 +422,7 @@ function Read-ConcealmentHmaConfig {
     }
     $text = [string]$call.Text
     if ([string]::IsNullOrWhiteSpace($text)) {
-        return Get-ToolkitResult -Status 'Warning' -Message 'The HMA configuration read returned nothing.' -Data (New-ConcealmentState -Code 'HMA_CONFIG_UNREADABLE' -Step 'config-read' -InstanceIndex $InstanceIndex)
+        return Get-ToolkitResult -Status 'Warning' -Message ("The HMA configuration at $script:ConcealmentConfigPath could not be read: the read returned nothing.") -Data (New-ConcealmentState -Code 'HMA_CONFIG_UNREADABLE' -Step 'config-read' -InstanceIndex $InstanceIndex)
     }
 
     $unsupported = {
@@ -238,30 +432,34 @@ function Read-ConcealmentHmaConfig {
     }
 
     $document = $null
+    $parseFailure = ''
     try {
         Assert-NoDuplicateJournalProperty -Json $text
         $document = $text | ConvertFrom-Json -ErrorAction Stop
     }
     catch {
-        return (& $unsupported 'The HMA configuration is not strict JSON and was not modified.' -1)
+        $parseFailure = Protect-ToolkitText ([string]$_.Exception.Message)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($parseFailure)) {
+        return (& $unsupported "The HMA configuration is not strict JSON, so it was not modified. Reader reason: $parseFailure" -1)
     }
     if ($null -eq $document -or $document -is [Array] -or $document -isnot [pscustomobject]) {
-        return (& $unsupported 'The HMA configuration is not a supported document and was not modified.' -1)
+        return (& $unsupported 'The HMA configuration is not a supported document, so it was not modified.' -1)
     }
     $versionProperty = $document.PSObject.Properties['configVersion']
     if ($null -eq $versionProperty -or
         ($versionProperty.Value -isnot [int] -and $versionProperty.Value -isnot [long])) {
-        return (& $unsupported 'The HMA configuration carries no usable configVersion and was not modified.' -1)
+        return (& $unsupported "The HMA configuration has no usable configVersion, so it was not modified. The supported version is $($script:ConcealmentConfigVersion)." -1)
     }
     $configVersion = [int]$versionProperty.Value
     if ($configVersion -ne $script:ConcealmentConfigVersion) {
-        return (& $unsupported "The HMA configuration version $configVersion is not the supported version $($script:ConcealmentConfigVersion) and was not modified." $configVersion)
+        return (& $unsupported "The HMA configuration version $configVersion is not the supported version $($script:ConcealmentConfigVersion), so it was not modified." $configVersion)
     }
 
     $templatesProperty = $document.PSObject.Properties['templates']
     if ($null -ne $templatesProperty -and
         ($null -eq $templatesProperty.Value -or $templatesProperty.Value -is [Array] -or $templatesProperty.Value -isnot [pscustomobject])) {
-        return (& $unsupported 'The HMA configuration has no usable template map and was not modified.' $configVersion)
+        return (& $unsupported "The HMA configuration has no usable template map, so it was not modified. Version: $configVersion." $configVersion)
     }
     $templateProperty = $null
     if ($null -ne $templatesProperty) {
@@ -269,16 +467,16 @@ function Read-ConcealmentHmaConfig {
     }
     if ($null -ne $templateProperty) {
         if ($null -eq $templateProperty.Value -or $templateProperty.Value -is [Array] -or $templateProperty.Value -isnot [pscustomobject]) {
-            return (& $unsupported "The HMA configuration template $($script:ConcealmentTemplateName) is not a supported template and was not modified." $configVersion)
+            return (& $unsupported "The HMA configuration template $($script:ConcealmentTemplateName) is not a supported template, so it was not modified. Version: $configVersion." $configVersion)
         }
         $appListProperty = $templateProperty.Value.PSObject.Properties['appList']
         if ($null -ne $appListProperty) {
             if ($null -eq $appListProperty.Value -or $appListProperty.Value -isnot [Array]) {
-                return (& $unsupported "The HMA configuration template $($script:ConcealmentTemplateName) has no usable app list and was not modified." $configVersion)
+                return (& $unsupported "The HMA configuration template $($script:ConcealmentTemplateName) has no usable app list, so it was not modified. Version: $configVersion." $configVersion)
             }
             foreach ($entry in @($appListProperty.Value)) {
                 if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace($entry)) {
-                    return (& $unsupported "The HMA configuration template $($script:ConcealmentTemplateName) has an unusable app list entry and was not modified." $configVersion)
+                    return (& $unsupported "The HMA configuration template $($script:ConcealmentTemplateName) has an unusable app list entry, so it was not modified. Version: $configVersion." $configVersion)
                 }
             }
         }
@@ -287,12 +485,12 @@ function Read-ConcealmentHmaConfig {
     $appsProperty = $document.PSObject.Properties['apps']
     if ($null -ne $appsProperty) {
         if ($null -eq $appsProperty.Value -or $appsProperty.Value -is [Array] -or $appsProperty.Value -isnot [pscustomobject]) {
-            return (& $unsupported 'The HMA configuration has no usable app scope map and was not modified.' $configVersion)
+            return (& $unsupported "The HMA configuration has no usable app scope map, so it was not modified. Version: $configVersion." $configVersion)
         }
         foreach ($appProperty in @($appsProperty.Value.PSObject.Properties)) {
             if ([string]::IsNullOrWhiteSpace($appProperty.Name) -or
                 $appProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($appProperty.Value)) {
-                return (& $unsupported 'The HMA configuration app scope map is unusable and was not modified.' $configVersion)
+                return (& $unsupported "The HMA configuration app scope map is unusable, so it was not modified. Version: $configVersion." $configVersion)
             }
         }
     }
@@ -302,37 +500,79 @@ function Read-ConcealmentHmaConfig {
     }
     $data['Document'] = $document
     $data['Text'] = $text
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try {
-        $data['Sha256'] = [BitConverter]::ToString($sha.ComputeHash((New-Object Text.UTF8Encoding($false)).GetBytes($text))).Replace('-', '').ToLowerInvariant()
-    }
-    finally {
-        $sha.Dispose()
-    }
+    $data['Sha256'] = Get-ConcealmentTextSha256 -Text $text
     return Get-ToolkitResult -Status 'Success' -Message 'The supported HMA configuration was read.' -Data $data
+}
+
+function Get-ConcealmentTargetIndex {
+    param(
+        [object]$Resolved,
+        [int]$TargetIndex
+    )
+
+    if ($TargetIndex -lt 0) {
+        return [int]$Resolved['Index']
+    }
+    return $TargetIndex
 }
 
 function Get-HmaConfig {
     param(
         [object]$Instance,
+        [int]$TargetIndex = -1,
         [scriptblock]$Runner = $null
     )
 
     $resolved = Resolve-ConcealmentInstance -Instance $Instance
     if ($resolved.Status -ne 'Success') {
-        return New-ConcealmentHandoff -Journal $null -State $resolved.Data
+        return Get-ToolkitResult -Status 'CriticalError' -Message $resolved.Message -Data $resolved.Data
     }
-    $config = Read-ConcealmentHmaConfig -ManagerPath $resolved.Data.Manager -InstanceIndex $resolved.Data.Index -Runner $Runner
+    $targetIndex = Get-ConcealmentTargetIndex -Resolved $resolved.Data -TargetIndex $TargetIndex
+    $config = Read-ConcealmentHmaConfig -ManagerPath ([string]$resolved.Data.Manager) -InstanceIndex $targetIndex -Runner $Runner
     if ($config.Status -ne 'Success') {
-        return New-ConcealmentHandoff -Journal $null -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $resolved.Data.Index)
+        return New-ConcealmentHandoff -Journal $null -Reason $config.Message -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $targetIndex -Fields @{ HmaConfigVersion = $config.Data.HmaConfigVersion })
     }
     return Get-ToolkitResult -Status 'Success' -Message $config.Message -Data $config.Data
+}
+
+function Get-ConcealmentStoredRootTemplate {
+    param(
+        [object]$Document,
+        [int]$InstanceIndex = -1
+    )
+
+    $stored = @()
+    $isWhitelist = $false
+    $found = $false
+    $templatesProperty = $Document.PSObject.Properties['templates']
+    if ($null -ne $templatesProperty) {
+        $templateProperty = $templatesProperty.Value.PSObject.Properties[$script:ConcealmentTemplateName]
+        if ($null -ne $templateProperty) {
+            $found = $true
+            $whitelistProperty = $templateProperty.Value.PSObject.Properties['isWhitelist']
+            if ($null -ne $whitelistProperty -and $whitelistProperty.Value -is [bool]) {
+                $isWhitelist = [bool]$whitelistProperty.Value
+            }
+            $appListProperty = $templateProperty.Value.PSObject.Properties['appList']
+            if ($null -ne $appListProperty -and $null -ne $appListProperty.Value) {
+                $stored = @($appListProperty.Value | ForEach-Object { [string]$_ })
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Code             = 'OK'
+        Found            = $found
+        IsWhitelist      = $isWhitelist
+        TemplatePackages = $stored
+        InstanceIndex    = $InstanceIndex
+    }
 }
 
 function New-ReusableRootTemplate {
     param(
         [object]$Instance,
         [object]$Journal,
+        [int]$TargetIndex = -1,
         [scriptblock]$Runner = $null
     )
 
@@ -346,25 +586,26 @@ function New-ReusableRootTemplate {
     if ($resolved.Status -ne 'Success') {
         return New-ToolkitRootFailure -Journal $Journal -Message $resolved.Message -Data $resolved.Data
     }
-    $instanceIndex = [int]$resolved.Data.Index
+    $manager = [string]$resolved.Data.Manager
+    $targetIndex = Get-ConcealmentTargetIndex -Resolved $resolved.Data -TargetIndex $TargetIndex
 
-    $config = Read-ConcealmentHmaConfig -ManagerPath $resolved.Data.Manager -InstanceIndex $instanceIndex -Runner $Runner
+    $config = Read-ConcealmentHmaConfig -ManagerPath $manager -InstanceIndex $targetIndex -Runner $Runner
     if ($config.Status -ne 'Success') {
-        return New-ConcealmentHandoff -Journal $Journal -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $instanceIndex)
+        return New-ConcealmentHandoff -Journal $Journal -Reason $config.Message -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $targetIndex -Fields @{ HmaConfigVersion = $config.Data.HmaConfigVersion })
     }
 
-    $packageList = Get-ConcealmentPackageList -ManagerPath $resolved.Data.Manager -InstanceIndex $instanceIndex -Runner $Runner
+    $packageList = Get-ConcealmentPackageList -ManagerPath $manager -InstanceIndex $targetIndex -Runner $Runner
     if ($packageList.Status -ne 'Success') {
         return New-ToolkitRootFailure -Journal $Journal -Message $packageList.Message -Data $packageList.Data
     }
     $installed = @($packageList.Data)
 
-    $template = Get-ConcealmentRootTemplate -Document $config.Data.Document -InstalledPackages $installed -InstanceIndex $instanceIndex
+    $template = Get-ConcealmentRootTemplate -Document $config.Data.Document -InstalledPackages $installed -InstanceIndex $targetIndex
     if ($template.Status -ne 'Success') {
         return New-ToolkitRootFailure -Journal $Journal -Message $template.Message -Data $template.Data
     }
 
-    $state = New-ConcealmentState -Code 'OK' -Step 'template' -InstanceIndex $instanceIndex -Fields @{
+    $state = New-ConcealmentState -Code 'OK' -Step 'template' -InstanceIndex $targetIndex -Fields @{
         TemplateName     = $script:ConcealmentTemplateName
         TemplatePackages = @($template.Data.TemplatePackages)
         IsWhitelist      = $false
@@ -374,7 +615,7 @@ function New-ReusableRootTemplate {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message "The reusable blacklist Root template was verified with $(@($template.Data.TemplatePackages).Count) package(s). No configuration was written." -Data $state
     }
     catch {
-        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Root template could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'template' -InstanceIndex $instanceIndex)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Root template could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'template' -InstanceIndex $targetIndex)
     }
     return Get-ToolkitResult -Status 'Success' -Message 'The reusable blacklist Root template is verified and no configuration was written.' -Data $state
 }
@@ -392,24 +633,9 @@ function Get-ConcealmentRootTemplate {
         return Get-ToolkitResult -Status 'CriticalError' -Message $Reason -Data (New-ConcealmentState -Code 'HMA_TEMPLATE_INVALID' -Step 'template' -InstanceIndex $InstanceIndex)
     }
 
-    $existing = @()
-    $isWhitelist = $false
-    $templatesProperty = $Document.PSObject.Properties['templates']
-    if ($null -ne $templatesProperty) {
-        $templateProperty = $templatesProperty.Value.PSObject.Properties[$script:ConcealmentTemplateName]
-        if ($null -ne $templateProperty) {
-            $whitelistProperty = $templateProperty.Value.PSObject.Properties['isWhitelist']
-            if ($null -ne $whitelistProperty -and $whitelistProperty.Value -is [bool]) {
-                if ($whitelistProperty.Value -eq $true) {
-                    return (& $invalid "The existing HMA template $($script:ConcealmentTemplateName) is a whitelist template and is never flipped to a blacklist automatically. Rename or remove it in the HMA app, then run the workflow again.")
-                }
-                $isWhitelist = $false
-            }
-            $appListProperty = $templateProperty.Value.PSObject.Properties['appList']
-            if ($null -ne $appListProperty) {
-                $existing = @($appListProperty.Value | ForEach-Object { [string]$_ })
-            }
-        }
+    $stored = Get-ConcealmentStoredRootTemplate -Document $Document -InstanceIndex $InstanceIndex
+    if ($stored.Found -and $stored.IsWhitelist) {
+        return (& $invalid "The existing HMA template $($script:ConcealmentTemplateName) is a whitelist template and is never flipped to a blacklist automatically. Rename or remove it in the HMA app, then run the workflow again.")
     }
 
     $installed = @()
@@ -418,11 +644,11 @@ function Get-ConcealmentRootTemplate {
             $installed += $rootPackage
         }
     }
-    $merged = @(@($existing) + @($installed) | Select-Object -Unique)
+    $merged = @(@($stored.TemplatePackages) + @($installed) | Select-Object -Unique)
     return Get-ToolkitResult -Status 'Success' -Message 'The reusable Root template is described.' -Data (New-ConcealmentState -Code 'OK' -Step 'template' -InstanceIndex $InstanceIndex -Fields @{
             TemplateName     = $script:ConcealmentTemplateName
             TemplatePackages = $merged
-            IsWhitelist      = $isWhitelist
+            IsWhitelist      = $false
         })
 }
 
@@ -442,8 +668,7 @@ function Set-ConcealmentGuestText {
     if ($null -eq $manager -or $InstanceIndex -lt 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The guest file manager path is invalid.' -Data (New-ConcealmentState -Code 'GUEST_WRITE_FAILED' -Step 'guest-write' -InstanceIndex $InstanceIndex)
     }
-    if ($Path -notmatch '^/[A-Za-z0-9._/-]+$' -or $Path -match '//' -or
-        $Path -match '(^|/)\.\.(/|$)' -or $Path.Length -gt $script:ConcealmentMaximumGuestPathLength) {
+    if (-not (Test-ConcealmentGuestPath -Path $Path)) {
         return New-ToolkitRootFailure -Journal $Journal -Message "The guest file path is not a plain absolute path: $Path" -Data (New-ConcealmentState -Code 'GUEST_WRITE_FAILED' -Step 'guest-write' -InstanceIndex $InstanceIndex)
     }
     if ($Text -isnot [string] -or [string]::IsNullOrWhiteSpace($Text)) {
@@ -469,9 +694,25 @@ function Set-ConcealmentGuestText {
     return Get-ToolkitResult -Status 'Success' -Message "The guest file was replaced: $Path" -Data $state
 }
 
+function Get-ConcealmentGuestFile {
+    param(
+        [string]$ManagerPath,
+        [int]$InstanceIndex,
+        [string]$Path,
+        [scriptblock]$Runner = $null
+    )
+
+    $call = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell su -c "cat ' + $Path + '"') -Runner $Runner
+    if ($null -eq $call -or $call.ExitCode -ne 0) {
+        return $null
+    }
+    return [string]$call.Text
+}
+
 function Install-ConcealmentDependencies {
     param(
         [object]$Instance,
+        [object]$VerifiedClone,
         [object]$Manifest,
         [object]$Journal,
         [string]$CacheRoot = '',
@@ -489,39 +730,56 @@ function Install-ConcealmentDependencies {
         return New-ToolkitRootFailure -Journal $Journal -Message $resolved.Message -Data $resolved.Data
     }
     $manager = [string]$resolved.Data.Manager
-    $instanceIndex = [int]$resolved.Data.Index
+    $sourceIndex = [int]$resolved.Data.Index
 
-    $hmaAsset = Save-ToolkitManifestAsset -Manifest $Manifest -Id $script:ConcealmentHmaAssetId -CacheRoot $CacheRoot
+    $hmaAsset = Save-ToolkitManifestAsset -Manifest $Manifest -Id $script:ConcealmentHmaAssetId -CacheRoot $CacheRoot -RequireCached
     if ($hmaAsset.Status -ne 'Success') {
-        return New-ToolkitRootFailure -Journal $Journal -Message $hmaAsset.Message -Data (New-ConcealmentState -Code ([string]$hmaAsset.Data.Code) -Step 'asset' -InstanceIndex $instanceIndex)
+        return New-ToolkitRootFailure -Journal $Journal -Message $hmaAsset.Message -Data (New-ConcealmentState -Code ([string]$hmaAsset.Data.Code) -Step 'asset' -InstanceIndex $sourceIndex)
     }
-    $vectorAsset = Save-ToolkitManifestAsset -Manifest $Manifest -Id $script:ConcealmentVectorAssetId -CacheRoot $CacheRoot
+    $vectorAsset = Save-ToolkitManifestAsset -Manifest $Manifest -Id $script:ConcealmentVectorAssetId -CacheRoot $CacheRoot -RequireCached
     if ($vectorAsset.Status -ne 'Success') {
-        return New-ToolkitRootFailure -Journal $Journal -Message $vectorAsset.Message -Data (New-ConcealmentState -Code ([string]$vectorAsset.Data.Code) -Step 'asset' -InstanceIndex $instanceIndex)
+        return New-ToolkitRootFailure -Journal $Journal -Message $vectorAsset.Message -Data (New-ConcealmentState -Code ([string]$vectorAsset.Data.Code) -Step 'asset' -InstanceIndex $sourceIndex)
     }
     $hmaPath = [string]$hmaAsset.Data.Asset
     $vectorPath = [string]$vectorAsset.Data.Asset
+
+    $clone = $null
+    if ($null -eq $VerifiedClone) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'A verified instance clone record is required before installing concealment dependencies. The selected instance is never changed and no second clone is created here.' -Data (New-ConcealmentState -Code 'CLONE_REQUIRED' -Step 'clone' -InstanceIndex $sourceIndex)
+    }
+    $clone = Assert-ConcealmentVerifiedClone -Resolved $resolved.Data -VerifiedClone $VerifiedClone -Runner $Runner
+    if ($clone.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message $clone.Message -Data $clone.Data
+    }
+    $instanceIndex = [int]$clone.Data.Index
+    $cloneName = [string]$clone.Data.Name
+    $cloneFields = @{ CloneIndex = $instanceIndex; CloneName = $cloneName }
+
     try {
-        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The pinned HMA and Vector assets were verified by size and SHA-256 before any instance change.' -Data (New-ConcealmentState -Code 'OK' -Step 'asset' -InstanceIndex $instanceIndex)
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message "The pinned HMA and Vector assets were verified by size and SHA-256 in the dependency cache before any instance change. The verified clone at index $instanceIndex is the only instance that will be changed." -Data (New-ConcealmentState -Code 'OK' -Step 'asset' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
     catch {
-        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified concealment dependencies could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'asset' -InstanceIndex $instanceIndex)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The verified concealment dependencies could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'asset' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
 
     $installed = @()
     $alreadyPresent = @()
+    $quotedApk = Format-ToolkitQuotedPath -Path $hmaPath -Label 'verified HMA asset path'
+    if ($quotedApk.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message $quotedApk.Message -Data (New-ConcealmentState -Code ([string]$quotedApk.Data.Code) -Step 'asset' -InstanceIndex $instanceIndex -Fields $cloneFields)
+    }
+    $quotedVector = Format-ToolkitQuotedPath -Path $vectorPath -Label 'verified Vector asset path'
+    if ($quotedVector.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message $quotedVector.Message -Data (New-ConcealmentState -Code ([string]$quotedVector.Data.Code) -Step 'asset' -InstanceIndex $instanceIndex -Fields $cloneFields)
+    }
     $hmaInstalled = Test-ConcealmentPackageInstalled -ManagerPath $manager -InstanceIndex $instanceIndex -PackageName $script:ConcealmentHmaPackage -Runner $Runner
     if (-not $hmaInstalled) {
-        $installCommand = Format-Android12InstallCommand -Path $hmaPath
-        if ($installCommand.Status -ne 'Success') {
-            return New-ToolkitRootFailure -Journal $Journal -Message $installCommand.Message -Data (New-ConcealmentState -Code 'ASSET_PATH_INVALID' -Step 'hma-install' -InstanceIndex $instanceIndex)
-        }
-        $apkInstall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ([string]$installCommand.Data) -Runner $Runner
+        $apkInstall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('install -r ' + [string]$quotedApk.Data) -Runner $Runner
         if ($null -eq $apkInstall -or $apkInstall.ExitCode -ne 0) {
-            return New-ToolkitRootFailure -Journal $Journal -Message "The verified HMA APK was not installed on the instance at index $instanceIndex." -Data (New-ConcealmentState -Code 'APK_INSTALL_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The verified HMA APK was not installed on the clone at index $instanceIndex." -Data (New-ConcealmentState -Code 'APK_INSTALL_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         if (-not (Test-ConcealmentPackageInstalled -ManagerPath $manager -InstanceIndex $instanceIndex -PackageName $script:ConcealmentHmaPackage -Runner $Runner)) {
-            return New-ToolkitRootFailure -Journal $Journal -Message "The verified HMA APK install did not leave the package $($script:ConcealmentHmaPackage) installed on the instance at index $instanceIndex." -Data (New-ConcealmentState -Code 'APK_INSTALL_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The verified HMA APK install did not leave the package $($script:ConcealmentHmaPackage) installed on the clone at index $instanceIndex." -Data (New-ConcealmentState -Code 'APK_INSTALL_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $installed += $script:ConcealmentHmaAssetId
     }
@@ -534,16 +792,18 @@ function Install-ConcealmentDependencies {
         $alreadyPresent += $script:ConcealmentVectorAssetId
     }
     else {
-        $assetName = [IO.Path]::GetFileName($vectorPath)
-        $stagedPath = $script:ConcealmentGuestStagePath + '/' + $assetName
+        $stagedPath = $script:ConcealmentGuestStagePath + '/' + [IO.Path]::GetFileName($vectorPath)
         $extractPath = $script:ConcealmentGuestStagePath + '/vector-extract-' + [Guid]::NewGuid().ToString('N')
-        $push = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('push "' + $vectorPath + '" ' + $stagedPath) -Runner $Runner
+        if (-not (Test-ConcealmentGuestPath -Path $stagedPath) -or -not (Test-ConcealmentGuestPath -Path $extractPath)) {
+            return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module staging path is not a plain absolute guest path, so nothing was staged.' -Data (New-ConcealmentState -Code 'ASSET_PATH_INVALID' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        }
+        $push = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('push ' + [string]$quotedVector.Data + ' ' + $stagedPath) -Runner $Runner
         if ($null -eq $push -or $push.ExitCode -ne 0) {
-            return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module was not staged on the instance.' -Data (New-ConcealmentState -Code 'MODULE_PUSH_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module was not staged on the clone.' -Data (New-ConcealmentState -Code 'MODULE_PUSH_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $extract = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "mkdir -p ' + $extractPath + ' && unzip -o ' + $stagedPath + ' -d ' + $extractPath + '"') -Runner $Runner
         if ($null -eq $extract -or $extract.ExitCode -ne 0) {
-            return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module was not extracted on the instance.' -Data (New-ConcealmentState -Code 'MODULE_EXTRACT_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module was not extracted on the clone.' -Data (New-ConcealmentState -Code 'MODULE_EXTRACT_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $listing = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "ls ' + $extractPath + '"') -Runner $Runner
         $entries = @()
@@ -551,31 +811,33 @@ function Install-ConcealmentDependencies {
             $entries = @(([string]$listing.Text) -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
         }
         if ($entries.Count -ne 1 -or $entries[0] -cne $script:ConcealmentVectorModuleName) {
-            return New-ToolkitRootFailure -Journal $Journal -Message "The verified Vector archive does not contain exactly the $($script:ConcealmentVectorModuleName) module directory and was not installed." -Data (New-ConcealmentState -Code 'MODULE_LAYOUT_UNSUPPORTED' -Step 'vector-install' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The verified Vector archive does not contain exactly the $($script:ConcealmentVectorModuleName) module directory and was not installed." -Data (New-ConcealmentState -Code 'MODULE_LAYOUT_UNSUPPORTED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $move = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "mv ' + $extractPath + '/' + $script:ConcealmentVectorModuleName + ' ' + $script:ConcealmentVectorModulePath + ' && rmdir ' + $extractPath + '"') -Runner $Runner
         if ($null -eq $move -or $move.ExitCode -ne 0) {
-            return New-ToolkitRootFailure -Journal $Journal -Message "The extracted Vector module was not moved into $($script:ConcealmentVectorModulePath)." -Data (New-ConcealmentState -Code 'MODULE_INSTALL_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The extracted Vector module was not moved into $($script:ConcealmentVectorModulePath)." -Data (New-ConcealmentState -Code 'MODULE_INSTALL_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $moduleList = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "ls ' + $script:ConcealmentVectorModulePath + '"') -Runner $Runner
         if ($null -eq $moduleList -or $moduleList.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$moduleList.Text)) {
-            return New-ToolkitRootFailure -Journal $Journal -Message "The Vector module directory $($script:ConcealmentVectorModulePath) is not present after the install." -Data (New-ConcealmentState -Code 'MODULE_INSTALL_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The Vector module directory $($script:ConcealmentVectorModulePath) is not present after the install." -Data (New-ConcealmentState -Code 'MODULE_INSTALL_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $installed += $script:ConcealmentVectorAssetId
     }
 
     $status = if ($installed.Count -eq 0) { 'AlreadyApplied' } else { 'Success' }
-    $message = "Concealment dependencies are in place on the instance at index $instanceIndex. Installed: $($installed.Count). Already present: $($alreadyPresent.Count)."
+    $message = "Concealment dependencies are in place on the verified clone at index $instanceIndex. Installed: $($installed.Count). Already present: $($alreadyPresent.Count)."
     $state = New-ConcealmentState -Code 'OK' -Step 'complete' -InstanceIndex $instanceIndex -Fields @{
         Installed      = @($installed)
         AlreadyPresent = @($alreadyPresent)
+        CloneIndex     = $instanceIndex
+        CloneName      = $cloneName
     }
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message $message -Data $state
         Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status $status -Message $message -Data $state)
     }
     catch {
-        return New-ToolkitRootFailure -Journal $Journal -Message 'The installed concealment dependencies could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'complete' -InstanceIndex $instanceIndex)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The installed concealment dependencies could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'complete' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
     return Get-ToolkitResult -Status $status -Message $message -Data $state
 }
@@ -583,6 +845,7 @@ function Install-ConcealmentDependencies {
 function Set-AppConcealment {
     param(
         [object]$Instance,
+        [object]$VerifiedClone,
         [string[]]$Packages,
         [object]$Journal,
         [scriptblock]$Runner = $null
@@ -599,7 +862,19 @@ function Set-AppConcealment {
         return New-ToolkitRootFailure -Journal $Journal -Message $resolved.Message -Data $resolved.Data
     }
     $manager = [string]$resolved.Data.Manager
-    $instanceIndex = [int]$resolved.Data.Index
+    $sourceIndex = [int]$resolved.Data.Index
+
+    $clone = $null
+    if ($null -eq $VerifiedClone) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'A verified instance clone record is required before applying concealment. The selected instance is never changed and no second clone is created here.' -Data (New-ConcealmentState -Code 'CLONE_REQUIRED' -Step 'clone' -InstanceIndex $sourceIndex)
+    }
+    $clone = Assert-ConcealmentVerifiedClone -Resolved $resolved.Data -VerifiedClone $VerifiedClone -Runner $Runner
+    if ($clone.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message $clone.Message -Data $clone.Data
+    }
+    $instanceIndex = [int]$clone.Data.Index
+    $cloneName = [string]$clone.Data.Name
+    $cloneFields = @{ CloneIndex = $instanceIndex; CloneName = $cloneName }
 
     $scope = Get-ConcealmentPackageScope -Packages $Packages -InstanceIndex $instanceIndex
     if ($scope.Status -ne 'Success') {
@@ -613,17 +888,17 @@ function Set-AppConcealment {
     }
     $installed = @($packageList.Data)
     if ($selected.Count -ge $installed.Count) {
-        return New-ToolkitRootFailure -Journal $Journal -Message "The selection covers all $($installed.Count) installed package(s), which is a global scope. Concealment is applied only to an explicit subset of apps; select fewer apps and run the workflow again." -Data (New-ConcealmentState -Code 'ALL_APPS_REFUSED' -Step 'selection' -InstanceIndex $instanceIndex -Fields @{ Packages = $selected })
+        return New-ToolkitRootFailure -Journal $Journal -Message "The selection covers all $($installed.Count) installed package(s) on the verified clone, which is a global scope. Concealment is applied only to an explicit subset of apps; select fewer apps and run the workflow again." -Data (New-ConcealmentState -Code 'ALL_APPS_REFUSED' -Step 'selection' -InstanceIndex $instanceIndex -Fields @{ Packages = $selected })
     }
     foreach ($packageName in $selected) {
         if ($installed -cnotcontains $packageName) {
-            return New-ToolkitRootFailure -Journal $Journal -Message "The selected package is not installed on the instance: $packageName" -Data (New-ConcealmentState -Code 'PACKAGE_NOT_INSTALLED' -Step 'selection' -InstanceIndex $instanceIndex -Fields @{ Packages = $selected })
+            return New-ToolkitRootFailure -Journal $Journal -Message "The selected package is not installed on the verified clone: $packageName" -Data (New-ConcealmentState -Code 'PACKAGE_NOT_INSTALLED' -Step 'selection' -InstanceIndex $instanceIndex -Fields @{ Packages = $selected })
         }
     }
 
     $config = Read-ConcealmentHmaConfig -ManagerPath $manager -InstanceIndex $instanceIndex -Runner $Runner
     if ($config.Status -ne 'Success') {
-        return New-ConcealmentHandoff -Journal $Journal -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $instanceIndex)
+        return New-ConcealmentHandoff -Journal $Journal -Reason $config.Message -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $instanceIndex -Fields @{ HmaConfigVersion = $config.Data.HmaConfigVersion })
     }
 
     $template = Get-ConcealmentRootTemplate -Document $config.Data.Document -InstalledPackages $installed -InstanceIndex $instanceIndex
@@ -654,7 +929,7 @@ function Set-AppConcealment {
     if ($null -ne $appsProperty) {
         foreach ($property in @($appsProperty.Value.PSObject.Properties)) {
             if (-not (Test-ConcealmentPackageName -Name $property.Name)) {
-                return New-ToolkitRootFailure -Journal $Journal -Message "The existing HMA app scope holds a key that is not a package name, so it is never rewritten: $($property.Name)" -Data (New-ConcealmentState -Code 'HMA_TEMPLATE_INVALID' -Step 'config-write' -InstanceIndex $instanceIndex)
+                return New-ToolkitRootFailure -Journal $Journal -Message "The existing HMA app scope holds a key that is not a package name, so it is never rewritten: $($property.Name)" -Data (New-ConcealmentState -Code 'HMA_TEMPLATE_INVALID' -Step 'config-write' -InstanceIndex $instanceIndex -Fields $cloneFields)
             }
             $applications[[string]$property.Name] = [string]$property.Value
         }
@@ -664,6 +939,9 @@ function Set-AppConcealment {
     }
     $document['apps'] = $applications
 
+    if ((Get-ConcealmentJsonDepth -Value $document) -gt $script:ConcealmentJsonDepth) {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The HMA configuration is nested deeper than $($script:ConcealmentJsonDepth) levels, so writing it would truncate the operator's own settings. Nothing was written and no backup was taken." -Data (New-ConcealmentState -Code 'HMA_WRITE_FAILED' -Step 'config-write' -InstanceIndex $instanceIndex -Fields $cloneFields)
+    }
     $text = ($document | ConvertTo-Json -Depth $script:ConcealmentJsonDepth)
     $written = $null
     try {
@@ -678,16 +956,28 @@ function Set-AppConcealment {
     }
     if ($writtenVersion -ne $script:ConcealmentConfigVersion -or
         $null -eq $written.PSObject.Properties['templates'].Value.PSObject.Properties[$script:ConcealmentTemplateName]) {
-        return New-ToolkitRootFailure -Journal $Journal -Message 'The prepared HMA configuration no longer describes the supported schema and was not written.' -Data (New-ConcealmentState -Code 'HMA_WRITE_FAILED' -Step 'config-write' -InstanceIndex $instanceIndex)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The prepared HMA configuration no longer describes the supported schema and was not written.' -Data (New-ConcealmentState -Code 'HMA_WRITE_FAILED' -Step 'config-write' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
 
-    $backupPath = [string]$config.Data.ConfigPath + '.backup-' + ([string]$config.Data.Sha256).Substring(0, 12)
+    $originalText = [string]$config.Data.Text
+    $originalSha = [string]$config.Data.Sha256
+    $backupPath = [string]$config.Data.ConfigPath + '.backup-' + $originalSha.Substring(0, 12)
     $existingBackup = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "ls ' + $backupPath + '"') -Runner $Runner
     if ($null -eq $existingBackup -or $existingBackup.ExitCode -ne 0) {
-        $backup = Set-ConcealmentGuestText -ManagerPath $manager -InstanceIndex $instanceIndex -Path $backupPath -Text ([string]$config.Data.Text) -Journal $Journal -Runner $Runner
+        $backup = Set-ConcealmentGuestText -ManagerPath $manager -InstanceIndex $instanceIndex -Path $backupPath -Text $originalText -Journal $Journal -Runner $Runner
         if ($backup.Status -ne 'Success') {
-            return New-ToolkitRootFailure -Journal $Journal -Message $backup.Message -Data (New-ConcealmentState -Code 'HMA_BACKUP_FAILED' -Step 'config-backup' -InstanceIndex $instanceIndex)
+            return New-ToolkitRootFailure -Journal $Journal -Message $backup.Message -Data (New-ConcealmentState -Code 'HMA_BACKUP_FAILED' -Step 'config-backup' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
+    }
+    $readBack = Get-ConcealmentGuestFile -ManagerPath $manager -InstanceIndex $instanceIndex -Path $backupPath -Runner $Runner
+    $readBackBytes = 0L
+    if ($null -ne $readBack) {
+        $readBackBytes = [long](New-Object Text.UTF8Encoding($false)).GetByteCount($readBack)
+    }
+    $originalBytes = [long](New-Object Text.UTF8Encoding($false)).GetByteCount($originalText)
+    if ($null -eq $readBack -or $readBackBytes -ne $originalBytes -or
+        (Get-ConcealmentTextSha256 -Text $readBack) -cne $originalSha) {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The HMA configuration backup at $backupPath could not be read back byte for byte, so the original configuration was not overwritten." -Data (New-ConcealmentState -Code 'HMA_BACKUP_FAILED' -Step 'config-backup' -InstanceIndex $instanceIndex -Fields ($cloneFields + @{ BackupPath = $backupPath }))
     }
 
     $write = Set-ConcealmentGuestText -ManagerPath $manager -InstanceIndex $instanceIndex -Path ([string]$config.Data.ConfigPath) -Text $text -Journal $Journal -Runner $Runner
@@ -702,7 +992,7 @@ function Set-AppConcealment {
         $handoff += , $packageSteps
         $flatSteps += $packageSteps
     }
-    $message = "The blacklist Root template was applied to $($selected.Count) explicitly selected app(s) on the instance at index $instanceIndex. The KernelSU Superuser profile is not machine readable, so confirm it in the app: " + ($flatSteps -join ' ')
+    $message = "The blacklist Root template was applied to $($selected.Count) explicitly selected app(s) on the verified clone at index $instanceIndex. The KernelSU Superuser profile is not machine readable, so confirm it in the app: " + ($flatSteps -join ' ')
     $state = New-ConcealmentState -Code 'OK' -Step 'complete' -InstanceIndex $instanceIndex -Fields @{
         Packages         = $selected
         InScope          = $selected
@@ -711,14 +1001,17 @@ function Set-AppConcealment {
         IsWhitelist      = $false
         HmaConfigVersion = $config.Data.HmaConfigVersion
         BackupPath       = $backupPath
+        BackupVerified   = $true
         Handoff          = $handoff
+        CloneIndex       = $instanceIndex
+        CloneName        = $cloneName
     }
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message $message -Data $state
         Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Success' -Message $message -Data $state)
     }
     catch {
-        return New-ToolkitRootFailure -Journal $Journal -Message 'The applied concealment scope could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'complete' -InstanceIndex $instanceIndex)
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The applied concealment scope could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'complete' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
     return Get-ToolkitResult -Status 'Success' -Message $message -Data $state
 }
@@ -756,17 +1049,19 @@ function Test-Concealment {
 
     $config = Read-ConcealmentHmaConfig -ManagerPath $manager -InstanceIndex $InstanceIndex -Runner $Runner
     if ($config.Status -ne 'Success') {
-        return New-ConcealmentHandoff -Journal $null -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $InstanceIndex)
+        return New-ConcealmentHandoff -Journal $null -Reason $config.Message -State (New-ConcealmentState -Code ([string]$config.Data.Code) -Step 'config-read' -InstanceIndex $InstanceIndex -Fields @{ HmaConfigVersion = $config.Data.HmaConfigVersion })
     }
 
-    $template = Get-ConcealmentRootTemplate -Document $config.Data.Document -InstalledPackages $null -InstanceIndex $InstanceIndex
-    $templatePackages = @()
-    if ($template.Status -eq 'Success') {
-        $templatePackages = @($template.Data.TemplatePackages)
+    $packageList = Get-ConcealmentPackageList -ManagerPath $manager -InstanceIndex $InstanceIndex -Runner $Runner
+    if ($packageList.Status -ne 'Success') {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The installed package list could not be read, so the concealment scope and the Root template contents cannot be reported from observation.' -Data $packageList.Data
     }
+    $installed = @($packageList.Data)
 
     $document = $config.Data.Document
+    $stored = Get-ConcealmentStoredRootTemplate -Document $document -InstanceIndex $InstanceIndex
     $inScope = @()
+    $outOfScope = @()
     foreach ($packageName in $selected) {
         $assigned = $false
         $appsProperty = $document.PSObject.Properties['apps']
@@ -777,6 +1072,9 @@ function Test-Concealment {
         }
         if ($assigned) {
             $inScope += $packageName
+        }
+        else {
+            $outOfScope += $packageName
         }
     }
 
@@ -802,18 +1100,30 @@ function Test-Concealment {
         $handoff += , $packageSteps
         $flatSteps += $packageSteps
     }
-    $message = "HMA scope covers $($inScope.Count) of $($selected.Count) requested app(s) on the instance at index $InstanceIndex through the blacklist Root template. The KernelSU Superuser profile is not machine readable, so confirm it in the app: " + ($flatSteps -join ' ')
 
-    return Get-ToolkitResult -Status 'Success' -Message $message -Data (New-ConcealmentState -Code 'OK' -Step 'verify' -InstanceIndex $InstanceIndex -Fields @{
-            Packages             = $selected
-            InScope              = $inScope
-            TemplateName         = $script:ConcealmentTemplateName
-            TemplatePackages     = $templatePackages
-            HmaConfigVersion     = $config.Data.HmaConfigVersion
-            KernelSUInstalled    = $kernelSuInstalled
-            AllowlistPresent     = $allowlistPresent
-            AllowlistLength      = $allowlistLength
-            ProfileStateObserved = $false
-            Handoff              = $handoff
-        })
+    $observed = @{
+        Packages             = $selected
+        InScope              = $inScope
+        OutOfScope           = $outOfScope
+        TemplateName         = $script:ConcealmentTemplateName
+        TemplatePackages     = @($stored.TemplatePackages)
+        TemplateFound        = $stored.Found
+        IsWhitelist          = $stored.IsWhitelist
+        HmaConfigVersion     = $config.Data.HmaConfigVersion
+        InstalledCount       = $installed.Count
+        KernelSUInstalled    = $kernelSuInstalled
+        AllowlistPresent     = $allowlistPresent
+        AllowlistLength      = $allowlistLength
+        ProfileStateObserved = $false
+        Handoff              = $handoff
+    }
+    $evidenceMessage = "HMA scope covers $($inScope.Count) of $($selected.Count) requested app(s) on the instance at index $InstanceIndex through the blacklist Root template, read from the installed configuration version $($config.Data.HmaConfigVersion). The KernelSU Superuser profile is not machine readable, so confirm it in the app: " + ($flatSteps -join ' ')
+
+    if ($stored.IsWhitelist) {
+        return Get-ToolkitResult -Status 'Warning' -Message "The stored HMA template $($script:ConcealmentTemplateName) is a whitelist template, so this workflow cannot report it as a verified blacklist scope. Create a blacklist Root template in the supported UI. $evidenceMessage" -Data (New-ConcealmentState -Code 'TEMPLATE_NOT_BLACKLIST' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
+    }
+    if ($inScope.Count -ne $selected.Count) {
+        return Get-ToolkitResult -Status 'Warning' -Message "Concealment is not fully applied: $($inScope.Count) of $($selected.Count) requested app(s) carry the blacklist Root template. Out of scope: $($outOfScope -join ', '). $evidenceMessage" -Data (New-ConcealmentState -Code 'SCOPE_INCOMPLETE' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
+    }
+    return Get-ToolkitResult -Status 'Success' -Message $evidenceMessage -Data (New-ConcealmentState -Code 'OK' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
 }

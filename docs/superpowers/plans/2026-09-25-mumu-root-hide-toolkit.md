@@ -646,11 +646,11 @@ git commit -m "feat: add Android 15 built-in root workflow"
 - Modify: `tests/Run-Tests.ps1`
 
 **Interfaces:**
-- Produces `Install-ConcealmentDependencies -Instance <object> -Manifest <object> -Journal <object>` returning installed/already-present dependency IDs.
-- Produces `Get-HmaConfig -Instance <object>` returning a parsed HMA configuration or a schema error.
-- Produces `New-ReusableRootTemplate -Instance <object> -Journal <object>` returning a verified HMA template record.
-- Produces `Set-AppConcealment -Instance <object> -Packages <string[]> -Journal <object>` returning per-package status.
-- Produces `Test-Concealment -ManagerPath <string> -InstanceIndex <int> -Packages <string[]>` returning HMA scope and KernelSU profile evidence.
+- Produces `Install-ConcealmentDependencies -Instance <object> -VerifiedClone <object> -Manifest <object> -Journal <object> [-CacheRoot <string>] [-Runner <scriptblock>]` returning installed/already-present dependency IDs. `-VerifiedClone` is the verified clone record the root flow returns: without it the call returns `CLONE_REQUIRED` before any guest request, and a supplied record is revalidated against the MuMu manager, the reported clone identity, the selected instance's Android version, the installation boundary, and the clone disk before anything is installed. `-CacheRoot` defaults to the per-user dependency cache, and the call is cached-only, so a mutating phase can never download a dependency.
+- Produces `Get-HmaConfig -Instance <object> [-TargetIndex <int>] [-Runner <scriptblock>]` returning a parsed HMA configuration or a schema error. `-TargetIndex` selects the instance to read so a read and a write can never disagree about the target. An invalid instance or manager is a `CriticalError`; only a genuine schema mismatch becomes the supported-UI `Warning` handoff, and that handoff carries the reader's own reason and the version it found.
+- Produces `New-ReusableRootTemplate -Instance <object> -Journal <object> [-TargetIndex <int>] [-Runner <scriptblock>]` returning a verified HMA template record, including only the installed members of the four required root packages.
+- Produces `Set-AppConcealment -Instance <object> -VerifiedClone <object> -Packages <string[]> -Journal <object> [-Runner <scriptblock>]` returning per-package status. The configuration backup is read back and compared by byte length and SHA-256 before the original is overwritten, and a configuration the serializer would truncate is refused instead of written.
+- Produces `Test-Concealment -ManagerPath <string> -InstanceIndex <int> -Packages <string[]> [-Runner <scriptblock>]` returning HMA scope and KernelSU profile evidence. It reports `SCOPE_INCOMPLETE` or `TEMPLATE_NOT_BLACKLIST` instead of `Success` when the stored scope does not match the request, and it never reports a root package it did not observe installed.
 
 - [ ] **Step 1: Write failing concealment tests**
 
@@ -672,7 +672,7 @@ Expected: FAIL because concealment functions do not exist.
 
 - [ ] **Step 3: Implement verified HMA and Vector installation**
 
-Download only manifest assets before elevation, verify size and SHA-256, install the HMA APK and Vector ZIP through the selected instance's manager/ADB path, and record package/module state. If a dependency cannot be verified, return `CriticalError` without installing a different artifact.
+Download only manifest assets before elevation, verify size and SHA-256, install the HMA APK and Vector ZIP through the selected instance's manager/ADB path, and record package/module state. If a dependency cannot be verified, return `CriticalError` without installing a different artifact. Acquisition and mutation are separate phases: the pinned assets are fetched and verified through the manifest asset helper in a non-mutating phase, and the install call is cached-only, so a mutating concealment call can never reach the network.
 
 ```powershell
 function Install-ConcealmentDependencies {

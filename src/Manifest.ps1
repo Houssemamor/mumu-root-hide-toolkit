@@ -363,7 +363,9 @@ function Save-ToolkitManifestAsset {
     param(
         [object]$Manifest,
         [string]$Id,
-        [string]$CacheRoot = ''
+        [string]$CacheRoot = '',
+        [scriptblock]$Fetch = $null,
+        [switch]$RequireCached
     )
 
     if ([string]::IsNullOrWhiteSpace($Id) -or $Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
@@ -386,7 +388,7 @@ function Save-ToolkitManifestAsset {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The dependency cache directory is unavailable.' -Data ([pscustomobject]@{ Code = 'CACHE_UNAVAILABLE'; Asset = '' })
     }
 
-    $asset = Save-ToolkitAsset -Manifest $Manifest -Id $Id -CacheRoot $assetCacheRoot
+    $asset = Save-ToolkitAsset -Manifest $Manifest -Id $Id -CacheRoot $assetCacheRoot -Fetch $Fetch -RequireCached:$RequireCached
     if ($asset.Status -ne 'Success') {
         return Get-ToolkitResult -Status 'CriticalError' -Message ('The pinned asset was not verified. ' + $asset.Message) -Data ([pscustomobject]@{ Code = 'ASSET_VERIFICATION_FAILED'; Asset = '' })
     }
@@ -395,4 +397,37 @@ function Save-ToolkitManifestAsset {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The pinned asset was not verified.' -Data ([pscustomobject]@{ Code = 'ASSET_VERIFICATION_FAILED'; Asset = '' })
     }
     return Get-ToolkitResult -Status 'Success' -Message 'The pinned asset is verified in the dependency cache.' -Data ([pscustomobject]@{ Code = 'OK'; Asset = $path })
+}
+
+function Format-ToolkitQuotedPath {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Path,
+        [string]$Label = 'Path'
+    )
+
+    $invalid = {
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The $Label cannot be used as a command argument." -Data ([pscustomobject]@{ Code = 'ASSET_PATH_INVALID' })
+    }
+    if ($Path -isnot [string] -or [string]::IsNullOrWhiteSpace($Path)) {
+        return (& $invalid)
+    }
+    if ($Path -ne $Path.Trim()) {
+        return (& $invalid)
+    }
+    foreach ($forbidden in @([char]'"', [char]"`r", [char]"`n", [char]0, [char]';', [char]'&', [char]'|', [char]'>', [char]'<')) {
+        if ($Path.IndexOf($forbidden) -ge 0) {
+            return (& $invalid)
+        }
+    }
+    if ($Path -notmatch '^[A-Za-z]:[\\/]') {
+        return (& $invalid)
+    }
+    foreach ($segment in @($Path -split '[\\/]')) {
+        if ($segment -ceq '..') {
+            return (& $invalid)
+        }
+    }
+    return Get-ToolkitResult -Status 'Success' -Message "The $Label is one quoted command element." -Data ('"' + $Path + '"')
 }

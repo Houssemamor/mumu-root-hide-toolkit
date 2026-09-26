@@ -5761,6 +5761,9 @@ $script:ConcealmentCodes = @(
     'JOURNAL_WRITE_FAILED',
     'INSTANCE_INVALID',
     'MANAGER_UNAVAILABLE',
+    'CLONE_REQUIRED',
+    'CLONE_RECORD_INVALID',
+    'CLONE_UNVERIFIED',
     'CACHE_UNAVAILABLE',
     'ASSET_ID_INVALID',
     'ASSET_VERIFICATION_FAILED',
@@ -5780,7 +5783,9 @@ $script:ConcealmentCodes = @(
     'PACKAGE_NAME_INVALID',
     'PACKAGE_LIST_UNREADABLE',
     'PACKAGE_NOT_INSTALLED',
-    'ALL_APPS_REFUSED'
+    'ALL_APPS_REFUSED',
+    'SCOPE_INCOMPLETE',
+    'TEMPLATE_NOT_BLACKLIST'
 )
 $script:ConcealmentRootPackages = @(
     'org.frknkrc44.hma_oss',
@@ -5790,6 +5795,8 @@ $script:ConcealmentRootPackages = @(
 )
 $script:ConcealmentModuleRoot = '/data/adb/modules'
 $script:ConcealmentSelectedPackage = 'jp.pokemon.pokemontcgp'
+$script:ConcealmentSecondPackage = 'com.example.other'
+$script:ConcealmentAllowlistBytes = 'kernel su allowlist bytes'
 $script:ConcealmentUiHandoffSteps = @(
     'Open the Hide My Applist OSS app on the selected instance.',
     'Open Settings, then Create Template, then name the template Root and choose blacklist mode.',
@@ -5815,6 +5822,26 @@ function New-ConcealmentInstanceFixture {
     }
 }
 
+function New-ConcealmentCloneFixture {
+    param(
+        [object]$Install,
+        [string]$Name = 'Concealment clone',
+        [int]$CloneIndex = 5
+    )
+
+    $cloneRoot = Join-Path $Install.VmsPath ([string]$CloneIndex)
+    [void][IO.Directory]::CreateDirectory($cloneRoot)
+    [IO.File]::WriteAllText((Join-Path $cloneRoot 'system.img'), 'concealment clone disk payload')
+    return [pscustomobject]@{
+        Code = 'OK'
+        Step = 'complete'
+        SourceIndex = $Install.SourceIndex
+        CloneIndex = $CloneIndex
+        CloneName = $Name
+        RootVerified = $true
+    }
+}
+
 function New-ConcealmentJournal {
     param(
         [string]$Root,
@@ -5825,11 +5852,15 @@ function New-ConcealmentJournal {
 }
 
 function New-ConcealmentAssetFixture {
-    param([string]$CacheRoot)
+    param(
+        [string]$CacheRoot,
+        [string]$HmaAssetName = 'HMA-OSS-oss-161-release.apk',
+        [string]$VectorAssetName = 'Vector-v2.0-3021-Release.zip'
+    )
 
     $records = @(
-        [pscustomobject]@{ Id = 'hma'; Directory = 'hma'; AssetName = 'HMA-OSS-oss-161-release.apk'; Url = 'https://github.com/frknkrc44/HMA-OSS/releases/download/oss-161/HMA-OSS-oss-161-release.apk'; Payload = 'pinned hma apk payload' },
-        [pscustomobject]@{ Id = 'vector'; Directory = 'vector'; AssetName = 'Vector-v2.0-3021-Release.zip'; Url = 'https://github.com/frknkrc44/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip'; Payload = 'pinned vector module payload' }
+        [pscustomobject]@{ Id = 'hma'; Directory = 'hma'; AssetName = $HmaAssetName; Url = 'https://github.com/frknkrc44/HMA-OSS/releases/download/oss-161/HMA-OSS-oss-161-release.apk'; Payload = 'pinned hma apk payload' },
+        [pscustomobject]@{ Id = 'vector'; Directory = 'vector'; AssetName = $VectorAssetName; Url = 'https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip'; Payload = 'pinned vector module payload' }
     )
     $dependencies = @()
     foreach ($record in $records) {
@@ -5848,8 +5879,8 @@ function New-ConcealmentAssetFixture {
     }
     return [pscustomobject]@{
         Manifest = [pscustomobject]@{ dependencies = @($dependencies) }
-        Hma = (Join-Path (Join-Path $CacheRoot 'hma') 'HMA-OSS-oss-161-release.apk')
-        Vector = (Join-Path (Join-Path $CacheRoot 'vector') 'Vector-v2.0-3021-Release.zip')
+        Hma = (Join-Path (Join-Path $CacheRoot 'hma') $HmaAssetName)
+        Vector = (Join-Path (Join-Path $CacheRoot 'vector') $VectorAssetName)
     }
 }
 
@@ -5858,7 +5889,8 @@ function New-ConcealmentConfigText {
         [string[]]$RootPackages = $script:ConcealmentRootPackages,
         [hashtable]$Apps = @{},
         [int]$ConfigVersion = 93,
-        [switch]$OmitConfigVersion
+        [switch]$OmitConfigVersion,
+        [int]$DeepLevels = 0
     )
 
     $document = [ordered]@{}
@@ -5876,7 +5908,14 @@ function New-ConcealmentConfigText {
         $applications[[string]$key] = [string]$Apps[$key]
     }
     $document['apps'] = $applications
-    return (($document | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+    if ($DeepLevels -gt 0) {
+        $deep = 'leaf'
+        for ($level = $DeepLevels; $level -ge 1; $level--) {
+            $deep = [pscustomobject]@{ level = $level; child = $deep }
+        }
+        $document['extra'] = $deep
+    }
+    return (($document | ConvertTo-Json -Depth 64) + [Environment]::NewLine)
 }
 
 function New-ConcealmentGuestState {
@@ -5884,6 +5923,8 @@ function New-ConcealmentGuestState {
 
     return @{
         Install = $Install
+        SourceIndex = [string]$Install.SourceIndex
+        CloneIndex = '5'
         Calls = @()
         Files = @{}
         ConfigPath = '/data/user/0/org.frknkrc44.hma_oss/files/config.json'
@@ -5892,11 +5933,19 @@ function New-ConcealmentGuestState {
         Modules = @()
         HmaPackage = [string]$script:ConcealmentRootPackages[0]
         AdbFailPattern = ''
+        CatFailPattern = ''
+        CatCorruptPattern = ''
+        ExtractChildName = 'vector'
         PushExitCode = 0
         InstallExitCode = 0
         ExtractExitCode = 0
         MoveExitCode = 0
         WriteFailPattern = ''
+        Instances = @(
+            [pscustomobject]@{ Index = 0; Name = 'Base'; IsMain = $true; Android = '15.0' },
+            [pscustomobject]@{ Index = $Install.SourceIndex; Name = 'Concealment target'; IsMain = $false; Android = '15.0' },
+            [pscustomobject]@{ Index = 5; Name = 'Concealment clone'; IsMain = $false; Android = '15.0' }
+        )
     }
 }
 
@@ -5908,6 +5957,12 @@ function Invoke-ConcealmentGuestShell {
 
     if ($Command -match '^cat (\S+)$') {
         $path = $Matches[1]
+        if (-not [string]::IsNullOrWhiteSpace([string]$State.CatFailPattern) -and $path -like $State.CatFailPattern) {
+            return [pscustomobject]@{ ExitCode = 1; Text = ('cat: ' + $path + ': No such file or directory') }
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$State.CatCorruptPattern) -and $path -like $State.CatCorruptPattern) {
+            return [pscustomobject]@{ ExitCode = 0; Text = 'truncated backup bytes' }
+        }
         if ($State.Files.ContainsKey($path)) {
             return [pscustomobject]@{ ExitCode = 0; Text = [string]$State.Files[$path] }
         }
@@ -5972,8 +6027,8 @@ function Invoke-ConcealmentGuestShell {
         if (-not $State.Files.ContainsKey($pushedPath)) {
             return [pscustomobject]@{ ExitCode = 1; Text = ('unzip: cannot find ' + $pushedPath) }
         }
-        $State.Files[($extractPath + '/vector')] = 'vector module payload'
-        return [pscustomobject]@{ ExitCode = 0; Text = 'inflating: vector/module.prop' }
+        $State.Files[($extractPath + '/' + [string]$State.ExtractChildName)] = 'vector module payload'
+        return [pscustomobject]@{ ExitCode = 0; Text = ('inflating: ' + [string]$State.ExtractChildName + '/module.prop') }
     }
     if ($Command -match '^mv (\S+)/(\S+) ' + [regex]::Escape($script:ConcealmentModuleRoot) + '/(\S+) && rmdir (\S+)$') {
         if ($State.MoveExitCode -ne 0) {
@@ -6002,9 +6057,31 @@ function New-ConcealmentManagerRunner {
         param($ActualFilePath, $ActualArgumentList)
         $State.Calls += ,@($ActualArgumentList)
         $arguments = @($ActualArgumentList | ForEach-Object { [string]$_ })
-        if ($arguments.Count -lt 5 -or $arguments[0] -cne 'adb' -or $arguments[1] -cne '-v' -or
-            $arguments[2] -cne [string]$State.Install.SourceIndex -or $arguments[3] -cne '-c') {
+        if ($arguments.Count -gt 0 -and $arguments[0] -ceq 'info') {
+            if ($arguments.Count -lt 3 -or $arguments[1] -cne '-v') {
+                return [pscustomobject]@{ ExitCode = 1; Text = '{"error_code":1}' }
+            }
+            $requested = [string]$arguments[2]
+            $matched = @($State.Instances | Where-Object { [string]$_.Index -ceq $requested })
+            if ($matched.Count -eq 0) {
+                return [pscustomobject]@{ ExitCode = 1; Text = '{"error_code":1}' }
+            }
+            $reported = @()
+            foreach ($reportedInstance in $matched) {
+                $reported += [pscustomobject][ordered]@{
+                    index           = [string]$reportedInstance.Index
+                    name            = [string]$reportedInstance.Name
+                    is_main         = [string]$reportedInstance.IsMain
+                    android_version = [string]$reportedInstance.Android
+                }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Text = (ConvertTo-Json -InputObject @($reported) -Depth 4 -Compress) }
+        }
+        if ($arguments.Count -lt 5 -or $arguments[0] -cne 'adb' -or $arguments[1] -cne '-v' -or $arguments[3] -cne '-c') {
             return [pscustomobject]@{ ExitCode = 1; Text = 'unsupported manager request' }
+        }
+        if ($arguments[2] -cne [string]$State.CloneIndex -and $arguments[2] -cne [string]$State.SourceIndex) {
+            return [pscustomobject]@{ ExitCode = 1; Text = 'the request did not target a fixture instance' }
         }
         $request = [string]$arguments[4]
         if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbFailPattern) -and $request -like $State.AdbFailPattern) {
@@ -6067,6 +6144,32 @@ function Get-ConcealmentCalls {
     return @($State.Calls | Where-Object { ((@($_) -join ' ')) -like $Pattern })
 }
 
+function Get-ConcealmentSourceInstanceCalls {
+    param([object]$State)
+
+    $sourceIndex = [string]$State.SourceIndex
+    return @($State.Calls | Where-Object {
+            $call = @($_)
+            ($call.Count -ge 3 -and [string]$call[0] -ceq 'adb' -and [string]$call[2] -ceq $sourceIndex)
+        })
+}
+
+function Assert-ConcealmentCloneOnly {
+    param(
+        [object]$State,
+        [string]$Message
+    )
+
+    $sourceCalls = @(Get-ConcealmentSourceInstanceCalls -State $State)
+    Assert-Equal 0 $sourceCalls.Count "$Message A request acted on the selected source instance instead of the verified clone."
+    foreach ($call in @($State.Calls)) {
+        $arguments = @($call)
+        if ($arguments.Count -ge 3 -and [string]$arguments[0] -ceq 'adb') {
+            Assert-Equal ([string]$State.CloneIndex) ([string]$arguments[2]) "$Message An ADB request did not target the verified clone."
+        }
+    }
+}
+
 function Assert-ConcealmentFailure {
     param(
         [object]$Result,
@@ -6092,12 +6195,16 @@ function Assert-ConcealmentHandoff {
         [object]$Result,
         [object]$Journal,
         [string]$Code,
-        [string]$Message
+        [string]$Message,
+        [string]$ReasonPattern = ''
     )
 
     Assert-Equal 'Warning' $Result.Status $Message
     Assert-True ($null -ne $Result.Data) "$Message The warning carried no data."
     Assert-Equal $Code $Result.Data.Code "$Message The warning reported the wrong code."
+    if (-not [string]::IsNullOrWhiteSpace($ReasonPattern)) {
+        Assert-True ([string]$Result.Message -match $ReasonPattern) "$Message The warning did not preserve the reader reason. $($Result.Message)"
+    }
     $steps = @($Result.Data.Steps)
     foreach ($expectedStep in $script:ConcealmentUiHandoffSteps) {
         Assert-True (@($steps) -ccontains $expectedStep) "$Message The warning dropped the supported-UI step: $expectedStep"
@@ -6112,7 +6219,7 @@ function Assert-ConcealmentHandoff {
 }
 
 function Invoke-ConcealmentTests {
-    foreach ($commandName in @('Install-ConcealmentDependencies', 'Get-HmaConfig', 'New-ReusableRootTemplate', 'Set-AppConcealment', 'Test-Concealment', 'Get-KernelSUProfileSteps')) {
+    foreach ($commandName in @('Install-ConcealmentDependencies', 'Get-HmaConfig', 'New-ReusableRootTemplate', 'Set-AppConcealment', 'Test-Concealment', 'Get-KernelSUProfileSteps', 'Set-ConcealmentGuestText')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Concealment command is unavailable: $commandName"
     }
     Assert-True (Test-Path -LiteralPath $concealmentScriptPath -PathType Leaf) 'src/Concealment.ps1 does not exist.'
@@ -6144,11 +6251,12 @@ function Invoke-ConcealmentTests {
             'rm -rf',
             'dd if=',
             'install-multiple',
+            'New-InstanceClone',
             "'UNKNOWN'"
         )) {
         Assert-True ($concealmentSource -notmatch [regex]::Escape($forbidden)) "Concealment source uses a forbidden construct: $forbidden"
     }
-    foreach ($sharedPrimitive in @('Invoke-ToolkitManagerAdb', 'Get-ToolkitPackageVersion', 'New-ToolkitRootFailure', 'Save-ToolkitManifestAsset', 'Format-Android12InstallCommand', 'Write-JournalEvent')) {
+    foreach ($sharedPrimitive in @('Invoke-ToolkitManagerAdb', 'Get-ToolkitPackageVersion', 'New-ToolkitRootFailure', 'Save-ToolkitManifestAsset', 'Format-ToolkitQuotedPath', 'Write-JournalEvent', 'Get-MuMuInstanceRecord', 'Get-MuMuInstanceRootPath', 'Measure-MuMuInstanceDiskBytes')) {
         Assert-True ($concealmentSource -match [regex]::Escape($sharedPrimitive)) "The concealment flow does not use the shared primitive: $sharedPrimitive"
     }
     Assert-Equal $script:ToolkitKitsunePackageName $script:ConcealmentKitsunePackage 'The concealment flow does not use the same Kitsune package name as the Android 12 flow.'
@@ -6160,7 +6268,26 @@ function Invoke-ConcealmentTests {
     }
     Assert-Equal $script:ConcealmentRootPackages.Count @($script:ConcealmentTemplatePackages).Count 'The reusable Root template package set is not exactly the four required packages.'
     Assert-Equal ($script:ConcealmentModuleRoot + '/vector') $script:ConcealmentVectorModulePath 'The Vector module path is not the pinned module directory.'
-    Assert-True ($concealmentSource -notmatch 'ToolkitKernelSUAllowlistPath[^\r\n]*WriteAllText') 'The concealment flow writes the KernelSU allowlist file.'
+    Assert-Equal 2 ([regex]::Matches($concealmentSource, 'Save-ToolkitManifestAsset')).Count 'The concealment flow does not call the manifest asset helper exactly twice.'
+    Assert-Equal 2 ([regex]::Matches($concealmentSource, 'Save-ToolkitManifestAsset[^\r\n]*-RequireCached')).Count 'A concealment asset call does not use the cached-only contract, so a mutating phase could reach the network.'
+    Assert-True ($concealmentSource -notmatch 'Save-ToolkitManifestAsset[^\r\n]*-Fetch') 'A concealment asset call injects a downloader into a mutating phase.'
+    $allowlistSourceLines = @()
+    foreach ($sourceLine in @($concealmentSource -split "`r?`n")) {
+        if ($sourceLine -match 'ConcealmentKernelSUAllowlistPath') {
+            $allowlistSourceLines += $sourceLine
+        }
+    }
+    Assert-True ($allowlistSourceLines.Count -ge 1) 'The concealment flow does not probe the KernelSU allowlist at all.'
+    $allowlistProbes = 0
+    foreach ($allowlistLine in $allowlistSourceLines) {
+        if ($allowlistLine -match '^\$script:ConcealmentKernelSUAllowlistPath\s*=') {
+            continue
+        }
+        $allowlistProbes++
+        Assert-True ($allowlistLine -match 'ls -l') "The KernelSU allowlist path is used outside the read-only ls -l probe: $allowlistLine"
+        Assert-True ($allowlistLine -notmatch 'base64 -d|\bmv\b|\brm\b|\bcp\b|WriteAllText|Set-ConcealmentGuestText') "The KernelSU allowlist path is used in a write: $allowlistLine"
+    }
+    Assert-Equal 1 $allowlistProbes 'The KernelSU allowlist path is used by more than the single read-only ls -l probe.'
 
     $profileSteps = @(Get-KernelSUProfileSteps -PackageName $script:ConcealmentSelectedPackage)
     Assert-Equal 3 $profileSteps.Count 'The KernelSU handoff did not return exactly three steps.'
@@ -6174,14 +6301,59 @@ function Invoke-ConcealmentTests {
     $assetCacheRoot = Join-Path $concealmentRoot 'assets'
     $install = New-Root12InstallFixture -InstallRoot (Join-Path $concealmentRoot 'MuMu Global') -SourceIndex 3
     $instance = New-ConcealmentInstanceFixture -Install $install
+    $clone = New-ConcealmentCloneFixture -Install $install
+    $cloneIndex = [int]$clone.CloneIndex
     $assets = New-ConcealmentAssetFixture -CacheRoot $assetCacheRoot
     $runner = New-ConcealmentManagerRunner -State (New-ConcealmentGuestState -Install $install)
 
-    $missingCacheRoot = Join-Path $concealmentRoot 'empty assets'
-    [void][IO.Directory]::CreateDirectory($missingCacheRoot)
-    $missingHma = Save-ToolkitManifestAsset -Manifest $assets.Manifest -Id 'hma' -CacheRoot $missingCacheRoot
-    Assert-Equal 'CriticalError' $missingHma.Status 'A missing pinned asset was accepted.'
-    Assert-Equal 'ASSET_VERIFICATION_FAILED' $missingHma.Data.Code 'A missing pinned asset did not report the verification gate.'
+    foreach ($badQuotedPath in @('   ', 'a"b', ("a`nb"), 'a b/../c', ' C:\assets\app.apk', 'C:assets\app.apk', 'C:\assets\app.apk&calc', "/data/local/tmp/x")) {
+        $badPath = Format-ToolkitQuotedPath -Path $badQuotedPath -Label 'asset path'
+        Assert-Equal 'CriticalError' $badPath.Status "The quoted path guard accepted an unsafe path: $badQuotedPath"
+        Assert-Equal 'ASSET_PATH_INVALID' $badPath.Data.Code 'The quoted path guard reported the wrong code.'
+    }
+    $goodPath = Format-ToolkitQuotedPath -Path 'C:\parent dir\app-release.apk' -Label 'asset path'
+    Assert-Equal 'Success' $goodPath.Status 'The quoted path guard refused a valid asset path.'
+    Assert-Equal '"C:\parent dir\app-release.apk"' $goodPath.Data 'The quoted path guard did not return one quoted element.'
+
+    $acquisitionRoot = Join-Path $concealmentRoot 'acquisition'
+    [void][IO.Directory]::CreateDirectory($acquisitionRoot)
+    $fetchState = @{ Calls = 0 }
+    $pinnedAsset = $assets.Hma
+    $fetcher = {
+        param($RequestedUrl, $RequestedPath)
+        $fetchState.Calls++
+        [IO.File]::Copy($pinnedAsset, $RequestedPath)
+    }.GetNewClosure()
+    $acquired = Save-ToolkitManifestAsset -Manifest $assets.Manifest -Id 'hma' -CacheRoot $acquisitionRoot -Fetch $fetcher
+    Assert-Equal 'Success' $acquired.Status "The acquisition phase did not accept a fetched pinned asset. $($acquired.Message)"
+    Assert-Equal 1 $fetchState.Calls 'The acquisition phase did not fetch the missing pinned asset exactly once.'
+    Assert-Equal 'OK' $acquired.Data.Code 'The acquisition phase reported the wrong success code.'
+    $expectedHma = @($assets.Manifest.dependencies | Where-Object { $_.id -eq 'hma' })[0]
+    $fetchedFile = Get-Item -LiteralPath ([string]$acquired.Data.Asset)
+    Assert-Equal ([long]$expectedHma.size) ([long]$fetchedFile.Length) 'The acquisition phase did not store the pinned asset at its pinned size.'
+    Assert-Equal ([string]$expectedHma.sha256) (Get-FileHash -LiteralPath $fetchedFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant() 'The acquisition phase did not store the pinned asset at its pinned SHA-256.'
+    $shortFetchRoot = Join-Path $concealmentRoot 'short fetch'
+    [void][IO.Directory]::CreateDirectory($shortFetchRoot)
+    $shortFetcher = { param($RequestedUrl, $RequestedPath) [IO.File]::WriteAllText($RequestedPath, 'short') }.GetNewClosure()
+    $shortAsset = Save-ToolkitManifestAsset -Manifest $assets.Manifest -Id 'hma' -CacheRoot $shortFetchRoot -Fetch $shortFetcher
+    Assert-Equal 'CriticalError' $shortAsset.Status 'The size and SHA-256 gate accepted a short downloaded asset.'
+    Assert-Equal 'ASSET_VERIFICATION_FAILED' $shortAsset.Data.Code 'A short downloaded asset did not report the verification gate.'
+    $wrongHashRoot = Join-Path $concealmentRoot 'wrong hash fetch'
+    [void][IO.Directory]::CreateDirectory($wrongHashRoot)
+    $wrongHashManifest = [pscustomobject]@{
+        dependencies = @([pscustomobject][ordered]@{
+                    id        = 'hma'
+                    version   = 'pinned'
+                    assetName = 'HMA-OSS-oss-161-release.apk'
+                    url       = 'https://github.com/frknkrc44/HMA-OSS/releases/download/oss-161/HMA-OSS-oss-161-release.apk'
+                    size      = [long]22
+                    sha256    = '1111111111111111111111111111111111111111111111111111111111111111'
+                })
+    }
+    $wrongHashFetcher = { param($RequestedUrl, $RequestedPath) [IO.File]::WriteAllText($RequestedPath, 'twenty two byte payload!') }.GetNewClosure()
+    $wrongHashAsset = Save-ToolkitManifestAsset -Manifest $wrongHashManifest -Id 'hma' -CacheRoot $wrongHashRoot -Fetch $wrongHashFetcher
+    Assert-Equal 'CriticalError' $wrongHashAsset.Status 'The size and SHA-256 gate accepted an asset with the wrong hash at the right size.'
+    Assert-Equal 'ASSET_VERIFICATION_FAILED' $wrongHashAsset.Data.Code 'A wrong-hash asset did not report the verification gate.'
     $tamperedRoot = Join-Path $concealmentRoot 'tampered assets'
     $tampered = New-ConcealmentAssetFixture -CacheRoot $tamperedRoot
     [IO.File]::WriteAllText($tampered.Hma, 'tampered hma apk payload')
@@ -6210,13 +6382,28 @@ function Invoke-ConcealmentTests {
     Assert-Equal 'Success' $verifiedAsset.Status 'The manifest helper refused a pinned verified asset.'
     Assert-Equal 'OK' $verifiedAsset.Data.Code 'The manifest helper reported the wrong success code.'
     Assert-Equal $assets.Hma $verifiedAsset.Data.Asset 'The manifest helper returned the wrong verified asset path.'
+    $unusableCacheRoot = Join-Path $concealmentRoot 'unusable cache'
+    [void][IO.Directory]::CreateDirectory($unusableCacheRoot)
+    $unusableCacheFile = Join-Path $unusableCacheRoot 'blocker'
+    [IO.File]::WriteAllText($unusableCacheFile, 'not a directory')
+    $unusableCache = Save-ToolkitManifestAsset -Manifest $assets.Manifest -Id 'hma' -CacheRoot (Join-Path $unusableCacheFile 'nested')
+    Assert-Equal 'CriticalError' $unusableCache.Status 'An unusable dependency cache root was accepted.'
+    Assert-Equal 'CACHE_UNAVAILABLE' $unusableCache.Data.Code 'An unusable dependency cache root reported the wrong code.'
+    $cachedOnlyRoot = Join-Path $concealmentRoot 'cached only'
+    [void][IO.Directory]::CreateDirectory($cachedOnlyRoot)
+    $forbiddenFetcher = { param($RequestedUrl, $RequestedPath) throw 'the cached-only contract must never fetch' }.GetNewClosure()
+    $cachedOnly = Save-ToolkitManifestAsset -Manifest $assets.Manifest -Id 'hma' -CacheRoot $cachedOnlyRoot -Fetch $forbiddenFetcher -RequireCached
+    Assert-Equal 'CriticalError' $cachedOnly.Status 'The cached-only contract accepted an absent asset.'
+    Assert-Equal 'ASSET_VERIFICATION_FAILED' $cachedOnly.Data.Code 'The cached-only contract reported the wrong code for an absent asset.'
 
     $installState = New-ConcealmentGuestState -Install $install
     $installState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
     $installJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $dependencyResult = Install-ConcealmentDependencies -Instance $instance -Manifest $assets.Manifest -Journal $installJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $installState)
-    Assert-True ($dependencyResult.Status -eq 'Success') "Concealment dependency installation failed. $($dependencyResult.Message) "
+    $dependencyResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $installJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $installState)
+    Assert-True ($dependencyResult.Status -eq 'Success') "Concealment dependency installation failed. $($dependencyResult.Message)"
     Assert-Equal 'OK' $dependencyResult.Data.Code 'Concealment dependency installation reported an invalid code.'
+    Assert-Equal $cloneIndex $dependencyResult.Data.CloneIndex 'Concealment dependency installation reported the wrong target instance.'
+    Assert-Equal $clone.CloneName $dependencyResult.Data.CloneName 'Concealment dependency installation reported the wrong target clone.'
     Assert-Equal 'Completed' $installJournal.State 'Concealment dependency installation did not complete its journal.'
     $reopenedInstall = Get-OperationJournal -Path $installJournal.JournalPath
     Assert-Equal 'Completed' $reopenedInstall.State 'Concealment dependency installation did not persist its journal state.'
@@ -6224,13 +6411,19 @@ function Invoke-ConcealmentTests {
     Assert-True (@($dependencyResult.Data.Installed) -ccontains 'hma') 'The verified HMA APK was not reported as installed.'
     Assert-True (@($dependencyResult.Data.Installed) -ccontains 'vector') 'The verified Vector module was not reported as installed.'
     Assert-Equal 0 @($dependencyResult.Data.AlreadyPresent).Count 'Concealment dependency installation reported an absent dependency as already present.'
-    Assert-True (@($installState.Packages) -ccontains $script:ConcealmentRootPackages[0]) 'The HMA package was not installed on the instance.'
-    Assert-True (@($installState.Modules) -ccontains 'vector') 'The Vector module was not installed on the instance.'
+    Assert-True (@($installState.Packages) -ccontains $script:ConcealmentRootPackages[0]) 'The HMA package was not installed on the clone.'
+    Assert-True (@($installState.Modules) -ccontains 'vector') 'The Vector module was not installed on the clone.'
+    Assert-ConcealmentCloneOnly -State $installState -Message 'Concealment dependency installation acted outside the verified clone.'
     Assert-Equal 1 @(Get-ConcealmentCalls -State $installState -Pattern '*install -r*').Count 'The verified HMA APK was not installed exactly once.'
     Assert-Equal 1 @(Get-ConcealmentCalls -State $installState -Pattern '*push*').Count 'The verified Vector module was not pushed exactly once.'
     $installCallText = (@($installState.Calls) | ForEach-Object { @($_) -join ' ' }) -join ' '
     Assert-True ($installCallText -notmatch 'neozygisk|corepatch|kitsune') 'Concealment dependency installation used an asset outside its pinned pair.'
     Assert-True ($installCallText -match [regex]::Escape($assets.Vector)) 'The Vector module was not pushed from the verified cache path.'
+    $pushArguments = [string[]]@(@(Get-ConcealmentCalls -State $installState -Pattern '*push*')[0])
+    Assert-Equal 5 $pushArguments.Count 'The Vector module push carried an unexpected argument count.'
+    Assert-Equal ('push "' + $assets.Vector + '" /data/local/tmp/Vector-v2.0-3021-Release.zip') $pushArguments[4] 'The Vector module push was not one quoted structured element.'
+    $apkArguments = [string[]]@(@(Get-ConcealmentCalls -State $installState -Pattern '*install -r*')[0])
+    Assert-Equal ('install -r "' + $assets.Hma + '"') $apkArguments[4] 'The HMA APK install was not one quoted structured element.'
     $moduleCall = Get-ConcealmentCallIndex -Calls $installState.Calls -Pattern ('*mv*' + $script:ConcealmentModuleRoot + '/vector*')
     Assert-True ($moduleCall -ge 0) 'The extracted Vector module was not moved into the module directory.'
 
@@ -6238,13 +6431,15 @@ function Invoke-ConcealmentTests {
     $presentState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3])
     $presentState.Modules = @('vector')
     $presentJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $presentResult = Install-ConcealmentDependencies -Instance $instance -Manifest $assets.Manifest -Journal $presentJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $presentState)
+    $presentResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $presentJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $presentState)
     Assert-Equal 'AlreadyApplied' $presentResult.Status 'Present concealment dependencies were not reported as already applied.'
     Assert-Equal 2 @($presentResult.Data.AlreadyPresent).Count 'Present concealment dependencies were not reported as already present.'
     Assert-Equal 0 @($presentResult.Data.Installed).Count 'Present concealment dependencies were reported as installed.'
     Assert-Equal 0 @(Get-ConcealmentCalls -State $presentState -Pattern '*install -r*').Count 'An already installed HMA APK was installed again.'
     Assert-Equal 0 @(Get-ConcealmentCalls -State $presentState -Pattern '*push*').Count 'An already installed Vector module was pushed again.'
 
+    $emptyCacheRoot = Join-Path $concealmentRoot 'empty assets'
+    [void][IO.Directory]::CreateDirectory($emptyCacheRoot)
     foreach ($assetDefect in @(
             [pscustomobject]@{ Label = 'a missing HMA asset'; Asset = 'hma' },
             [pscustomobject]@{ Label = 'a missing Vector asset'; Asset = 'vector' }
@@ -6261,25 +6456,87 @@ function Invoke-ConcealmentTests {
         $defectState = New-ConcealmentGuestState -Install $install
         $defectState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
         $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-        $defectResult = Install-ConcealmentDependencies -Instance $instance -Manifest $defectFixture.Manifest -Journal $defectJournal -CacheRoot $defectRoot -Runner (New-ConcealmentManagerRunner -State $defectState)
+        $defectResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $defectFixture.Manifest -Journal $defectJournal -CacheRoot $defectRoot -Runner (New-ConcealmentManagerRunner -State $defectState)
         Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code 'ASSET_VERIFICATION_FAILED' -Message "An unverified dependency was substituted: $($assetDefect.Label)."
         Assert-Equal 0 @($defectState.Calls).Count "An unverified dependency still changed the instance: $($assetDefect.Label)."
         Assert-Equal 2 @($defectState.Packages).Count "An unverified dependency still changed the package list: $($assetDefect.Label)."
-        Assert-True (@($defectState.Packages) -cnotcontains 'com.example.substituted') "An unverified dependency still installed a package: $($assetDefect.Label)."
     }
+    $offlineState = New-ConcealmentGuestState -Install $install
+    $offlineJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $offlineResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $offlineJournal -CacheRoot $emptyCacheRoot -Runner (New-ConcealmentManagerRunner -State $offlineState)
+    Assert-ConcealmentFailure -Result $offlineResult -Journal $offlineJournal -Code 'ASSET_VERIFICATION_FAILED' -Message 'The mutating concealment phase accepted a dependency that was not already in the verified cache.'
+    Assert-Equal 0 @($offlineState.Calls).Count 'The mutating concealment phase reached the guest without a verified cached asset.'
+
+    $noCloneState = New-ConcealmentGuestState -Install $install
+    $noCloneJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $noCloneResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $null -Manifest $assets.Manifest -Journal $noCloneJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $noCloneState)
+    Assert-ConcealmentFailure -Result $noCloneResult -Journal $noCloneJournal -Code 'CLONE_REQUIRED' -Message 'Concealment dependency installation mutated an instance without a verified clone record.'
+    Assert-Equal 0 @($noCloneState.Calls).Count 'Concealment dependency installation reached the manager without a verified clone record.'
+    $noCloneApplyState = New-ConcealmentGuestState -Install $install
+    $noCloneApplyJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $noCloneApplyResult = Set-AppConcealment -Instance $instance -VerifiedClone $null -Packages @($script:ConcealmentSelectedPackage) -Journal $noCloneApplyJournal -Runner (New-ConcealmentManagerRunner -State $noCloneApplyState)
+    Assert-ConcealmentFailure -Result $noCloneApplyResult -Journal $noCloneApplyJournal -Code 'CLONE_REQUIRED' -Message 'Selected app concealment mutated an instance without a verified clone record.'
+    Assert-Equal 0 @($noCloneApplyState.Calls).Count 'Selected app concealment reached the guest without a verified clone record.'
+    Assert-Equal 0 @($noCloneApplyState.Files.Keys).Count 'Selected app concealment wrote a file without a verified clone record.'
+    $foreignCloneInstall = New-Root12InstallFixture -InstallRoot (Join-Path $concealmentRoot 'Foreign MuMu') -SourceIndex 3
+    foreach ($cloneDefect in @(
+            [pscustomobject]@{ Clone = $null; Code = 'CLONE_REQUIRED'; Calls = 0; Label = 'no clone record' },
+            [pscustomobject]@{ Clone = 'not a record'; Code = 'CLONE_RECORD_INVALID'; Calls = 0; Label = 'a clone record that is not an object' },
+            [pscustomobject]@{ Clone = ([pscustomobject]@{ CloneIndex = -1; CloneName = 'Concealment clone' }); Code = 'CLONE_RECORD_INVALID'; Calls = 0; Label = 'a negative clone index' },
+            [pscustomobject]@{ Clone = ([pscustomobject]@{ CloneIndex = 'five'; CloneName = 'Concealment clone' }); Code = 'CLONE_RECORD_INVALID'; Calls = 0; Label = 'a clone index that is not a number' },
+            [pscustomobject]@{ Clone = ([pscustomobject]@{ CloneIndex = 5; CloneName = '   ' }); Code = 'CLONE_RECORD_INVALID'; Calls = 0; Label = 'a blank clone name' },
+            [pscustomobject]@{ Clone = ([pscustomobject]@{ CloneIndex = 5; CloneName = 'Some other name' }); Code = 'CLONE_UNVERIFIED'; Calls = 1; Label = 'a clone name the manager does not report' },
+            [pscustomobject]@{ Clone = ([pscustomobject]@{ CloneIndex = 7; CloneName = 'Concealment clone' }); Code = 'CLONE_UNVERIFIED'; Calls = 1; Label = 'a clone index the manager does not report' },
+            [pscustomobject]@{ Clone = ([pscustomobject]@{ CloneIndex = 0; CloneName = 'Base' }); Code = 'CLONE_UNVERIFIED'; Calls = 1; Label = 'the base instance' },
+            [pscustomobject]@{ Clone = ([pscustomobject]@{ CloneIndex = 5; CloneName = 'Concealment clone'; SourceIndex = 9 }); Code = 'CLONE_RECORD_INVALID'; Calls = 0; Label = 'a record from another selected instance' }
+        )) {
+        foreach ($entryPoint in @('Install-ConcealmentDependencies', 'Set-AppConcealment')) {
+            $defectState = New-ConcealmentGuestState -Install $install
+            $defectState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+            $defectState.Files[$defectState.ConfigPath] = (New-ConcealmentConfigText)
+            $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+            if ($entryPoint -ceq 'Install-ConcealmentDependencies') {
+                $defectResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $cloneDefect.Clone -Manifest $assets.Manifest -Journal $defectJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $defectState)
+            }
+            else {
+                $defectResult = Set-AppConcealment -Instance $instance -VerifiedClone $cloneDefect.Clone -Packages @($script:ConcealmentSelectedPackage) -Journal $defectJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
+            }
+            Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code $cloneDefect.Code -Message "$entryPoint accepted $($cloneDefect.Label)."
+            Assert-Equal $cloneDefect.Calls @($defectState.Calls).Count "$entryPoint issued an unexpected number of requests for $($cloneDefect.Label)."
+            Assert-Equal 0 @(Get-ConcealmentCalls -State $defectState -Pattern 'adb*').Count "$entryPoint issued a guest request with $($cloneDefect.Label)."
+            Assert-Equal 0 @($defectState.Files.Keys | Where-Object { $_ -like '*.backup-*' }).Count "$entryPoint wrote a configuration backup with $($cloneDefect.Label)."
+            Assert-Equal 0 @($defectState.Modules).Count "$entryPoint changed a module with $($cloneDefect.Label)."
+        }
+    }
+    $versionDriftState = New-ConcealmentGuestState -Install $install
+    $versionDriftState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+    $versionDriftState.Files[$versionDriftState.ConfigPath] = (New-ConcealmentConfigText)
+    $versionDriftState.Instances = @($versionDriftState.Instances | Where-Object { [string]$_.Index -cne '5' })
+    $versionDriftState.Instances = @($versionDriftState.Instances) + @([pscustomobject]@{ Index = 5; Name = 'Concealment clone'; IsMain = $false; Android = '12.0' })
+    $versionDriftJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $versionDriftResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $versionDriftJournal -Runner (New-ConcealmentManagerRunner -State $versionDriftState)
+    Assert-ConcealmentFailure -Result $versionDriftResult -Journal $versionDriftJournal -Code 'CLONE_UNVERIFIED' -Message 'A clone that reports a different Android version was accepted.'
+    Assert-Equal 0 @(Get-ConcealmentCalls -State $versionDriftState -Pattern 'adb*').Count 'A clone with a different Android version issued a guest request.'
+    $foreignManagerInstance = New-ConcealmentInstanceFixture -Install $install
+    $foreignManagerInstance.Install.ManagerPath = $foreignCloneInstall.ManagerPath
+    $foreignManagerState = New-ConcealmentGuestState -Install $install
+    $foreignManagerResult = Set-AppConcealment -Instance $foreignManagerInstance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -Runner (New-ConcealmentManagerRunner -State $foreignManagerState)
+    Assert-Equal 'CriticalError' $foreignManagerResult.Status 'Selected app concealment accepted a manager outside its own install root.'
+    Assert-Equal 'MANAGER_UNAVAILABLE' $foreignManagerResult.Data.Code 'A manager outside its own install root reported the wrong code.'
+    Assert-Equal 0 @($foreignManagerState.Calls).Count 'Selected app concealment reached a manager outside its own install root.'
 
     $noJournalState = New-ConcealmentGuestState -Install $install
-    $noJournalResult = Install-ConcealmentDependencies -Instance $instance -Manifest $assets.Manifest -Journal $null -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $noJournalState)
+    $noJournalResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $null -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $noJournalState)
     Assert-Equal 'CriticalError' $noJournalResult.Status 'Concealment dependency installation accepted a missing journal.'
     Assert-Equal 'JOURNAL_INVALID' $noJournalResult.Data.Code 'A missing journal reported the wrong code.'
     Assert-Equal 0 @($noJournalState.Calls).Count 'A missing journal still changed the instance.'
     $nullInstanceState = New-ConcealmentGuestState -Install $install
-    $nullInstanceResult = Install-ConcealmentDependencies -Instance $null -Manifest $assets.Manifest -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $nullInstanceState)
+    $nullInstanceResult = Install-ConcealmentDependencies -Instance $null -VerifiedClone $clone -Manifest $assets.Manifest -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $nullInstanceState)
     Assert-Equal 'CriticalError' $nullInstanceResult.Status 'Concealment dependency installation accepted a missing instance.'
     Assert-Equal 'INSTANCE_INVALID' $nullInstanceResult.Data.Code 'A missing instance reported the wrong code.'
     Assert-Equal 0 @($nullInstanceState.Calls).Count 'A missing instance still reached the manager.'
     $noManifestState = New-ConcealmentGuestState -Install $install
-    $noManifestResult = Install-ConcealmentDependencies -Instance $instance -Manifest $null -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $noManifestState)
+    $noManifestResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $null -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $noManifestState)
     Assert-Equal 'CriticalError' $noManifestResult.Status 'Concealment dependency installation accepted a missing manifest.'
     Assert-Equal 0 @($noManifestState.Calls).Count 'A missing manifest still reached the manager.'
 
@@ -6293,7 +6550,7 @@ function Invoke-ConcealmentTests {
         $defectState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
         $defectState.($installDefect.Knob) = $installDefect.Value
         $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-        $defectResult = Install-ConcealmentDependencies -Instance $instance -Manifest $assets.Manifest -Journal $defectJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $defectState)
+        $defectResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $defectJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $defectState)
         Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code $installDefect.Code -Message "A concealment dependency defect was accepted: $($installDefect.Label)."
         if ($installDefect.Knob -ceq 'InstallExitCode') {
             Assert-Equal 0 @(Get-ConcealmentCalls -State $defectState -Pattern '*push*').Count 'A failed HMA APK install still pushed the Vector module.'
@@ -6302,6 +6559,55 @@ function Invoke-ConcealmentTests {
             Assert-Equal 0 @($defectState.Modules).Count "A failed Vector module install was recorded as present: $($installDefect.Label)."
         }
     }
+    foreach ($layoutDefect in @(
+            [pscustomobject]@{ Child = 'vector-inner'; Label = 'a nested module directory' },
+            [pscustomobject]@{ Child = 'Vector'; Label = 'a differently named module directory' },
+            [pscustomobject]@{ Child = 'vector.zip'; Label = 'a file instead of the module directory' }
+        )) {
+        $defectState = New-ConcealmentGuestState -Install $install
+        $defectState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
+        $defectState.ExtractChildName = $layoutDefect.Child
+        $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+        $defectResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $defectJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $defectState)
+        Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code 'MODULE_LAYOUT_UNSUPPORTED' -Message "A wrong Vector archive layout was accepted: $($layoutDefect.Label)."
+        Assert-Equal 0 @($defectState.Modules).Count "A wrong Vector archive layout was installed anyway: $($layoutDefect.Label)."
+        Assert-Equal -1 (Get-ConcealmentCallIndex -Calls $defectState.Calls -Pattern '*mv *') "A wrong Vector archive layout still moved a directory: $($layoutDefect.Label)."
+    }
+
+    foreach ($assetNameDefect in @(
+            [pscustomobject]@{ Name = 'Vector&payload.zip'; Code = 'ASSET_PATH_INVALID'; Label = 'a shell operator in the pinned asset name' },
+            [pscustomobject]@{ Name = 'Vector;payload.zip'; Code = 'ASSET_PATH_INVALID'; Label = 'a command separator in the pinned asset name' }
+        )) {
+        $defectRoot = Join-Path $concealmentRoot ('unsafe asset name ' + ([Math]::Abs($assetNameDefect.Name.GetHashCode())))
+        [void][IO.Directory]::CreateDirectory($defectRoot)
+        $defectFixture = New-ConcealmentAssetFixture -CacheRoot $defectRoot -VectorAssetName $assetNameDefect.Name
+        $defectState = New-ConcealmentGuestState -Install $install
+        $defectState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
+        $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+        $defectResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $defectFixture.Manifest -Journal $defectJournal -CacheRoot $defectRoot -Runner (New-ConcealmentManagerRunner -State $defectState)
+        Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code $assetNameDefect.Code -Message "An unsafe pinned asset name was accepted: $($assetNameDefect.Label)."
+        Assert-Equal 0 @(Get-ConcealmentCalls -State $defectState -Pattern '*push*').Count "An unsafe pinned asset name still staged the module: $($assetNameDefect.Label)."
+        Assert-Equal 0 @(Get-ConcealmentCalls -State $defectState -Pattern '*install -r*').Count "An unsafe pinned asset name still installed the HMA APK: $($assetNameDefect.Label)."
+    }
+    $traversalManifest = [pscustomobject]@{
+        dependencies = @(
+            @($assets.Manifest.dependencies | Where-Object { [string]$_.id -ceq 'hma' })[0],
+            [pscustomobject][ordered]@{
+                id        = 'vector'
+                version   = 'pinned'
+                assetName = '..\evil.zip'
+                url       = 'https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip'
+                size      = [long]28
+                sha256    = '0000000000000000000000000000000000000000000000000000000000000000'
+            }
+        )
+    }
+    $traversalState = New-ConcealmentGuestState -Install $install
+    $traversalState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
+    $traversalJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $traversalResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $traversalManifest -Journal $traversalJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $traversalState)
+    Assert-ConcealmentFailure -Result $traversalResult -Journal $traversalJournal -Code 'ASSET_VERIFICATION_FAILED' -Message 'A pinned asset name with a traversal was accepted.'
+    Assert-Equal 0 @($traversalState.Calls).Count 'A pinned asset name with a traversal still changed the instance.'
 
     $configState = New-ConcealmentGuestState -Install $install
     $configState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[2], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
@@ -6311,79 +6617,78 @@ function Invoke-ConcealmentTests {
     Assert-Equal 'Success' $readConfig.Status "The supported HMA configuration was refused. $($readConfig.Message)"
     Assert-Equal 93 $readConfig.Data.HmaConfigVersion 'The HMA configuration reader reported the wrong version.'
     Assert-Equal $configState.ConfigPath $readConfig.Data.ConfigPath 'The HMA configuration reader reported the wrong path.'
+    $cloneTargetConfig = Get-HmaConfig -Instance $instance -TargetIndex $cloneIndex -Runner $configRunner
+    Assert-Equal 'Success' $cloneTargetConfig.Status 'The HMA configuration reader refused an explicit target index.'
+    Assert-Equal $cloneIndex $cloneTargetConfig.Data.InstanceIndex 'The HMA configuration reader reported the wrong target index.'
+    $readSourceConfig = Get-HmaConfig -Instance $instance -Runner $configRunner
+    Assert-Equal 3 $readSourceConfig.Data.InstanceIndex 'The HMA configuration reader did not default to the selected instance.'
 
     foreach ($schemaDefect in @(
-            [pscustomobject]@{ Text = (New-ConcealmentConfigText -ConfigVersion 92); Code = 'HMA_SCHEMA_UNSUPPORTED'; Label = 'an older configuration version' },
-            [pscustomobject]@{ Text = (New-ConcealmentConfigText -ConfigVersion 94); Code = 'HMA_SCHEMA_UNSUPPORTED'; Label = 'a newer configuration version' },
-            [pscustomobject]@{ Text = (New-ConcealmentConfigText -OmitConfigVersion); Code = 'HMA_SCHEMA_UNSUPPORTED'; Label = 'a configuration with no version' },
-            [pscustomobject]@{ Text = ('{"configVersion":"93"}'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Label = 'a string configuration version' },
-            [pscustomobject]@{ Text = ('{"configVersion":93,"templates":"Root"}'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Label = 'a configuration with an unusable template map' },
-            [pscustomobject]@{ Text = ('[{"configVersion":93}]'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Label = 'an array configuration' },
-            [pscustomobject]@{ Text = ('not json'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Label = 'a malformed configuration' }
+            [pscustomobject]@{ Text = (New-ConcealmentConfigText -ConfigVersion 92); Code = 'HMA_SCHEMA_UNSUPPORTED'; Reason = 'version 92'; Label = 'an older configuration version' },
+            [pscustomobject]@{ Text = (New-ConcealmentConfigText -ConfigVersion 94); Code = 'HMA_SCHEMA_UNSUPPORTED'; Reason = 'version 94'; Label = 'a newer configuration version' },
+            [pscustomobject]@{ Text = (New-ConcealmentConfigText -OmitConfigVersion); Code = 'HMA_SCHEMA_UNSUPPORTED'; Reason = 'no usable configVersion'; Label = 'a configuration with no version' },
+            [pscustomobject]@{ Text = ('{"configVersion":"93"}'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Reason = 'no usable configVersion'; Label = 'a string configuration version' },
+            [pscustomobject]@{ Text = ('{"configVersion":93,"templates":"Root"}'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Reason = 'no usable template map'; Label = 'a configuration with an unusable template map' },
+            [pscustomobject]@{ Text = ('[{"configVersion":93}]'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Reason = 'not a supported document'; Label = 'an array configuration' },
+            [pscustomobject]@{ Text = ('not json'); Code = 'HMA_SCHEMA_UNSUPPORTED'; Reason = 'not strict JSON'; Label = 'a malformed configuration' },
+            [pscustomobject]@{ Text = ''; Code = 'HMA_CONFIG_UNREADABLE'; Reason = 'could not be read'; Label = 'an unreadable configuration' }
         )) {
         $defectState = New-ConcealmentGuestState -Install $install
         $defectState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
-        $defectState.Files[$defectState.ConfigPath] = $schemaDefect.Text
+        if ($schemaDefect.Text) {
+            $defectState.Files[$defectState.ConfigPath] = $schemaDefect.Text
+        }
         $defectConfig = Get-HmaConfig -Instance $instance -Runner (New-ConcealmentManagerRunner -State $defectState)
-        Assert-ConcealmentHandoff -Result $defectConfig -Journal $null -Code $schemaDefect.Code -Message "An unknown HMA schema was accepted: $($schemaDefect.Label)."
+        Assert-ConcealmentHandoff -Result $defectConfig -Journal $null -Code $schemaDefect.Code -ReasonPattern ([regex]::Escape($schemaDefect.Reason)) -Message "An unknown HMA schema was accepted: $($schemaDefect.Label)."
         Assert-Equal 0 @(Get-ConcealmentCalls -State $defectState -Pattern '*base64*').Count "An unknown HMA schema still wrote a file: $($schemaDefect.Label)."
         $defectTemplateJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
         $defectTemplate = New-ReusableRootTemplate -Instance $instance -Journal $defectTemplateJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
-        Assert-ConcealmentHandoff -Result $defectTemplate -Journal $defectTemplateJournal -Code $schemaDefect.Code -Message "An unknown HMA schema still produced a template: $($schemaDefect.Label)."
+        Assert-ConcealmentHandoff -Result $defectTemplate -Journal $defectTemplateJournal -Code $schemaDefect.Code -ReasonPattern ([regex]::Escape($schemaDefect.Reason)) -Message "An unknown HMA schema still produced a template: $($schemaDefect.Label)."
         $defectSetJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-        $defectSet = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage) -Journal $defectSetJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
-        Assert-ConcealmentHandoff -Result $defectSet -Journal $defectSetJournal -Code $schemaDefect.Code -Message "An unknown HMA schema still applied concealment: $($schemaDefect.Label)."
-        Assert-Equal $schemaDefect.Text $defectState.Files[$defectState.ConfigPath] "An unknown HMA schema changed the configuration: $($schemaDefect.Label)."
+        $defectSet = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $defectSetJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
+        Assert-ConcealmentHandoff -Result $defectSet -Journal $defectSetJournal -Code $schemaDefect.Code -ReasonPattern ([regex]::Escape($schemaDefect.Reason)) -Message "An unknown HMA schema still applied concealment: $($schemaDefect.Label)."
+        if ($schemaDefect.Text) {
+            Assert-Equal $schemaDefect.Text $defectState.Files[$defectState.ConfigPath] "An unknown HMA schema changed the configuration: $($schemaDefect.Label)."
+        }
     }
 
-    $absentState = New-ConcealmentGuestState -Install $install
-    $absentState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
-    $absentConfig = Get-HmaConfig -Instance $instance -Runner (New-ConcealmentManagerRunner -State $absentState)
-    Assert-ConcealmentHandoff -Result $absentConfig -Journal $null -Code 'HMA_CONFIG_UNREADABLE' -Message 'An unreadable HMA configuration was accepted.'
-    Assert-Equal 0 @(Get-ConcealmentCalls -State $absentState -Pattern '*base64*').Count 'An unreadable HMA configuration still wrote a file.'
+    $nullConfig = Get-HmaConfig -Instance $null -Runner $runner
+    Assert-Equal 'CriticalError' $nullConfig.Status 'A concealment read without an instance asked the operator to configure the UI.'
+    Assert-Equal 'INSTANCE_INVALID' $nullConfig.Data.Code 'A concealment read without an instance reported the wrong code.'
+    Assert-True ($nullConfig.Data -isnot [Collections.IDictionary] -or -not $nullConfig.Data.Contains('Steps')) 'An invalid instance was answered with a supported-UI handoff.'
+    $noManagerConfig = Get-HmaConfig -Instance ([pscustomobject]@{ Index = $install.SourceIndex }) -Runner $runner
+    Assert-Equal 'CriticalError' $noManagerConfig.Status 'A concealment read without a manager asked the operator to configure the UI.'
+    Assert-Equal 'INSTANCE_INVALID' $noManagerConfig.Data.Code 'A concealment read without a manager install reported the wrong code.'
+    $foreignManagerRead = Get-HmaConfig -Instance $foreignManagerInstance -Runner $runner
+    Assert-Equal 'CriticalError' $foreignManagerRead.Status 'A concealment read with a foreign manager asked the operator to configure the UI.'
+    Assert-Equal 'MANAGER_UNAVAILABLE' $foreignManagerRead.Data.Code 'A concealment read with a foreign manager reported the wrong code.'
     $failingState = New-ConcealmentGuestState -Install $install
     $failingState.Packages = @($script:ConcealmentSelectedPackage)
     $failingState.AdbFailPattern = '*cat*'
     $failingConfig = Get-HmaConfig -Instance $instance -Runner (New-ConcealmentManagerRunner -State $failingState)
-    Assert-ConcealmentHandoff -Result $failingConfig -Journal $null -Code 'HMA_CONFIG_UNREADABLE' -Message 'A failed HMA configuration read was accepted.'
+    Assert-ConcealmentHandoff -Result $failingConfig -Journal $null -Code 'HMA_CONFIG_UNREADABLE' -ReasonPattern 'could not be read' -Message 'A failed HMA configuration read was accepted.'
+    $absentState = New-ConcealmentGuestState -Install $install
+    $absentState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
     $absentTemplateJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
     $absentTemplate = New-ReusableRootTemplate -Instance $instance -Journal $absentTemplateJournal -Runner (New-ConcealmentManagerRunner -State $absentState)
-    Assert-ConcealmentHandoff -Result $absentTemplate -Journal $absentTemplateJournal -Code 'HMA_CONFIG_UNREADABLE' -Message 'An unreadable HMA configuration still produced a template.'
-    $noManagerConfig = Get-HmaConfig -Instance ([pscustomobject]@{ Index = $install.SourceIndex }) -Runner $runner
-    Assert-Equal 'Warning' $noManagerConfig.Status 'A concealment read without a manager path was not reported as a safe handoff.'
-    $nullConfig = Get-HmaConfig -Instance $null -Runner $runner
-    Assert-Equal 'Warning' $nullConfig.Status 'A concealment read without an instance was not reported as a safe handoff.'
+    Assert-ConcealmentHandoff -Result $absentTemplate -Journal $absentTemplateJournal -Code 'HMA_CONFIG_UNREADABLE' -ReasonPattern 'could not be read' -Message 'An unreadable HMA configuration still produced a template.'
 
     $templateState = New-ConcealmentGuestState -Install $install
     $templateState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[2], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
     $templateState.Files[$templateState.ConfigPath] = (New-ConcealmentConfigText -RootPackages @('com.example.legacy'))
     $templateJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $templateResult = New-ReusableRootTemplate -Instance $instance -Journal $templateJournal -Runner (New-ConcealmentManagerRunner -State $templateState)
+    $templateResult = New-ReusableRootTemplate -Instance $instance -TargetIndex $cloneIndex -Journal $templateJournal -Runner (New-ConcealmentManagerRunner -State $templateState)
     Assert-Equal 'Success' $templateResult.Status "The reusable Root template could not be verified. $($templateResult.Message)"
     Assert-Equal 'Root' $templateResult.Data.TemplateName 'The reusable Root template reported the wrong name.'
     Assert-Equal $false $templateResult.Data.IsWhitelist 'The reusable Root template is not a blacklist template.'
+    Assert-Equal $cloneIndex $templateResult.Data.InstanceIndex 'The reusable Root template did not report the instance it inspected.'
     foreach ($requiredPackage in $script:ConcealmentRootPackages) {
         Assert-True (@($templateResult.Data.TemplatePackages) -ccontains $requiredPackage) "The reusable Root template omits the required package: $requiredPackage"
     }
     Assert-True (@($templateResult.Data.TemplatePackages) -ccontains 'com.example.legacy') 'The reusable Root template dropped an existing template entry.'
     Assert-True (@($templateResult.Data.TemplatePackages) -cnotcontains $script:ConcealmentSelectedPackage) 'The reusable Root template absorbed a selected app.'
     Assert-Equal 0 @(Get-ConcealmentCalls -State $templateState -Pattern '*base64*').Count 'Verifying the reusable Root template wrote the configuration.'
-
-    $whitelistState = New-ConcealmentGuestState -Install $install
-    $whitelistState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
-    $whitelistState.Files[$whitelistState.ConfigPath] = ('{"configVersion":93,"templates":{"Root":{"isWhitelist":true,"appList":[]}},"apps":{}}')
-    $whitelistJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $whitelistResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage) -Journal $whitelistJournal -Runner (New-ConcealmentManagerRunner -State $whitelistState)
-    Assert-ConcealmentFailure -Result $whitelistResult -Journal $whitelistJournal -Code 'HMA_TEMPLATE_INVALID' -Message 'An existing HMA Root whitelist template was flipped to a blacklist.'
-    Assert-Equal 0 @(Get-ConcealmentCalls -State $whitelistState -Pattern '*base64*').Count 'An existing HMA Root whitelist template still wrote the configuration.'
-
-    $globalState = New-ConcealmentGuestState -Install $install
-    $globalState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage, 'com.example.other')
-    $globalState.Files[$globalState.ConfigPath] = (New-ConcealmentConfigText -Apps @{'*' = 'Root'})
-    $globalJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $globalResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage) -Journal $globalJournal -Runner (New-ConcealmentManagerRunner -State $globalState)
-    Assert-ConcealmentFailure -Result $globalResult -Journal $globalJournal -Code 'HMA_TEMPLATE_INVALID' -Message 'An existing global HMA template scope was rewritten.'
-    Assert-Equal 0 @(Get-ConcealmentCalls -State $globalState -Pattern '*base64*').Count 'An existing global HMA template scope still wrote the configuration.'
+    Assert-ConcealmentCloneOnly -State $templateState -Message 'Verifying the reusable Root template acted outside the verified clone.'
 
     $partialState = New-ConcealmentGuestState -Install $install
     $partialState.Packages = @($script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
@@ -6391,26 +6696,58 @@ function Invoke-ConcealmentTests {
     $partialTemplate = New-ReusableRootTemplate -Instance $instance -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -Runner (New-ConcealmentManagerRunner -State $partialState)
     Assert-Equal @($script:ConcealmentRootPackages[3]) @($partialTemplate.Data.TemplatePackages) 'The reusable Root template added a root package that is not installed.'
 
+    $whitelistState = New-ConcealmentGuestState -Install $install
+    $whitelistState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+    $whitelistState.Files[$whitelistState.ConfigPath] = ('{"configVersion":93,"templates":{"Root":{"isWhitelist":true,"appList":[]}},"apps":{}}')
+    $whitelistJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $whitelistResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $whitelistJournal -Runner (New-ConcealmentManagerRunner -State $whitelistState)
+    Assert-ConcealmentFailure -Result $whitelistResult -Journal $whitelistJournal -Code 'HMA_TEMPLATE_INVALID' -Message 'An existing HMA Root whitelist template was flipped to a blacklist.'
+    Assert-Equal 0 @(Get-ConcealmentCalls -State $whitelistState -Pattern '*base64*').Count 'An existing HMA Root whitelist template still wrote the configuration.'
+
+    $globalState = New-ConcealmentGuestState -Install $install
+    $globalState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage)
+    $globalState.Files[$globalState.ConfigPath] = (New-ConcealmentConfigText -Apps @{'*' = 'Root'})
+    $globalJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $globalResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $globalJournal -Runner (New-ConcealmentManagerRunner -State $globalState)
+    Assert-ConcealmentFailure -Result $globalResult -Journal $globalJournal -Code 'HMA_TEMPLATE_INVALID' -Message 'An existing global HMA template scope was rewritten.'
+    Assert-Equal 0 @(Get-ConcealmentCalls -State $globalState -Pattern '*base64*').Count 'An existing global HMA template scope still wrote the configuration.'
+
+    $deepState = New-ConcealmentGuestState -Install $install
+    $deepState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+    $deepState.Files[$deepState.ConfigPath] = (New-ConcealmentConfigText -DeepLevels 20)
+    $deepJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $deepConfigText = $deepState.Files[$deepState.ConfigPath]
+    $deepResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $deepJournal -Runner (New-ConcealmentManagerRunner -State $deepState)
+    Assert-ConcealmentFailure -Result $deepResult -Journal $deepJournal -Code 'HMA_WRITE_FAILED' -Message 'A configuration the serializer would truncate was written.'
+    Assert-Equal 0 @(Get-ConcealmentCalls -State $deepState -Pattern '*base64*').Count 'A configuration the serializer would truncate still wrote a file.'
+    Assert-Equal 0 @($deepState.Files.Keys | Where-Object { $_ -like '*.backup-*' }).Count 'A configuration the serializer would truncate created a backup.'
+    Assert-Equal $deepConfigText $deepState.Files[$deepState.ConfigPath] 'A configuration the serializer would truncate changed the original configuration.'
+
     $applyState = New-ConcealmentGuestState -Install $install
-    $applyState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[2], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage, 'com.example.other')
+    $applyState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[2], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage)
     $applyState.Files[$applyState.ConfigPath] = (New-ConcealmentConfigText -RootPackages @('com.example.legacy'))
+    $applyState.Files[$script:ConcealmentKernelSUAllowlistPath] = $script:ConcealmentAllowlistBytes
     $applyJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
     $applyRunner = New-ConcealmentManagerRunner -State $applyState
-    $applyResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage) -Journal $applyJournal -Runner $applyRunner
+    $applyResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $applyJournal -Runner $applyRunner
     Assert-True ($applyResult.Status -eq 'Success') "Selected app concealment failed. $($applyResult.Message)"
     Assert-Equal 'OK' $applyResult.Data.Code 'Selected app concealment reported an invalid code.'
     Assert-True (@($applyResult.Data.Packages) -ccontains $script:ConcealmentSelectedPackage) 'The selected app is missing from the result.'
     Assert-Equal 1 @($applyResult.Data.Packages).Count 'Selected app concealment reported an unexpected package count.'
+    Assert-Equal $cloneIndex $applyResult.Data.CloneIndex 'Selected app concealment reported the wrong target instance.'
+    Assert-Equal $clone.CloneName $applyResult.Data.CloneName 'Selected app concealment reported the wrong target clone.'
     Assert-Equal 'Completed' $applyJournal.State 'Selected app concealment did not complete its journal.'
     $reopenedApply = Get-OperationJournal -Path $applyJournal.JournalPath
     Assert-Equal 'Completed' $reopenedApply.State 'Selected app concealment did not persist its journal state.'
     Assert-True (@($reopenedApply.Result.Data.Packages) -ccontains $script:ConcealmentSelectedPackage) 'Selected app concealment did not persist its package scope.'
+    Assert-Equal $cloneIndex $reopenedApply.Result.Data.CloneIndex 'Selected app concealment did not persist its target instance.'
     Assert-Equal 3 @(@($applyResult.Data.Handoff) | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum 'Selected app concealment did not record the KernelSU handoff for the selected app.'
+    Assert-ConcealmentCloneOnly -State $applyState -Message 'Selected app concealment acted outside the verified clone.'
     $writtenConfig = $applyState.Files[$applyState.ConfigPath] | ConvertFrom-Json
     Assert-Equal 93 $writtenConfig.configVersion 'The written HMA configuration changed the supported version.'
     Assert-Equal $false $writtenConfig.templates.Root.isWhitelist 'The written HMA configuration turned the Root template into a whitelist.'
     Assert-True (@($writtenConfig.templates.Root.appList) -cnotcontains $script:ConcealmentSelectedPackage) 'The written HMA configuration leaked the selected app into the Root template.'
-    Assert-True (@($writtenConfig.templates.Root.appList) -cnotcontains 'com.example.other') 'The written HMA configuration leaked an unselected app into the Root template.'
+    Assert-True (@($writtenConfig.templates.Root.appList) -cnotcontains $script:ConcealmentSecondPackage) 'The written HMA configuration leaked an unselected app into the Root template.'
     Assert-Equal 'Root' $writtenConfig.apps.($script:ConcealmentSelectedPackage) 'The selected app was not assigned the Root template.'
     Assert-Equal 1 @($writtenConfig.apps.PSObject.Properties).Count 'The written HMA configuration assigned the template to another app.'
     Assert-Equal -1 (Get-ConcealmentCallIndex -Calls $applyState.Calls -Pattern '*pm uninstall*') 'Selected app concealment uninstalled a package.'
@@ -6422,15 +6759,38 @@ function Invoke-ConcealmentTests {
     Assert-True ((@($writeCalls[1]) -join ' ') -like ('*' + $applyState.ConfigPath + '*')) 'Selected app concealment did not write the configuration after its backup.'
     Assert-True ($backupPath.StartsWith($applyState.ConfigPath, [StringComparison]::Ordinal)) 'The recorded configuration backup is not beside the configuration.'
     Assert-Equal (New-ConcealmentConfigText -RootPackages @('com.example.legacy')) $applyState.Files[$backupPath] 'The configuration backup does not hold the original configuration.'
+    $backupWriteIndex = Get-ConcealmentCallIndex -Calls $applyState.Calls -Pattern ('*base64*' + $backupPath + '*')
+    $backupReadIndex = Get-ConcealmentCallIndex -Calls $applyState.Calls -Pattern ('*cat ' + $backupPath + '*')
+    Assert-True ($backupWriteIndex -ge 0) 'Selected app concealment did not write the configuration backup.'
+    Assert-True ($backupReadIndex -gt $backupWriteIndex) 'Selected app concealment did not read the configuration backup back after writing it.'
+    Assert-Equal $script:ConcealmentAllowlistBytes $applyState.Files[$script:ConcealmentKernelSUAllowlistPath] 'Selected app concealment changed the KernelSU allowlist bytes.'
+    $applyCallText = (@($applyState.Calls) | ForEach-Object { @($_) -join ' ' }) -join ' '
+    Assert-True ($applyCallText -notmatch [regex]::Escape($script:ConcealmentKernelSUAllowlistPath) + ' *(>|base64|mv|rm)') 'Selected app concealment issued a write against the KernelSU allowlist path.'
+    Assert-True ($applyCallText -notmatch ('base64[^"]*' + [regex]::Escape($script:ConcealmentKernelSUAllowlistPath))) 'Selected app concealment wrote through the KernelSU allowlist path.'
 
-    $restoreResult = Set-ConcealmentGuestText -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Path $applyState.ConfigPath -Text $applyState.Files[$backupPath] -Runner (New-ConcealmentManagerRunner -State $applyState)
+    $restoreResult = Set-ConcealmentGuestText -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Path $applyState.ConfigPath -Text $applyState.Files[$backupPath] -Runner (New-ConcealmentManagerRunner -State $applyState)
     Assert-Equal 'Success' $restoreResult.Status "The HMA configuration backup could not be restored. $($restoreResult.Message)"
     Assert-Equal (New-ConcealmentConfigText -RootPackages @('com.example.legacy')) $applyState.Files[$applyState.ConfigPath] 'The restored HMA configuration differs from the original configuration.'
 
+    foreach ($backupDefect in @(
+            [pscustomobject]@{ Knob = 'CatCorruptPattern'; Value = '*.backup-*'; Label = 'a truncated backup read-back' },
+            [pscustomobject]@{ Knob = 'CatFailPattern'; Value = '*.backup-*'; Label = 'a backup read-back that cannot be read' }
+        )) {
+        $defectState = New-ConcealmentGuestState -Install $install
+        $defectState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+        $defectState.Files[$defectState.ConfigPath] = (New-ConcealmentConfigText -RootPackages @('com.example.legacy'))
+        $defectState.($backupDefect.Knob) = $backupDefect.Value
+        $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+        $defectResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $defectJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
+        Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code 'HMA_BACKUP_FAILED' -Message "An unverified configuration backup was accepted: $($backupDefect.Label)."
+        Assert-Equal (New-ConcealmentConfigText -RootPackages @('com.example.legacy')) $defectState.Files[$defectState.ConfigPath] "An unverified configuration backup still changed the original configuration: $($backupDefect.Label)."
+        Assert-Equal 1 @(Get-ConcealmentCalls -State $defectState -Pattern '*base64*').Count "An unverified configuration backup still wrote the configuration: $($backupDefect.Label)."
+    }
+
     $multiState = New-ConcealmentGuestState -Install $install
-    $multiState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage, 'com.example.other')
+    $multiState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage)
     $multiState.Files[$multiState.ConfigPath] = (New-ConcealmentConfigText)
-    $multiResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage, 'com.example.other', $script:ConcealmentSelectedPackage) -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -Runner (New-ConcealmentManagerRunner -State $multiState)
+    $multiResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage, $script:ConcealmentSelectedPackage) -Journal (New-ConcealmentJournal -Root $journalRoot -Instance $instance) -Runner (New-ConcealmentManagerRunner -State $multiState)
     Assert-Equal 'Success' $multiResult.Status "Selected app concealment failed for two apps. $($multiResult.Message)"
     Assert-Equal 2 @($multiResult.Data.Packages).Count 'Duplicate selected packages were not collapsed.'
     $multiConfig = $multiState.Files[$multiState.ConfigPath] | ConvertFrom-Json
@@ -6453,7 +6813,7 @@ function Invoke-ConcealmentTests {
         $defectState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
         $defectState.Files[$defectState.ConfigPath] = (New-ConcealmentConfigText)
         $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-        $defectResult = Set-AppConcealment -Instance $instance -Packages $defect.Packages -Journal $defectJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
+        $defectResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages $defect.Packages -Journal $defectJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
         Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code 'PACKAGE_NAME_INVALID' -Message "An invalid package name was accepted: $($defect.Label)."
         Assert-Equal 0 @(Get-ConcealmentCalls -State $defectState -Pattern '*base64*').Count "An invalid package name still wrote the configuration: $($defect.Label)."
     }
@@ -6463,7 +6823,7 @@ function Invoke-ConcealmentTests {
         $defectState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
         $defectState.Files[$defectState.ConfigPath] = (New-ConcealmentConfigText)
         $defectJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-        $defectResult = Set-AppConcealment -Instance $instance -Packages $emptySelection -Journal $defectJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
+        $defectResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages $emptySelection -Journal $defectJournal -Runner (New-ConcealmentManagerRunner -State $defectState)
         Assert-ConcealmentFailure -Result $defectResult -Journal $defectJournal -Code 'PACKAGES_REQUIRED' -Message 'An empty selected package list was accepted.'
         Assert-Equal 0 @(Get-ConcealmentCalls -State $defectState -Pattern '*base64*').Count 'An empty selected package list still wrote the configuration.'
     }
@@ -6472,15 +6832,15 @@ function Invoke-ConcealmentTests {
     $allState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
     $allState.Files[$allState.ConfigPath] = (New-ConcealmentConfigText)
     $allJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $allResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage) -Journal $allJournal -Runner (New-ConcealmentManagerRunner -State $allState)
+    $allResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage) -Journal $allJournal -Runner (New-ConcealmentManagerRunner -State $allState)
     Assert-ConcealmentFailure -Result $allResult -Journal $allJournal -Code 'ALL_APPS_REFUSED' -Message 'A selection of every installed app was accepted.'
     Assert-Equal 0 @(Get-ConcealmentCalls -State $allState -Pattern '*base64*').Count 'A selection of every installed app still wrote the configuration.'
 
     $uninstalledState = New-ConcealmentGuestState -Install $install
-    $uninstalledState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage, 'com.example.other')
+    $uninstalledState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage)
     $uninstalledState.Files[$uninstalledState.ConfigPath] = (New-ConcealmentConfigText)
     $uninstalledJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $uninstalledResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage, 'com.example.absent') -Journal $uninstalledJournal -Runner (New-ConcealmentManagerRunner -State $uninstalledState)
+    $uninstalledResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage, 'com.example.absent') -Journal $uninstalledJournal -Runner (New-ConcealmentManagerRunner -State $uninstalledState)
     Assert-ConcealmentFailure -Result $uninstalledResult -Journal $uninstalledJournal -Code 'PACKAGE_NOT_INSTALLED' -Message 'A package that is not installed was accepted.'
     Assert-Equal 0 @(Get-ConcealmentCalls -State $uninstalledState -Pattern '*base64*').Count 'A package that is not installed still wrote the configuration.'
 
@@ -6489,7 +6849,7 @@ function Invoke-ConcealmentTests {
     $unreadableState.Files[$unreadableState.ConfigPath] = (New-ConcealmentConfigText)
     $unreadableState.AdbFailPattern = '*pm list packages*'
     $unreadableJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $unreadableResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage) -Journal $unreadableJournal -Runner (New-ConcealmentManagerRunner -State $unreadableState)
+    $unreadableResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $unreadableJournal -Runner (New-ConcealmentManagerRunner -State $unreadableState)
     Assert-ConcealmentFailure -Result $unreadableResult -Journal $unreadableJournal -Code 'PACKAGE_LIST_UNREADABLE' -Message 'An unreadable package list was accepted.'
     Assert-Equal 0 @(Get-ConcealmentCalls -State $unreadableState -Pattern '*base64*').Count 'An unreadable package list still wrote the configuration.'
 
@@ -6498,29 +6858,30 @@ function Invoke-ConcealmentTests {
     $writeFailureState.Files[$writeFailureState.ConfigPath] = (New-ConcealmentConfigText -RootPackages @('com.example.legacy'))
     $writeFailureState.WriteFailPattern = $writeFailureState.ConfigPath
     $writeFailureJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $writeFailureResult = Set-AppConcealment -Instance $instance -Packages @($script:ConcealmentSelectedPackage) -Journal $writeFailureJournal -Runner (New-ConcealmentManagerRunner -State $writeFailureState)
+    $writeFailureResult = Set-AppConcealment -Instance $instance -VerifiedClone $clone -Packages @($script:ConcealmentSelectedPackage) -Journal $writeFailureJournal -Runner (New-ConcealmentManagerRunner -State $writeFailureState)
     Assert-ConcealmentFailure -Result $writeFailureResult -Journal $writeFailureJournal -Code 'GUEST_WRITE_FAILED' -Message 'A refused HMA configuration write was accepted.'
     Assert-Equal (New-ConcealmentConfigText -RootPackages @('com.example.legacy')) $writeFailureState.Files[$writeFailureState.ConfigPath] 'A refused HMA configuration write changed the configuration.'
 
     $guestWriteState = New-ConcealmentGuestState -Install $install
     $guestWriteState.WriteFailPattern = '*'
     $guestWriteJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $guestWriteResult = Set-ConcealmentGuestText -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Path $guestWriteState.ConfigPath -Text '{}' -Journal $guestWriteJournal -Runner (New-ConcealmentManagerRunner -State $guestWriteState)
+    $guestWriteResult = Set-ConcealmentGuestText -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Path $guestWriteState.ConfigPath -Text '{}' -Journal $guestWriteJournal -Runner (New-ConcealmentManagerRunner -State $guestWriteState)
     Assert-ConcealmentFailure -Result $guestWriteResult -Journal $guestWriteJournal -Code 'GUEST_WRITE_FAILED' -Message 'A refused guest file write was accepted.'
     $guestPathJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
-    $guestPathResult = Set-ConcealmentGuestText -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Path 'not an absolute guest path' -Text '{}' -Journal $guestPathJournal -Runner (New-ConcealmentManagerRunner -State $guestWriteState)
+    $guestPathResult = Set-ConcealmentGuestText -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Path 'not an absolute guest path' -Text '{}' -Journal $guestPathJournal -Runner (New-ConcealmentManagerRunner -State $guestWriteState)
     Assert-ConcealmentFailure -Result $guestPathResult -Journal $guestPathJournal -Code 'GUEST_WRITE_FAILED' -Message 'A guest file write accepted a path that is not absolute.'
     Assert-Equal 0 @($guestWriteState.Files.Keys).Count 'A refused guest file write stored a file.'
 
     $verificationState = New-ConcealmentGuestState -Install $install
     $verificationState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[2], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
     $verificationState.Files[$verificationState.ConfigPath] = (New-ConcealmentConfigText -Apps @{$script:ConcealmentSelectedPackage = 'Root'})
-    $verificationState.Files[$script:ConcealmentKernelSUAllowlistPath] = 'kernel su allowlist bytes'
-    $verificationResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $verificationState)
+    $verificationState.Files[$script:ConcealmentKernelSUAllowlistPath] = $script:ConcealmentAllowlistBytes
+    $verificationResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $verificationState)
     Assert-Equal 'Success' $verificationResult.Status "Concealment verification failed. $($verificationResult.Message)"
     Assert-Equal 93 $verificationResult.Data.HmaConfigVersion 'Concealment verification reported the wrong HMA configuration version.'
     Assert-True (@($verificationResult.Data.InScope) -ccontains $script:ConcealmentSelectedPackage) 'Concealment verification did not report the selected app in HMA scope.'
     Assert-True (@($verificationResult.Data.TemplatePackages) -ccontains 'me.weishu.kernelsu') 'Concealment verification did not report the Root template contents.'
+    Assert-Equal 0 @($verificationResult.Data.OutOfScope).Count 'Concealment verification reported an out-of-scope app for a fully applied scope.'
     Assert-Equal $true $verificationResult.Data.KernelSUInstalled 'Concealment verification did not report the KernelSU package.'
     Assert-Equal $true $verificationResult.Data.AllowlistPresent 'Concealment verification did not report the KernelSU allowlist file.'
     Assert-Equal $false $verificationResult.Data.ProfileStateObserved 'Concealment verification claimed to observe the KernelSU Superuser profile.'
@@ -6528,16 +6889,51 @@ function Invoke-ConcealmentTests {
     Assert-True ($verificationResult.Message -match 'Umount modules') 'Concealment verification did not ask the operator to confirm Umount modules in the app.'
     Assert-Equal 0 @(Get-ConcealmentCalls -State $verificationState -Pattern '*base64*').Count 'Concealment verification wrote a file.'
 
-    $outOfScopeState = New-ConcealmentGuestState -Install $install
-    $outOfScopeState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
-    $outOfScopeState.Files[$outOfScopeState.ConfigPath] = (New-ConcealmentConfigText)
-    $outOfScopeResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $outOfScopeState)
-    Assert-Equal 'Success' $outOfScopeResult.Status 'Concealment verification refused an unassigned app.'
-    Assert-Equal 0 @($outOfScopeResult.Data.InScope).Count 'Concealment verification reported an unassigned app in HMA scope.'
+    $partialScopeState = New-ConcealmentGuestState -Install $install
+    $partialScopeState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage)
+    $partialScopeState.Files[$partialScopeState.ConfigPath] = (New-ConcealmentConfigText -Apps @{$script:ConcealmentSelectedPackage = 'Root'})
+    $partialScopeResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage) -Runner (New-ConcealmentManagerRunner -State $partialScopeState)
+    Assert-Equal 'Warning' $partialScopeResult.Status 'Concealment verification reported Success for a partially applied scope.'
+    Assert-Equal 'SCOPE_INCOMPLETE' $partialScopeResult.Data.Code 'A partially applied scope reported the wrong code.'
+    Assert-Equal 1 @($partialScopeResult.Data.InScope).Count 'A partially applied scope reported the wrong in-scope count.'
+    Assert-True (@($partialScopeResult.Data.OutOfScope) -ccontains $script:ConcealmentSecondPackage) 'A partially applied scope did not report the out-of-scope app.'
+
+    $unscopedState = New-ConcealmentGuestState -Install $install
+    $unscopedState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+    $unscopedState.Files[$unscopedState.ConfigPath] = (New-ConcealmentConfigText)
+    $unscopedResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $unscopedState)
+    Assert-Equal 'Warning' $unscopedResult.Status 'Concealment verification reported Success for an unapplied scope.'
+    Assert-Equal 'SCOPE_INCOMPLETE' $unscopedResult.Data.Code 'An unapplied scope reported the wrong code.'
+    Assert-Equal 0 @($unscopedResult.Data.InScope).Count 'An unapplied scope reported an in-scope app.'
+
+    $uninstalledTemplateState = New-ConcealmentGuestState -Install $install
+    $uninstalledTemplateState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
+    $uninstalledTemplateState.Files[$uninstalledTemplateState.ConfigPath] = (New-ConcealmentConfigText -RootPackages @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3]) -Apps @{$script:ConcealmentSelectedPackage = 'Root'})
+    $uninstalledTemplateResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $uninstalledTemplateState)
+    Assert-Equal 'Success' $uninstalledTemplateResult.Status 'Concealment verification refused an applied scope.'
+    Assert-Equal 2 @($uninstalledTemplateResult.Data.TemplatePackages).Count 'Concealment verification reported a root package that is not installed.'
+    Assert-True (@($uninstalledTemplateResult.Data.TemplatePackages) -cnotcontains 'com.coderstory.toolkit') 'Concealment verification reported an uninstalled root package in the template.'
+
+    $whitelistVerifyState = New-ConcealmentGuestState -Install $install
+    $whitelistVerifyState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+    $whitelistVerifyState.Files[$whitelistVerifyState.ConfigPath] = ('{"configVersion":93,"templates":{"Root":{"isWhitelist":true,"appList":["org.frknkrc44.hma_oss"]}},"apps":{"jp.pokemon.pokemontcgp":"Root"}}')
+    $whitelistVerifyResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $whitelistVerifyState)
+    Assert-Equal 'Warning' $whitelistVerifyResult.Status 'Concealment verification reported Success for a stored whitelist Root template.'
+    Assert-Equal 'TEMPLATE_NOT_BLACKLIST' $whitelistVerifyResult.Data.Code 'A stored whitelist Root template reported the wrong code.'
+    Assert-Equal $true $whitelistVerifyResult.Data.IsWhitelist 'A stored whitelist Root template was not reported as a whitelist.'
+
+    $unreadableVerifyState = New-ConcealmentGuestState -Install $install
+    $unreadableVerifyState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+    $unreadableVerifyState.Files[$unreadableVerifyState.ConfigPath] = (New-ConcealmentConfigText -Apps @{$script:ConcealmentSelectedPackage = 'Root'})
+    $unreadableVerifyState.AdbFailPattern = '*pm list packages*'
+    $unreadableVerifyResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $unreadableVerifyState)
+    Assert-Equal 'CriticalError' $unreadableVerifyResult.Status 'Concealment verification claimed a Root template without observing the installed packages.'
+    Assert-Equal 'PACKAGE_LIST_UNREADABLE' $unreadableVerifyResult.Data.Code 'An unreadable package list reported the wrong verification code.'
+
     $absentAllowlistState = New-ConcealmentGuestState -Install $install
     $absentAllowlistState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
     $absentAllowlistState.Files[$absentAllowlistState.ConfigPath] = (New-ConcealmentConfigText -Apps @{$script:ConcealmentSelectedPackage = 'Root'})
-    $absentAllowlistResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $absentAllowlistState)
+    $absentAllowlistResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $absentAllowlistState)
     Assert-Equal 'Success' $absentAllowlistResult.Status 'Concealment verification refused a missing KernelSU allowlist file.'
     Assert-Equal $false $absentAllowlistResult.Data.AllowlistPresent 'Concealment verification reported a missing KernelSU allowlist file as present.'
     Assert-Equal $false $absentAllowlistResult.Data.KernelSUInstalled 'Concealment verification reported an absent KernelSU package as installed.'
@@ -6547,7 +6943,7 @@ function Invoke-ConcealmentTests {
             [pscustomobject]@{ ManagerPath = 'C:\MuMu\shell\MuMuManager.exe'; Packages = @(); Label = 'an empty package list' },
             [pscustomobject]@{ ManagerPath = 'C:\MuMu\shell\MuMuManager.exe'; Packages = @('*'); Label = 'a wildcard package' }
         )) {
-        $defectResult = Test-Concealment -ManagerPath $verificationDefect.ManagerPath -InstanceIndex $install.SourceIndex -Packages $verificationDefect.Packages -Runner $runner
+        $defectResult = Test-Concealment -ManagerPath $verificationDefect.ManagerPath -InstanceIndex $cloneIndex -Packages $verificationDefect.Packages -Runner $runner
         Assert-Equal 'CriticalError' $defectResult.Status "Concealment verification accepted $($verificationDefect.Label)."
         Assert-True ($script:ConcealmentCodes -ccontains [string]$defectResult.Data.Code) "Concealment verification reported an undocumented code for $($verificationDefect.Label)."
     }
