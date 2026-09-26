@@ -78,12 +78,14 @@ function New-Android12Recovery {
         VersionName = ''
         VersionCode = ''
         DaemonCount = 0
+        DaemonSamples = 0
     }
     if ($null -ne $Checks) {
         $record.RootVerified = [bool](Get-Android12RecordField -Record $Checks -Name 'RootVerified')
         $record.VersionName = [string](Get-Android12RecordField -Record $Checks -Name 'VersionName')
         $record.VersionCode = [string](Get-Android12RecordField -Record $Checks -Name 'VersionCode')
         $record.DaemonCount = [int](Get-Android12RecordField -Record $Checks -Name 'DaemonCount')
+        $record.DaemonSamples = [int](Get-Android12RecordField -Record $Checks -Name 'DaemonSamples')
     }
     return $record
 }
@@ -428,7 +430,7 @@ function Restore-Android12VendorRoot {
     $restoreData['VendorRootRetained'] = $true
     $restoreData['SystemDiskReadonly'] = $false
     $restoreData['PackageName'] = $script:ToolkitKitsunePackageName
-    $restoreMessage = "The Kitsune root does not survive disabling the MuMu vendor root on MuMu 6.8, because Kitsune System Mode requires the vendor root on this MuMu build. The vendor root was enabled again on the clone at index $CloneIndex and the Kitsune root is verified with it, so the retained vendor root is documented here and the action is reported as a warning, not as a success."
+    $restoreMessage = "The Kitsune root does not survive disabling the MuMu vendor root on MuMu 6.8. The adb shell there stays uid=2000, root is provided by the Magisk su, and disabling the vendor root removes the /system/bin/su path that provides it, so the clone at index $CloneIndex keeps the vendor root enabled. The Kitsune root is verified again with the vendor root on, the retained vendor root is documented here, and the action is reported as a warning, not as a success."
     try {
         Write-JournalEvent -Journal $Journal -Level 'Warning' -Message $restoreMessage -Data $restoreData
         Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Warning' -Message $restoreMessage -Data $restoreData)

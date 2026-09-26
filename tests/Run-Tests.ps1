@@ -4745,21 +4745,22 @@ function Invoke-Root12Tests {
         }
 
         foreach ($daemonCase in @(
-                [pscustomobject]@{ ExitCode = 0; Pids = ''; Code = 'DAEMON_ABSENT'; Label = 'exit 0 with no output' },
-                [pscustomobject]@{ ExitCode = 0; Pids = '   '; Code = 'DAEMON_ABSENT'; Label = 'exit 0 with blank output' },
-                [pscustomobject]@{ ExitCode = 1; Pids = ''; Code = 'DAEMON_ABSENT'; Label = 'exit 1 with empty output' },
-                [pscustomobject]@{ ExitCode = 1; Pids = " `n "; Code = 'DAEMON_ABSENT'; Label = 'exit 1 with blank output' },
-                [pscustomobject]@{ ExitCode = 0; Pids = '4242'; Code = 'OK'; Label = 'exit 0 with one daemon' },
-                [pscustomobject]@{ ExitCode = 0; Pids = "11`n22"; Code = 'DAEMON_DUPLICATE'; Label = 'exit 0 with two daemons' },
-                [pscustomobject]@{ ExitCode = 1; Pids = '4242'; Code = 'ADB_FAILED'; Label = 'exit 1 with output' },
-                [pscustomobject]@{ ExitCode = -201; Pids = ''; Code = 'ADB_FAILED'; Label = 'exit -201' },
-                [pscustomobject]@{ ExitCode = 3; Pids = ''; Code = 'ADB_FAILED'; Label = 'exit 3' }
+                [pscustomobject]@{ ExitCode = 0; Pids = ''; Code = 'DAEMON_ABSENT'; Label = 'exit 0 with no output'; Samples = 3 },
+                [pscustomobject]@{ ExitCode = 0; Pids = '   '; Code = 'DAEMON_ABSENT'; Label = 'exit 0 with blank output'; Samples = 3 },
+                [pscustomobject]@{ ExitCode = 1; Pids = ''; Code = 'DAEMON_ABSENT'; Label = 'exit 1 with empty output'; Samples = 3 },
+                [pscustomobject]@{ ExitCode = 1; Pids = " `n "; Code = 'DAEMON_ABSENT'; Label = 'exit 1 with blank output'; Samples = 3 },
+                [pscustomobject]@{ ExitCode = 0; Pids = '4242'; Code = 'OK'; Label = 'exit 0 with one daemon'; Samples = 1 },
+                [pscustomobject]@{ ExitCode = 0; Pids = "11`n22"; Code = 'DAEMON_DUPLICATE'; Label = 'exit 0 with two daemons'; Samples = 3 },
+                [pscustomobject]@{ ExitCode = 1; Pids = '4242'; Code = 'ADB_FAILED'; Label = 'exit 1 with output'; Samples = 1 },
+                [pscustomobject]@{ ExitCode = -201; Pids = ''; Code = 'ADB_FAILED'; Label = 'exit -201'; Samples = 1 },
+                [pscustomobject]@{ ExitCode = 3; Pids = ''; Code = 'ADB_FAILED'; Label = 'exit 3'; Samples = 1 }
             )) {
             $daemonState = New-Root12ManagerState -Install $install
             $daemonState.DaemonExitCode = [int]$daemonCase.ExitCode
             $daemonState.DaemonPids = [string]$daemonCase.Pids
             $daemonFailure = Invoke-Root12Case -State $daemonState -Instance $android12 -Manifest $manifest `
                 -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Equal $daemonCase.Samples $daemonFailure.Result.Data.DaemonSamples "The final result dropped the settling sample count ($($daemonCase.Label))."
             if ([string]$daemonCase.Code -ceq 'OK') {
                 Assert-True ($daemonFailure.Result.Status -eq 'Success') "A verified root daemon result was rejected ($($daemonCase.Label)): $($daemonFailure.Result.Message)"
                 Assert-Equal 1 $daemonFailure.Result.Data.DaemonCount "A verified root daemon was not reported as exactly one ($($daemonCase.Label))."
@@ -4859,8 +4860,11 @@ function Invoke-Root12Tests {
         Assert-Equal 'vendor-root-restore' $rollback.Result.Data.Step 'The retained-vendor-root warning reported the wrong recovery step.'
         Assert-Equal $rollbackState.CloneIndex $rollback.Result.Data.CloneIndex 'The retained-vendor-root warning did not report the clone.'
         Assert-Equal $android12.Index $rollback.Result.Data.SourceIndex 'The retained-vendor-root warning did not report the source instance.'
-        Assert-True ($rollback.Result.Message -match 'MuMu 6\.8') 'The retained-vendor-root warning does not name the MuMu build that forces it.'
-        Assert-True ($rollback.Result.Message -match '(?i)requires the vendor root') 'The retained-vendor-root warning does not say Kitsune System Mode requires the vendor root.'
+        Assert-True ($rollback.Result.Message -match 'uid=2000') 'The retained-vendor-root warning does not state the observed adb shell identity.'
+        Assert-True ($rollback.Result.Message -match '(?i)removes the /system/bin/su path') 'The retained-vendor-root warning does not say the cleanup removes the su path.'
+        Assert-True ($rollback.Result.Message -match '(?i)Magisk su') 'The retained-vendor-root warning does not say root comes from the Magisk su.'
+        Assert-True ($rollback.Result.Message -notmatch '(?i)requires the vendor root') 'The retained-vendor-root warning still claims Kitsune requires the vendor root.'
+        Assert-True ($rollback.Result.Message -match 'MuMu 6\.8') 'The retained-vendor-root warning does not name the MuMu build the cleanup breaks on.'
         Assert-True ($rollback.Result.Message -match '(?i)not as a success') 'The retained-vendor-root warning does not say it is not a success.'
         Assert-Equal $true $rollbackState.RootSettings[[string]$rollbackState.CloneIndex] 'The rollback did not leave the vendor root enabled on the clone.'
         Assert-Equal $false $rollbackState.SystemDiskReadonly 'The rollback did not leave the system disk writable on the clone.'
@@ -4933,6 +4937,8 @@ function Invoke-Root12Tests {
         $settledDuplicateState.DaemonPidSequence = @('1118 3463', '1118')
         $settledDuplicateChecks = Test-Android12Root -ManagerPath $install.ManagerPath -InstanceIndex $install.SourceIndex -Runner (New-Root12ManagerRunner -State $settledDuplicateState)
         Assert-True ((Get-Root12CallIndex -Calls $settledDuplicateState.Calls -Pattern '*su -c id*') -gt (Get-Root12LastCallIndex -Calls $settledDuplicateState.Calls -Pattern '*pidof magiskd*')) 'The root shell probe ran before the daemon settled.'
+        $settledDuplicateRecord = New-Android12Recovery -Code 'OK' -Step 'verification' -SourceIndex $install.SourceIndex -CloneIndex $settledDuplicateState.CloneIndex -CloneName $settledDuplicateState.CloneName -Checks $settledDuplicateChecks.Data
+        Assert-Equal 2 $settledDuplicateRecord.DaemonSamples 'The recovery record dropped the settling sample count.'
 
         $duplicateRollbackState = New-Root12ManagerState -Install $install
         $duplicateRollbackState.RootAllowedAfterDisable = $false
@@ -4943,6 +4949,7 @@ function Invoke-Root12Tests {
             -Message 'A transient duplicate daemon count poisoned the rollback re-verification.'
         Assert-Equal $true $duplicateRollback.Result.Data.VendorRootRetained 'A transient duplicate daemon count lost the retained vendor root record.'
         Assert-Equal 1 $duplicateRollback.Result.Data.DaemonCount 'The rollback re-verification reported the wrong daemon count after a transient duplicate.'
+        Assert-Equal 1 $duplicateRollback.Result.Data.DaemonSamples 'The rollback re-verification dropped the settling sample count.'
 
         $callerState = New-Root12ManagerState -Install $install
         $callerState.DaemonExitCode = 1
