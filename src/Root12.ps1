@@ -353,6 +353,63 @@ function Test-Android12Root {
         })
 }
 
+function Restore-Android12VendorRoot {
+    param(
+        [string]$ManagerPath,
+        [int]$CloneIndex,
+        [int]$SourceIndex,
+        [string]$CloneName,
+        [object]$CleanupChecks,
+        [object]$Journal,
+        [scriptblock]$Runner = $null
+    )
+
+    $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
+    $enableRoot = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$CloneIndex), '-k', 'root_permission', '-val', 'true') -Runner $Runner
+    if ($null -eq $enableRoot -or $enableRoot.ExitCode -ne 0) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The Kitsune root did not survive disabling the MuMu vendor root, and the vendor root could not be enabled again on the clone, so the clone is left without a verified root. No further change was made.' -Data (New-Android12Recovery -Code 'ROOT_RECOVERY_FAILED' -Step 'vendor-root-restore' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $CleanupChecks.Data)
+    }
+    $restoredSettings = Get-ToolkitInstanceSettings -ManagerPath $manager -Index $CloneIndex -Keys @('root_permission', 'system_disk_readonly') -Runner $Runner
+    if ($restoredSettings.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The vendor root was enabled again on the clone, but the clone settings could not be read afterwards, so the Kitsune root is not verified. ' + $restoredSettings.Message) -Data (New-Android12Recovery -Code 'ROOT_RECOVERY_FAILED' -Step 'vendor-root-restore' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $CleanupChecks.Data)
+    }
+    $restoredRootValue = Get-ToolkitRecordValue -Record $restoredSettings.Data -PropertyNames @('root_permission')
+    if ($restoredRootValue -ne $true) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The vendor root write was accepted, but the clone does not report the enabled vendor root afterwards, so the Kitsune root is not verified.' -Data (New-Android12Recovery -Code 'ROOT_RECOVERY_FAILED' -Step 'vendor-root-restore' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $CleanupChecks.Data)
+    }
+    $restoredSystemDiskValue = Get-ToolkitRecordValue -Record $restoredSettings.Data -PropertyNames @('system_disk_readonly')
+    if ($restoredSystemDiskValue -ne $false) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone reports a read-only system disk again, so Kitsune cannot install into the system partition and the Kitsune root is not verified.' -Data (New-Android12Recovery -Code 'ROOT_RECOVERY_FAILED' -Step 'vendor-root-restore' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $CleanupChecks.Data)
+    }
+    $restoreChecks = Test-Android12Root -ManagerPath $manager -InstanceIndex $CloneIndex -Runner $Runner
+    try {
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The Android 12 package, root daemon, and root shell checks were repeated after the MuMu vendor root was enabled again on the clone.' -Data $restoreChecks.Data
+    }
+    catch {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The Android 12 root checks after the vendor root was enabled again could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'vendor-root-restore-verification' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $restoreChecks.Data)
+    }
+    if ($restoreChecks.Status -ne 'Success') {
+        # The readback above proved the vendor root is enabled, so the record must say the operator is left with it on.
+        $failedRestoreData = New-Android12Recovery -Code 'ROOT_RECOVERY_FAILED' -Step 'vendor-root-restore-verification' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $restoreChecks.Data
+        $failedRestoreData['VendorRootRetained'] = $true
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The MuMu vendor root is enabled again on the clone, but the Kitsune root still does not verify, so the clone is left with the vendor root on and without a verified root. ' + $restoreChecks.Message) -Data $failedRestoreData
+    }
+
+    $restoreData = New-Android12Recovery -Code 'ROOT_AFTER_DISABLE_ROLLED_BACK' -Step 'vendor-root-restore' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $restoreChecks.Data
+    $restoreData['VendorRootRetained'] = $true
+    $restoreData['SystemDiskReadonly'] = $false
+    $restoreData['PackageName'] = $script:ToolkitKitsunePackageName
+    $restoreMessage = "The Kitsune root does not survive disabling the MuMu vendor root on MuMu 6.8, because Kitsune System Mode requires the vendor root on this MuMu build. The vendor root was enabled again on the clone at index $CloneIndex and the Kitsune root is verified with it, so the retained vendor root is documented here and the action is reported as a warning, not as a success."
+    try {
+        Write-JournalEvent -Journal $Journal -Level 'Warning' -Message $restoreMessage -Data $restoreData
+        Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Warning' -Message $restoreMessage -Data $restoreData)
+    }
+    catch {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The retained-vendor-root Android 12 result could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'vendor-root-restore' -SourceIndex $SourceIndex -CloneIndex $CloneIndex -CloneName $CloneName -Checks $restoreChecks.Data)
+    }
+    return Get-ToolkitResult -Status 'Warning' -Message $restoreMessage -Data $restoreData
+}
+
 function Install-Android12Root {
     param(
         [object]$Instance,
@@ -617,7 +674,7 @@ function Install-Android12Root {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The Android 12 root checks after the temporary vendor root was disabled could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'post-cleanup-verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $cleanupChecks.Data)
     }
     if ($cleanupChecks.Status -ne 'Success') {
-        return New-ToolkitRootFailure -Journal $Journal -Message ('The Kitsune root did not survive disabling the temporary vendor root, so this is not a success. The clone is left as it is for inspection and no repair is attempted. ' + $cleanupChecks.Message) -Data (New-Android12Recovery -Code 'ROOT_AFTER_DISABLE' -Step 'post-cleanup-verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $cleanupChecks.Data)
+        return Restore-Android12VendorRoot -ManagerPath $manager -CloneIndex $cloneIndex -SourceIndex $sourceIndex -CloneName $cloneName -CleanupChecks $cleanupChecks -Journal $Journal -Runner $Runner
     }
 
     $successData = New-Android12Recovery -Code 'OK' -Step 'complete' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $cleanupChecks.Data

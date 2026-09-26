@@ -174,9 +174,18 @@ choice above is accepted; any other answer stops the workflow before the cold bo
 clone is left as it is. After you confirm, the toolkit cold-boots the clone, verifies the
 Kitsune package, the root daemon, and a root shell, disables the temporary vendor root again,
 and then repeats the same three checks. Success is reported only when those checks still pass
-after the cleanup, because disabling the vendor root can remove the root shell. If they do not
-pass, the workflow reports `ROOT_AFTER_DISABLE`, leaves the clone as it is for inspection, and
-attempts no repair.
+after the cleanup, because disabling the vendor root can remove the root shell.
+
+On MuMu 6.8 that cleanup does remove `/system/bin/su` while the Kitsune files and one `magiskd`
+survive, so Kitsune System Mode needs the MuMu vendor root. When the checks after the cleanup
+fail, the toolkit therefore enables the vendor root again on that clone, reads the settings back,
+repeats the three checks, and reports a `Warning` with the code `ROOT_AFTER_DISABLE_ROLLED_BACK`,
+`VendorRootRetained`, and a message that names the retained vendor root. The journal is completed
+as a warning, the clone keeps the vendor root on, and the result is never reported as a
+`Success` root result. A script must check `Status`, not the process exit code, because a
+`Warning` exits `0`. If the rollback itself fails, the toolkit reports `CriticalError` with the
+code `ROOT_RECOVERY_FAILED`, fails the journal, and claims no root. Nothing outside the selected
+clone is changed in either path.
 
 ## Android 15: built-in root and explicit confirmation
 
@@ -306,8 +315,9 @@ These are the honest limits of the current state of the code.
   signal.
 - The temporary MuMu vendor root is left enabled on an Android 12 clone when root
   verification fails, because disabling it would hide the state that needs investigation.
-- The temporary MuMu vendor root stays disabled on an Android 12 clone when the root does not
-  survive the cleanup, because re-enabling it would hide the state that needs investigation.
+- The temporary MuMu vendor root stays enabled on an Android 12 clone when root verification fails
+  after the cleanup, because Kitsune System Mode on MuMu 6.8 needs it. That state is reported as a
+  `Warning`, never as a `Success`, and the retained vendor root is recorded in the journal.
 - no binaries are bundled: no APK, archive, installer, or image is committed here, and the
   repository ignores those file types on purpose.
 - The Chinese edition is fixture-tested only. The live setup verification behind the tested

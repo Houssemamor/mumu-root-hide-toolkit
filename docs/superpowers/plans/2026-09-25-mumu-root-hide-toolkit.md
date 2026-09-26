@@ -545,6 +545,13 @@ function Test-KitsuneConfirmation {
 
 After confirmation, stop and launch the instance, wait for `sys.boot_completed=1`, verify package version `31.0-kitsune` / `31000`, verify one `magiskd`, verify root through the supported root shell, and only then disable temporary vendor root. Record every check in the journal.
 
+The disable is not the end of the verification. Disabling the MuMu vendor root removes `/system/bin/su` on MuMu 6.8 while the Kitsune files and one `magiskd` survive, so the same three checks are repeated after the disable. Success is reported only when they pass again. When they do not, the flow rolls the vendor root back on the clone with `setting -v <clone> -k root_permission -val true`, reads `root_permission` and `system_disk_readonly` back, and repeats the three checks once more:
+
+- rollback verified: `Status` is `Warning` with code `ROOT_AFTER_DISABLE_ROLLED_BACK`, `VendorRootRetained = $true`, `RootVerified = $true`, and a message stating that Kitsune System Mode on MuMu 6.8 requires the vendor root. The journal is completed as a warning. It is never a `Success` root result, so a script must read `Status` rather than the process exit code, which is `0` for a `Warning`.
+- rollback refused, unreadable, or still unverified: `Status` is `CriticalError` with code `ROOT_RECOVERY_FAILED`, the journal is failed, and no root is claimed. `VendorRootRetained` is set only where a readback proved the vendor root is enabled.
+
+The Android 15 flow is unaffected and never disables its vendor root.
+
 ```powershell
 function Test-Android12Root {
     param([string]$ManagerPath, [int]$InstanceIndex)

@@ -3622,6 +3622,8 @@ $script:Root12Codes = @(
     'VENDOR_ROOT_DISABLE_FAILED',
     'VENDOR_ROOT_NOT_DISABLED',
     'ROOT_AFTER_DISABLE',
+    'ROOT_AFTER_DISABLE_ROLLED_BACK',
+    'ROOT_RECOVERY_FAILED',
     'SYSTEM_DISK_ENABLE_FAILED',
     'SYSTEM_DISK_NOT_WRITABLE',
     'PREINSTALL_LAUNCH_FAILED',
@@ -3778,6 +3780,9 @@ function New-Root12ManagerState {
         DaemonExitCode = 0
         DaemonPidsAfterDisable = $null
         RootAllowedAfterDisable = $null
+        RootAllowedAfterRollback = $null
+        RootDisableCount = @{}
+        RootEnableExitCodeAfterDisable = 0
         RootAllowed = $true
         RootShellText = 'uid=0(root) gid=0(root) groups=0(root)'
         JournalLockPath = ''
@@ -3911,6 +3916,12 @@ function New-Root12ManagerRunner {
                     if (-not $ignored) {
                         $State.RootSettings[$index] = $requestedValue
                     }
+                    if ((-not $ignored) -and (-not $requestedValue)) {
+                        $State.RootDisableCount[$index] = 1 + [int]$State.RootDisableCount[$index]
+                    }
+                    elseif ((-not $ignored) -and [int]$State.RootDisableCount[$index] -gt 0 -and $State.RootEnableExitCodeAfterDisable -ne 0) {
+                        return [pscustomobject]@{ ExitCode = $State.RootEnableExitCodeAfterDisable; Text = '{"error_code":1}' }
+                    }
                 }
             }
             if ($State.RootSettingQueryExitCode -ne 0 -or
@@ -4010,17 +4021,21 @@ function New-Root12ManagerRunner {
                 }
             }
             if ($request -ceq 'shell pidof magiskd') {
-                if ($null -ne $State.DaemonPidsAfterDisable -and
-                    $State.RootSettings.ContainsKey($index) -and $State.RootSettings[$index] -eq $false) {
+                if ($null -ne $State.DaemonPidsAfterDisable -and [int]$State.RootDisableCount[$index] -gt 0) {
                     return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = $State.DaemonPidsAfterDisable }
                 }
                 return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = $State.DaemonPids }
             }
             if ($request -ceq 'shell su -c id') {
                 $rootAllowedNow = [bool]$State.RootAllowed
-                if ($null -ne $State.RootAllowedAfterDisable -and
-                    $State.RootSettings.ContainsKey($index) -and $State.RootSettings[$index] -eq $false) {
-                    $rootAllowedNow = [bool]$State.RootAllowedAfterDisable
+                $rootDisabledOnce = [int]$State.RootDisableCount[$index] -gt 0
+                if ($rootDisabledOnce -and $State.RootSettings.ContainsKey($index) -and $State.RootSettings[$index] -eq $false) {
+                    if ($null -ne $State.RootAllowedAfterDisable) {
+                        $rootAllowedNow = [bool]$State.RootAllowedAfterDisable
+                    }
+                }
+                elseif ($rootDisabledOnce -and $null -ne $State.RootAllowedAfterRollback) {
+                    $rootAllowedNow = [bool]$State.RootAllowedAfterRollback
                 }
                 if (-not $rootAllowedNow) {
                     return [pscustomobject]@{ ExitCode = 1; Text = '/system/bin/sh: su: not found' }
@@ -4130,6 +4145,24 @@ function Get-Root12LaunchCount {
         }
     }
     return $count
+}
+
+function Assert-Root12Warning {
+    param(
+        [object]$Result,
+        [object]$Journal,
+        [string]$Code,
+        [string]$Message
+    )
+
+    Assert-Equal 'Warning' $Result.Status $Message
+    Assert-True ($null -ne $Result.Data) "$Message The warning carried no record data."
+    Assert-True ($script:Root12Codes -ccontains [string]$Result.Data.Code) "$Message The warning reported an undocumented code: $($Result.Data.Code)"
+    Assert-Equal $Code $Result.Data.Code "$Message The warning code is invalid."
+    Assert-Equal 'Completed' $Journal.State "$Message The warning was not completed."
+    $reopened = Get-OperationJournal -Path $Journal.JournalPath
+    Assert-Equal 'Completed' $reopened.State "$Message The warning was not persisted as completed."
+    Assert-Equal 'Warning' $reopened.Result.Status "$Message The persisted result is not a warning."
 }
 
 function Assert-Root12Failure {
@@ -4808,35 +4841,63 @@ function Invoke-Root12Tests {
         Assert-True ($postCleanupShellIndex -gt $disableRootIndex) 'The confirmed workflow did not check the root shell after disabling the temporary vendor root.'
         Assert-True ($confirmed.Message -match '(?i)again after the temporary vendor root was disabled') 'The success message does not state that the root was re-checked after the cleanup.'
 
-        foreach ($postCleanupCase in @(
-                [pscustomobject]@{ Kind = 'shell'; Label = 'a root shell removed by the cleanup'; DaemonCount = 1; Cause = 'root shell could not be verified' },
-                [pscustomobject]@{ Kind = 'daemon'; Label = 'a daemon that disappeared with the cleanup'; DaemonCount = 0; Cause = 'daemon is not running' }
+        $rollbackState = New-Root12ManagerState -Install $install
+        $rollbackState.RootAllowedAfterDisable = $false
+        $rollback = Invoke-Root12Case -State $rollbackState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Warning -Result $rollback.Result -Journal $rollback.Journal -Code 'ROOT_AFTER_DISABLE_ROLLED_BACK' `
+            -Message 'A root that did not survive the cleanup was not reported as a retained-vendor-root warning.'
+        Assert-Equal $true $rollback.Result.Data.VendorRootRetained 'The retained-vendor-root warning does not report the retained vendor root.'
+        Assert-Equal $false $rollback.Result.Data.SystemDiskReadonly 'The retained-vendor-root warning does not report the writable system disk.'
+        Assert-Equal $true $rollback.Result.Data.RootVerified 'The retained-vendor-root warning does not report the re-verified root.'
+        Assert-Equal 'vendor-root-restore' $rollback.Result.Data.Step 'The retained-vendor-root warning reported the wrong recovery step.'
+        Assert-Equal $rollbackState.CloneIndex $rollback.Result.Data.CloneIndex 'The retained-vendor-root warning did not report the clone.'
+        Assert-Equal $android12.Index $rollback.Result.Data.SourceIndex 'The retained-vendor-root warning did not report the source instance.'
+        Assert-True ($rollback.Result.Message -match 'MuMu 6\.8') 'The retained-vendor-root warning does not name the MuMu build that forces it.'
+        Assert-True ($rollback.Result.Message -match '(?i)requires the vendor root') 'The retained-vendor-root warning does not say Kitsune System Mode requires the vendor root.'
+        Assert-True ($rollback.Result.Message -match '(?i)not as a success') 'The retained-vendor-root warning does not say it is not a success.'
+        Assert-Equal $true $rollbackState.RootSettings[[string]$rollbackState.CloneIndex] 'The rollback did not leave the vendor root enabled on the clone.'
+        Assert-Equal $false $rollbackState.SystemDiskReadonly 'The rollback did not leave the system disk writable on the clone.'
+        Assert-Equal 2 @($rollbackState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*true*' }).Count 'The rollback did not enable the vendor root exactly once more.'
+        Assert-Equal 1 @($rollbackState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*false*' }).Count 'The rollback disabled the vendor root more than once.'
+        Assert-Equal 3 @($rollbackState.Calls | Where-Object { (@($_) -join ' ') -like '*dumpsys package io.github.huskydg.magisk*' }).Count 'The rollback did not run all three root checks.'
+        Assert-Equal 0 @($rollbackState.Calls | Where-Object {
+                (@($_) -join ' ') -like 'setting*' -and (@($_) -join ' ') -notlike ('*-v ' + $rollbackState.CloneIndex + '*')
+            }).Count 'The rollback changed a setting on an instance other than the clone.'
+        $rollbackReopened = Get-OperationJournal -Path $rollback.Journal.JournalPath
+        Assert-Equal 'Warning' $rollbackReopened.Result.Status 'The retained-vendor-root warning was persisted as a success.'
+        Assert-Equal 'ROOT_AFTER_DISABLE_ROLLED_BACK' $rollbackReopened.Result.Data.Code 'The persisted warning reported the wrong code.'
+        Assert-Equal $true $rollbackReopened.Result.Data.VendorRootRetained 'The persisted warning lost the retained vendor root field.'
+        $rollbackRecords = @(Get-ToolkitJournalRecords -StateRoot $root12Root | Where-Object {
+                $recordResult = Get-ToolkitRecordValue -Record $_ -PropertyNames @('Result')
+                $recordData = Get-ToolkitRecordValue -Record $recordResult -PropertyNames @('Data')
+                [string](Get-ToolkitRecordValue -Record $recordData -PropertyNames @('Code')) -ceq 'ROOT_AFTER_DISABLE_ROLLED_BACK'
+            })
+        Assert-Equal 1 $rollbackRecords.Count 'The completed warning record is not recoverable for the verified-clone lookup.'
+        Assert-Equal 'Completed' $rollbackRecords[0].State 'The recoverable warning record is not a completed journal.'
+        Assert-Equal $rollbackState.CloneIndex $rollbackRecords[0].Result.Data.CloneIndex 'The recoverable warning record lost the clone index.'
+
+        foreach ($recoveryCase in @(
+                [pscustomobject]@{ Kind = 'write'; Label = 'a refused rollback write'; Step = 'vendor-root-restore'; Retained = $false },
+                [pscustomobject]@{ Kind = 'root'; Label = 'a root that still fails after the rollback'; Step = 'vendor-root-restore-verification'; Retained = $true }
             )) {
-            $postCleanupState = New-Root12ManagerState -Install $install
-            if ($postCleanupCase.Kind -ceq 'shell') {
-                $postCleanupState.RootAllowedAfterDisable = $false
+            $recoveryState = New-Root12ManagerState -Install $install
+            $recoveryState.RootAllowedAfterDisable = $false
+            if ($recoveryCase.Kind -ceq 'write') {
+                $recoveryState.RootEnableExitCodeAfterDisable = 1
             }
             else {
-                $postCleanupState.DaemonPidsAfterDisable = ''
+                $recoveryState.RootAllowedAfterRollback = $false
             }
-            $postCleanupCaseRun = Invoke-Root12Case -State $postCleanupState -Instance $android12 -Manifest $manifest `
+            $recovery = Invoke-Root12Case -State $recoveryState -Instance $android12 -Manifest $manifest `
                 -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
-            Assert-Root12Failure -Result $postCleanupCaseRun.Result -Journal $postCleanupCaseRun.Journal -Code 'ROOT_AFTER_DISABLE' -Message "A root that did not survive the cleanup was reported as a success ($($postCleanupCase.Label))."
-            Assert-True ($postCleanupCaseRun.Result.Message -match '(?i)did not survive') "A post-cleanup root failure does not explain itself ($($postCleanupCase.Label)): $($postCleanupCaseRun.Result.Message)"
-            Assert-True ($postCleanupCaseRun.Result.Message -match '(?i)left as it is') "A post-cleanup root failure does not say the clone was left as it is ($($postCleanupCase.Label))"
-            Assert-Equal 'post-cleanup-verification' $postCleanupCaseRun.Result.Data.Step "A post-cleanup root failure reported the wrong recovery step ($($postCleanupCase.Label))."
-            Assert-Equal $postCleanupState.CloneIndex $postCleanupCaseRun.Result.Data.CloneIndex "A post-cleanup root failure did not report the clone ($($postCleanupCase.Label))."
-            Assert-Equal 'Failed' $postCleanupCaseRun.Journal.State "A post-cleanup root failure did not fail its journal ($($postCleanupCase.Label))."
-            $postCleanupReopened = Get-OperationJournal -Path $postCleanupCaseRun.Journal.JournalPath
-            Assert-Equal 'CriticalError' $postCleanupReopened.Result.Status "A post-cleanup root failure persisted a success ($($postCleanupCase.Label))."
-            Assert-Equal 'ROOT_AFTER_DISABLE' $postCleanupReopened.Result.Data.Code "A post-cleanup root failure persisted the wrong code ($($postCleanupCase.Label))."
-            Assert-True ($postCleanupReopened.Result.Message -match '(?i)did not survive') "A post-cleanup root failure persisted a message that hides the cause ($($postCleanupCase.Label))"
-            Assert-True ($postCleanupCaseRun.Result.Message -match [regex]::Escape($postCleanupCase.Cause)) "A post-cleanup root failure lost the underlying cause ($($postCleanupCase.Label)): $($postCleanupCaseRun.Result.Message)"
-            Assert-Equal $postCleanupCase.DaemonCount $postCleanupCaseRun.Result.Data.DaemonCount "A post-cleanup root failure reported the wrong daemon count ($($postCleanupCase.Label))."
-            Assert-Equal $false $postCleanupCaseRun.Result.Data.RootVerified "A post-cleanup root failure still claims a verified root ($($postCleanupCase.Label))."
-            Assert-Equal 1 @($postCleanupState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*true*' }).Count "A post-cleanup root failure re-enabled the temporary vendor root ($($postCleanupCase.Label))."
-            Assert-Equal 1 @($postCleanupState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*false*' }).Count "A post-cleanup root failure disabled the temporary vendor root more than once ($($postCleanupCase.Label))."
-            Assert-Equal 2 @($postCleanupState.Calls | Where-Object { (@($_) -join ' ') -like '*dumpsys package io.github.huskydg.magisk*' }).Count "A post-cleanup root failure did not run both root checks ($($postCleanupCase.Label))."
+            Assert-Root12Failure -Result $recovery.Result -Journal $recovery.Journal -Code 'ROOT_RECOVERY_FAILED' -Message "A failed rollback was reported as a success ($($recoveryCase.Label))."
+            Assert-Equal $recoveryCase.Step $recovery.Result.Data.Step "A failed rollback reported the wrong recovery step ($($recoveryCase.Label))."
+            Assert-Equal $recoveryCase.Retained ([bool](Get-ToolkitRecordValue -Record $recovery.Result.Data -PropertyNames @('VendorRootRetained'))) "A failed rollback reported a retained vendor root it cannot prove ($($recoveryCase.Label))."
+            Assert-Equal $false $recovery.Result.Data.RootVerified "A failed rollback still claims a verified root ($($recoveryCase.Label))."
+            Assert-Equal $recoveryState.CloneIndex $recovery.Result.Data.CloneIndex "A failed rollback did not report the clone ($($recoveryCase.Label))."
+            Assert-Equal 2 @($recoveryState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*true*' }).Count "A failed rollback did not try the vendor root exactly once more ($($recoveryCase.Label))."
+            Assert-Equal 1 @($recoveryState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*false*' }).Count "A failed rollback disabled the vendor root more than once ($($recoveryCase.Label))."
         }
 
         $callerState = New-Root12ManagerState -Install $install
