@@ -3621,6 +3621,7 @@ $script:Root12Codes = @(
     'VENDOR_ROOT_SETTING_UNREADABLE',
     'VENDOR_ROOT_DISABLE_FAILED',
     'VENDOR_ROOT_NOT_DISABLED',
+    'ROOT_AFTER_DISABLE',
     'SYSTEM_DISK_ENABLE_FAILED',
     'SYSTEM_DISK_NOT_WRITABLE',
     'PREINSTALL_LAUNCH_FAILED',
@@ -3775,6 +3776,8 @@ function New-Root12ManagerState {
         VersionCode = '31000'
         DaemonPids = '4242'
         DaemonExitCode = 0
+        DaemonPidsAfterDisable = $null
+        RootAllowedAfterDisable = $null
         RootAllowed = $true
         RootShellText = 'uid=0(root) gid=0(root) groups=0(root)'
         JournalLockPath = ''
@@ -4007,10 +4010,19 @@ function New-Root12ManagerRunner {
                 }
             }
             if ($request -ceq 'shell pidof magiskd') {
+                if ($null -ne $State.DaemonPidsAfterDisable -and
+                    $State.RootSettings.ContainsKey($index) -and $State.RootSettings[$index] -eq $false) {
+                    return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = $State.DaemonPidsAfterDisable }
+                }
                 return [pscustomobject]@{ ExitCode = $State.DaemonExitCode; Text = $State.DaemonPids }
             }
             if ($request -ceq 'shell su -c id') {
-                if (-not $State.RootAllowed) {
+                $rootAllowedNow = [bool]$State.RootAllowed
+                if ($null -ne $State.RootAllowedAfterDisable -and
+                    $State.RootSettings.ContainsKey($index) -and $State.RootSettings[$index] -eq $false) {
+                    $rootAllowedNow = [bool]$State.RootAllowedAfterDisable
+                }
+                if (-not $rootAllowedNow) {
                     return [pscustomobject]@{ ExitCode = 1; Text = '/system/bin/sh: su: not found' }
                 }
                 return [pscustomobject]@{ ExitCode = 0; Text = $State.RootShellText }
@@ -4786,6 +4798,46 @@ function Invoke-Root12Tests {
         Assert-Equal -1 (Get-Root12CallIndex -Calls $systemDiskWriteFailureState.Calls -Pattern 'adb*-v*-c*install*') 'A failed system disk write still reached the APK install.'
         Assert-Equal 0 (Get-Root12LaunchCount -Calls $systemDiskWriteFailureState.Calls) 'A failed system disk write still launched the clone.'
         Assert-Equal $true $systemDiskWriteFailureState.RootSettings[[string]$systemDiskWriteFailureState.CloneIndex] 'A failed system disk write did not leave the temporary vendor root enabled.'
+
+        $postCleanupShellCalls = @($confirmedState.Calls | Where-Object { (@($_) -join ' ') -like '*su -c id*' })
+        $postCleanupPackageCalls = @($confirmedState.Calls | Where-Object { (@($_) -join ' ') -like ('*dumpsys package io.github.huskydg.magisk*') })
+        Assert-Equal 2 $postCleanupShellCalls.Count 'The confirmed workflow did not verify the root shell again after disabling the temporary vendor root.'
+        Assert-Equal 2 $postCleanupPackageCalls.Count 'The confirmed workflow did not verify the Kitsune package again after disabling the temporary vendor root.'
+        $disableRootIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern '*root_permission*-val*false*'
+        $postCleanupShellIndex = Get-Root12LastCallIndex -Calls $confirmedState.Calls -Pattern '*su -c id*'
+        Assert-True ($postCleanupShellIndex -gt $disableRootIndex) 'The confirmed workflow did not check the root shell after disabling the temporary vendor root.'
+        Assert-True ($confirmed.Message -match '(?i)again after the temporary vendor root was disabled') 'The success message does not state that the root was re-checked after the cleanup.'
+
+        foreach ($postCleanupCase in @(
+                [pscustomobject]@{ Kind = 'shell'; Label = 'a root shell removed by the cleanup'; DaemonCount = 1; Cause = 'root shell could not be verified' },
+                [pscustomobject]@{ Kind = 'daemon'; Label = 'a daemon that disappeared with the cleanup'; DaemonCount = 0; Cause = 'daemon is not running' }
+            )) {
+            $postCleanupState = New-Root12ManagerState -Install $install
+            if ($postCleanupCase.Kind -ceq 'shell') {
+                $postCleanupState.RootAllowedAfterDisable = $false
+            }
+            else {
+                $postCleanupState.DaemonPidsAfterDisable = ''
+            }
+            $postCleanupCaseRun = Invoke-Root12Case -State $postCleanupState -Instance $android12 -Manifest $manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Root12Failure -Result $postCleanupCaseRun.Result -Journal $postCleanupCaseRun.Journal -Code 'ROOT_AFTER_DISABLE' -Message "A root that did not survive the cleanup was reported as a success ($($postCleanupCase.Label))."
+            Assert-True ($postCleanupCaseRun.Result.Message -match '(?i)did not survive') "A post-cleanup root failure does not explain itself ($($postCleanupCase.Label)): $($postCleanupCaseRun.Result.Message)"
+            Assert-True ($postCleanupCaseRun.Result.Message -match '(?i)left as it is') "A post-cleanup root failure does not say the clone was left as it is ($($postCleanupCase.Label))"
+            Assert-Equal 'post-cleanup-verification' $postCleanupCaseRun.Result.Data.Step "A post-cleanup root failure reported the wrong recovery step ($($postCleanupCase.Label))."
+            Assert-Equal $postCleanupState.CloneIndex $postCleanupCaseRun.Result.Data.CloneIndex "A post-cleanup root failure did not report the clone ($($postCleanupCase.Label))."
+            Assert-Equal 'Failed' $postCleanupCaseRun.Journal.State "A post-cleanup root failure did not fail its journal ($($postCleanupCase.Label))."
+            $postCleanupReopened = Get-OperationJournal -Path $postCleanupCaseRun.Journal.JournalPath
+            Assert-Equal 'CriticalError' $postCleanupReopened.Result.Status "A post-cleanup root failure persisted a success ($($postCleanupCase.Label))."
+            Assert-Equal 'ROOT_AFTER_DISABLE' $postCleanupReopened.Result.Data.Code "A post-cleanup root failure persisted the wrong code ($($postCleanupCase.Label))."
+            Assert-True ($postCleanupReopened.Result.Message -match '(?i)did not survive') "A post-cleanup root failure persisted a message that hides the cause ($($postCleanupCase.Label))"
+            Assert-True ($postCleanupCaseRun.Result.Message -match [regex]::Escape($postCleanupCase.Cause)) "A post-cleanup root failure lost the underlying cause ($($postCleanupCase.Label)): $($postCleanupCaseRun.Result.Message)"
+            Assert-Equal $postCleanupCase.DaemonCount $postCleanupCaseRun.Result.Data.DaemonCount "A post-cleanup root failure reported the wrong daemon count ($($postCleanupCase.Label))."
+            Assert-Equal $false $postCleanupCaseRun.Result.Data.RootVerified "A post-cleanup root failure still claims a verified root ($($postCleanupCase.Label))."
+            Assert-Equal 1 @($postCleanupState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*true*' }).Count "A post-cleanup root failure re-enabled the temporary vendor root ($($postCleanupCase.Label))."
+            Assert-Equal 1 @($postCleanupState.Calls | Where-Object { (@($_) -join ' ') -like '*root_permission*-val*false*' }).Count "A post-cleanup root failure disabled the temporary vendor root more than once ($($postCleanupCase.Label))."
+            Assert-Equal 2 @($postCleanupState.Calls | Where-Object { (@($_) -join ' ') -like '*dumpsys package io.github.huskydg.magisk*' }).Count "A post-cleanup root failure did not run both root checks ($($postCleanupCase.Label))."
+        }
 
         $callerState = New-Root12ManagerState -Install $install
         $callerState.DaemonExitCode = 1

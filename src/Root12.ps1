@@ -609,9 +609,20 @@ function Install-Android12Root {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The Kitsune root is verified, but the clone still reports the enabled vendor root.' -Data (New-Android12Recovery -Code 'VENDOR_ROOT_NOT_DISABLED' -Step 'vendor-root-disable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data)
     }
 
-    $successData = New-Android12Recovery -Code 'OK' -Step 'complete' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $checks.Data
+    $cleanupChecks = Test-Android12Root -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner
+    try {
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The Android 12 package, root daemon, and root shell checks were repeated after the temporary vendor root was disabled, because disabling it can remove the root shell.' -Data $cleanupChecks.Data
+    }
+    catch {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The Android 12 root checks after the temporary vendor root was disabled could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'post-cleanup-verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $cleanupChecks.Data)
+    }
+    if ($cleanupChecks.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message ('The Kitsune root did not survive disabling the temporary vendor root, so this is not a success. The clone is left as it is for inspection and no repair is attempted. ' + $cleanupChecks.Message) -Data (New-Android12Recovery -Code 'ROOT_AFTER_DISABLE' -Step 'post-cleanup-verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $cleanupChecks.Data)
+    }
+
+    $successData = New-Android12Recovery -Code 'OK' -Step 'complete' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Checks $cleanupChecks.Data
     $successData['PackageName'] = $script:ToolkitKitsunePackageName
-    $successMessage = "Android 12 Kitsune root is verified on the clone at index $cloneIndex, and the temporary vendor root on that clone is disabled."
+    $successMessage = "Android 12 Kitsune root is verified on the clone at index $cloneIndex, the temporary vendor root on that clone is disabled, and the root was checked again after the temporary vendor root was disabled."
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message $successMessage -Data $successData
         Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Success' -Message $successMessage -Data $successData)

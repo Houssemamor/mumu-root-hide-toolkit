@@ -172,8 +172,11 @@ Install -> Direct Install into system partition
 Do not choose the ordinary `Direct Install` or `Select and Patch a File` option. Only the exact
 choice above is accepted; any other answer stops the workflow before the cold boot, and the
 clone is left as it is. After you confirm, the toolkit cold-boots the clone, verifies the
-Kitsune package, the root daemon, and a root shell, and only then disables the temporary vendor
-root again.
+Kitsune package, the root daemon, and a root shell, disables the temporary vendor root again,
+and then repeats the same three checks. Success is reported only when those checks still pass
+after the cleanup, because disabling the vendor root can remove the root shell. If they do not
+pass, the workflow reports `ROOT_AFTER_DISABLE`, leaves the clone as it is for inspection, and
+attempts no repair.
 
 ## Android 15: built-in root and explicit confirmation
 
@@ -303,6 +306,8 @@ These are the honest limits of the current state of the code.
   signal.
 - The temporary MuMu vendor root is left enabled on an Android 12 clone when root
   verification fails, because disabling it would hide the state that needs investigation.
+- The temporary MuMu vendor root stays disabled on an Android 12 clone when the root does not
+  survive the cleanup, because re-enabling it would hide the state that needs investigation.
 - no binaries are bundled: no APK, archive, installer, or image is committed here, and the
   repository ignores those file types on purpose.
 - The Chinese edition is fixture-tested only. The live setup verification behind the tested
