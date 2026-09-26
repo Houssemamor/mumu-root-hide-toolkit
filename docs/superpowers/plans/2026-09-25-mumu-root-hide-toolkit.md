@@ -647,22 +647,24 @@ git commit -m "feat: add Android 15 built-in root workflow"
 
 **Interfaces:**
 - Produces `Install-ConcealmentDependencies -Instance <object> -VerifiedClone <object> -Manifest <object> -Journal <object> [-CacheRoot <string>] [-Runner <scriptblock>]` returning installed/already-present dependency IDs. `-VerifiedClone` is the verified clone record the root flow returns: without it the call returns `CLONE_REQUIRED` before any guest request, and a supplied record is revalidated against the MuMu manager, the reported clone identity, the selected instance's Android version, the installation boundary, and the clone disk before anything is installed. `-CacheRoot` defaults to the per-user dependency cache, and the call is cached-only, so a mutating phase can never download a dependency.
-- Produces `Get-HmaConfig -Instance <object> [-TargetIndex <int>] [-Runner <scriptblock>]` returning a parsed HMA configuration or a schema error. `-TargetIndex` selects the instance to read so a read and a write can never disagree about the target. An invalid instance or manager is a `CriticalError`; only a genuine schema mismatch becomes the supported-UI `Warning` handoff, and that handoff carries the reader's own reason and the version it found.
+- Produces `Get-HmaConfig -Instance <object> [-TargetIndex <int>] [-Runner <scriptblock>]` returning a parsed HMA configuration or a schema error. `-TargetIndex` selects the instance to read so a read and a write can never disagree about the target. An invalid instance or manager is a `CriticalError` and never asks the operator to configure the UI; a configuration that cannot be read at all, and a genuine schema mismatch, both become the supported-UI `Warning` handoff, and that handoff carries the reader's own reason and the version it found.
 - Produces `New-ReusableRootTemplate -Instance <object> -Journal <object> [-TargetIndex <int>] [-Runner <scriptblock>]` returning a verified HMA template record, including only the installed members of the four required root packages.
 - Produces `Set-AppConcealment -Instance <object> -VerifiedClone <object> -Packages <string[]> -Journal <object> [-Runner <scriptblock>]` returning per-package status. The configuration backup is read back and compared by byte length and SHA-256 before the original is overwritten, and a configuration the serializer would truncate is refused instead of written.
-- Produces `Test-Concealment -ManagerPath <string> -InstanceIndex <int> -Packages <string[]> [-Runner <scriptblock>]` returning HMA scope and KernelSU profile evidence. It reports `SCOPE_INCOMPLETE` or `TEMPLATE_NOT_BLACKLIST` instead of `Success` when the stored scope does not match the request, and it never reports a root package it did not observe installed.
+- Produces `Test-Concealment -ManagerPath <string> -InstanceIndex <int> -Packages <string[]> [-Runner <scriptblock>]` returning HMA scope and KernelSU profile evidence. `Success` requires a stored blacklist `Root` template with a nonempty app list and every requested app assigned to it; otherwise it reports `TEMPLATE_MISSING`, `TEMPLATE_NOT_BLACKLIST`, or `SCOPE_INCOMPLETE`, and it never reports a root package it did not observe installed.
 
 - [ ] **Step 1: Write failing concealment tests**
 
 Use a fixture with packages `org.frknkrc44.hma_oss`, `io.github.huskydg.magisk`, `com.coderstory.toolkit`, and `me.weishu.kernelsu`. Assert that the reusable Root template includes all four, only selected apps receive the template, and an unknown HMA config version returns a safe UI-handoff warning.
 
 ```powershell
-$template = New-ReusableRootTemplate -Instance $concealmentFixture -Journal $journal
-Assert-True (@($template.Packages) -contains 'me.weishu.kernelsu') 'KernelSU was omitted from the Root template.'
-$selected = Set-AppConcealment -Instance $concealmentFixture -Packages @('jp.pokemon.pokemontcgp') -Journal $journal
+$template = New-ReusableRootTemplate -Instance $concealmentFixture -TargetIndex $cloneIndex -Journal $journal
+Assert-True (@($template.Data.TemplatePackages) -contains 'me.weishu.kernelsu') 'KernelSU was omitted from the Root template.'
+$selected = Set-AppConcealment -Instance $concealmentFixture -VerifiedClone $clone -Packages @('jp.pokemon.pokemontcgp') -Journal $journal
 Assert-True ($selected.Status -eq 'Success') 'Selected app concealment failed.'
-Assert-True (@($selected.Packages) -contains 'jp.pokemon.pokemontcgp') 'Selected app is missing from the result.'
+Assert-True (@($selected.Data.Packages) -contains 'jp.pokemon.pokemontcgp') 'The selected app is missing from the result.'
 ```
+
+The read-only template check takes `-TargetIndex` so it inspects the same instance the apply will change, and the apply takes the verified clone record from the root flow. Every public result is the canonical `Get-ToolkitResult` envelope, so the records live under `Data`.
 
 - [ ] **Step 2: Run concealment tests and verify failure**
 
@@ -676,7 +678,7 @@ Download only manifest assets before elevation, verify size and SHA-256, install
 
 ```powershell
 function Install-ConcealmentDependencies {
-    param([object]$Instance, [object]$Manifest, [object]$Journal)
+    param([object]$Instance, [object]$VerifiedClone, [object]$Manifest, [object]$Journal)
     $hma = Get-VerifiedAsset -Manifest $Manifest -Id 'hma' -CacheRoot $Instance.CacheRoot
     $vector = Get-VerifiedAsset -Manifest $Manifest -Id 'vector' -CacheRoot $Instance.CacheRoot
     if ($hma.Status -ne 'Success' -or $vector.Status -ne 'Success') {
@@ -692,7 +694,7 @@ Back up HMA configuration before editing. Accept only `configVersion=93`; create
 
 ```powershell
 function New-ReusableRootTemplate {
-    param([object]$Instance, [object]$Journal)
+    param([object]$Instance, [object]$Journal, [int]$TargetIndex)
     $packages = @('org.frknkrc44.hma_oss','io.github.huskydg.magisk','com.coderstory.toolkit','me.weishu.kernelsu')
     $existing = @((Get-HmaConfig -Instance $Instance).templates.Root.appList)
     $merged = @($existing + $packages | Select-Object -Unique)

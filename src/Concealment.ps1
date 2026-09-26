@@ -382,12 +382,17 @@ function Assert-ConcealmentVerifiedClone {
     if ([string]::IsNullOrWhiteSpace($managerName) -or $managerName -cne $cloneName) {
         return (& $unverified "The recorded clone name does not match the MuMu manager, so no guest change was started." $cloneIndex $cloneName)
     }
-    $managerVersion = ConvertTo-ToolkitAndroidVersion -Value (Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('android_version', 'androidVersion', 'system_version', 'systemVersion'))
-    $expectedVersion = ConvertTo-ToolkitAndroidVersion -Value ([string]$Resolved['AndroidVersion'])
-    if ($null -eq $expectedVersion) {
-        $expectedVersion = ConvertTo-ToolkitAndroidVersion -Value $managerVersion
+    $reportedVersion = [string](Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('android_version', 'androidVersion', 'system_version', 'systemVersion'))
+    $selectedVersion = [string]$Resolved['AndroidVersion']
+    if ([string]::IsNullOrWhiteSpace($selectedVersion)) {
+        return (& $unverified 'The selected instance reports no Android version, so the recorded clone cannot be matched to it and no guest change was started. Report the instance with a known Android version.' $cloneIndex $cloneName)
     }
-    if ($null -eq $expectedVersion -or $null -eq $managerVersion -or $managerVersion -cne $expectedVersion) {
+    if ([string]::IsNullOrWhiteSpace($reportedVersion)) {
+        return (& $unverified "The recorded clone at index $cloneIndex reports no Android version, so it cannot be matched to the selected instance and no guest change was started." $cloneIndex $cloneName)
+    }
+    $managerVersion = ConvertTo-ToolkitAndroidVersion -Value $reportedVersion
+    $expectedVersion = ConvertTo-ToolkitAndroidVersion -Value $selectedVersion
+    if ([string]::IsNullOrWhiteSpace([string]$managerVersion) -or [string]::IsNullOrWhiteSpace([string]$expectedVersion) -or $managerVersion -cne $expectedVersion) {
         return (& $unverified "The recorded clone does not report the selected instance Android version, so no guest change was started." $cloneIndex $cloneName)
     }
     $reportedVmsPath = [string](Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('vms_path', 'vmsPath'))
@@ -702,7 +707,11 @@ function Get-ConcealmentGuestFile {
         [scriptblock]$Runner = $null
     )
 
-    $call = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell su -c "cat ' + $Path + '"') -Runner $Runner
+    $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
+    if ($null -eq $manager -or $InstanceIndex -lt 0 -or -not (Test-ConcealmentGuestPath -Path $Path)) {
+        return $null
+    }
+    $call = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command ('shell su -c "cat ' + $Path + '"') -Runner $Runner
     if ($null -eq $call -or $call.ExitCode -ne 0) {
         return $null
     }
@@ -966,7 +975,8 @@ function Set-AppConcealment {
     if ($null -eq $existingBackup -or $existingBackup.ExitCode -ne 0) {
         $backup = Set-ConcealmentGuestText -ManagerPath $manager -InstanceIndex $instanceIndex -Path $backupPath -Text $originalText -Journal $Journal -Runner $Runner
         if ($backup.Status -ne 'Success') {
-            return New-ToolkitRootFailure -Journal $Journal -Message $backup.Message -Data (New-ConcealmentState -Code 'HMA_BACKUP_FAILED' -Step 'config-backup' -InstanceIndex $instanceIndex -Fields $cloneFields)
+            $backupCode = if ([string]$backup.Data.Code -ceq 'JOURNAL_WRITE_FAILED') { 'JOURNAL_WRITE_FAILED' } else { 'HMA_BACKUP_FAILED' }
+            return New-ToolkitRootFailure -Journal $Journal -Message $backup.Message -Data (New-ConcealmentState -Code $backupCode -Step 'config-backup' -InstanceIndex $instanceIndex -Fields ($cloneFields + @{ BackupPath = $backupPath }))
         }
     }
     $readBack = Get-ConcealmentGuestFile -ManagerPath $manager -InstanceIndex $instanceIndex -Path $backupPath -Runner $Runner
@@ -1121,6 +1131,9 @@ function Test-Concealment {
 
     if ($stored.IsWhitelist) {
         return Get-ToolkitResult -Status 'Warning' -Message "The stored HMA template $($script:ConcealmentTemplateName) is a whitelist template, so this workflow cannot report it as a verified blacklist scope. Create a blacklist Root template in the supported UI. $evidenceMessage" -Data (New-ConcealmentState -Code 'TEMPLATE_NOT_BLACKLIST' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
+    }
+    if (-not $stored.Found -or @($stored.TemplatePackages).Count -eq 0) {
+        return Get-ToolkitResult -Status 'Warning' -Message "The stored HMA configuration carries no usable $($script:ConcealmentTemplateName) template: the template is missing or its app list is empty, so an assignment to it hides nothing and is not reported as verified. Create the blacklist Root template in the supported UI. $evidenceMessage" -Data (New-ConcealmentState -Code 'TEMPLATE_MISSING' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
     }
     if ($inScope.Count -ne $selected.Count) {
         return Get-ToolkitResult -Status 'Warning' -Message "Concealment is not fully applied: $($inScope.Count) of $($selected.Count) requested app(s) carry the blacklist Root template. Out of scope: $($outOfScope -join ', '). $evidenceMessage" -Data (New-ConcealmentState -Code 'SCOPE_INCOMPLETE' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
