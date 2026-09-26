@@ -485,6 +485,20 @@ function Install-Android12Root {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The enabled vendor root could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'vendor-root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
+    $preInstallLaunch = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('control', '-v', ([string]$cloneIndex), 'launch') -Runner $Runner
+    if ($null -eq $preInstallLaunch -or $preInstallLaunch.ExitCode -ne 0) {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not accept the launch request that precedes the APK install, so the verified APK was not installed. The temporary vendor root was left enabled.' -Data (New-Android12Recovery -Code 'PREINSTALL_LAUNCH_FAILED' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
+    if (-not (Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner)) {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 before the APK install after $($script:ToolkitBootPollAttempts) checks, so the verified APK was not installed. The temporary vendor root was left enabled." -Data (New-Android12Recovery -Code 'PREINSTALL_BOOT_TIMEOUT' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
+    try {
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The clone was launched and reported sys.boot_completed=1 before the APK install, because the MuMu manager rejects ADB on a stopped instance.' -Data (New-Android12Recovery -Code 'OK' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
+    catch {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The pre-install clone launch could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
+
     $apkInstall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $cloneIndex -Command $apkInstallCommand -Runner $Runner
     if ($null -eq $apkInstall -or $apkInstall.ExitCode -ne 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Kitsune APK was not installed on the clone.' -Data (New-Android12Recovery -Code 'APK_INSTALL_FAILED' -Step 'apk-install' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)

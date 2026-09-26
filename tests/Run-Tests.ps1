@@ -3621,6 +3621,8 @@ $script:Root12Codes = @(
     'VENDOR_ROOT_SETTING_UNREADABLE',
     'VENDOR_ROOT_DISABLE_FAILED',
     'VENDOR_ROOT_NOT_DISABLED',
+    'PREINSTALL_LAUNCH_FAILED',
+    'PREINSTALL_BOOT_TIMEOUT',
     'APK_INSTALL_FAILED',
     'APK_LAUNCH_FAILED',
     'BOOT_CONTROL_FAILED',
@@ -3747,12 +3749,18 @@ function New-Root12ManagerState {
         AdbFailPattern = ''
         AdbThrowPattern = ''
         AdbFailExitCode = 1
+        AdbRequiresRunning = $false
+        AdbStoppedExitCode = -201
         ControlFailPattern = ''
         ControlFailExitCode = 1
+        LaunchCount = 0
+        LaunchFailAfterCount = -1
         ApkInstallExitCode = 0
         InstalledPath = ''
         BootPolls = @{}
+        BootReadyReported = @{}
         BootReadyPolls = 1
+        BootFailAfterReady = -1
         PackageInstalled = $true
         PackageName = 'io.github.huskydg.magisk'
         PackageHeaderName = ''
@@ -3824,6 +3832,17 @@ function New-Root12ManagerRunner {
                     }
                 }
             }
+            if ($arguments[3] -eq 'launch') {
+                $State.LaunchCount = [int]$State.LaunchCount + 1
+                if ([int]$State.LaunchFailAfterCount -ge 0 -and $State.LaunchCount -gt [int]$State.LaunchFailAfterCount) {
+                    return [pscustomobject]@{ ExitCode = $State.ControlFailExitCode; Text = '{"error_code":1}' }
+                }
+                foreach ($controlInstance in $State.Instances) {
+                    if ([string]$controlInstance.Index -ceq $arguments[2]) {
+                        $controlInstance.Running = $true
+                    }
+                }
+            }
             return [pscustomobject]@{ ExitCode = 0; Text = '{"error_code":0}' }
         }
         if ($command -eq 'clone') {
@@ -3887,6 +3906,12 @@ function New-Root12ManagerRunner {
         if ($command -eq 'adb') {
             $index = $arguments[2]
             $request = [string]$arguments[4]
+            if ($State.AdbRequiresRunning) {
+                $adbInstance = @($State.Instances | Where-Object { [string]$_.Index -ceq $index })
+                if ($adbInstance.Count -ne 1 -or $adbInstance[0].Running -ne $true) {
+                    return [pscustomobject]@{ ExitCode = $State.AdbStoppedExitCode; Text = 'adb: no running instance' }
+                }
+            }
             if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbThrowPattern) -and $request -like $State.AdbThrowPattern) {
                 throw 'adb transport failure'
             }
@@ -3910,7 +3935,17 @@ function New-Root12ManagerRunner {
                 }
                 $polls++
                 $State.BootPolls[$index] = $polls
+                $readyReported = 0
+                if ($State.BootReadyReported.ContainsKey($index)) {
+                    $readyReported = [int]$State.BootReadyReported[$index]
+                }
+                if ([int]$State.BootFailAfterReady -ge 0 -and $readyReported -ge [int]$State.BootFailAfterReady) {
+                    return [pscustomobject]@{ ExitCode = 0; Text = '0' }
+                }
                 if ($polls -ge $State.BootReadyPolls) {
+                    if ([int]$State.BootFailAfterReady -ge 0) {
+                        $State.BootReadyReported[$index] = $readyReported + 1
+                    }
                     return [pscustomobject]@{ ExitCode = 0; Text = '1' }
                 }
                 return [pscustomobject]@{ ExitCode = 0; Text = '0' }
@@ -4014,6 +4049,33 @@ function Get-Root12CallIndex {
         }
     }
     return -1
+}
+
+function Get-Root12LastCallIndex {
+    param(
+        [object[]]$Calls,
+        [string]$Pattern
+    )
+
+    $lastIndex = -1
+    for ($index = 0; $index -lt $Calls.Count; $index++) {
+        if ((@($Calls[$index]) -join ' ') -like $Pattern) {
+            $lastIndex = $index
+        }
+    }
+    return $lastIndex
+}
+
+function Get-Root12LaunchCount {
+    param([object[]]$Calls)
+
+    $count = 0
+    foreach ($call in @($Calls)) {
+        if ((@($call) -join ' ') -like 'control*-v*launch*') {
+            $count++
+        }
+    }
+    return $count
 }
 
 function Assert-Root12Failure {
@@ -4214,8 +4276,8 @@ function Invoke-Root12Tests {
         $decliningCase = Invoke-Root12Case -State $decliningState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { 'no' }
         Assert-Root12Failure -Result $decliningCase.Result -Journal $decliningCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A declined Kitsune confirmation was accepted.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern 'control*-v*launch*') 'A declined confirmation cold-booted the instance.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*getprop sys.boot_completed*') 'A declined confirmation waited for the boot.'
+        Assert-Equal 1 (Get-Root12LaunchCount -Calls $decliningState.Calls) 'A declined confirmation performed a step beyond the pre-install launch.'
+        Assert-Equal 1 @($decliningState.Calls | Where-Object { (@($_) -join ' ') -like '*getprop sys.boot_completed*' }).Count 'A declined confirmation did not perform exactly the pre-install boot wait.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*pidof magiskd*') 'A declined confirmation verified the root daemon.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*root_permission*-val*false*') 'A declined confirmation disabled the vendor root.'
         Assert-Equal $decliningState.CloneIndex $decliningCase.Result.Data.CloneIndex 'A declined confirmation did not report the recoverable clone.'
@@ -4241,7 +4303,7 @@ function Invoke-Root12Tests {
         $ordinaryCase = Invoke-Root12Case -State $ordinaryState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install'
         Assert-Root12Failure -Result $ordinaryCase.Result -Journal $ordinaryCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'An ordinary Direct Install confirmation was accepted.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $ordinaryState.Calls -Pattern 'control*-v*launch*') 'An ordinary Direct Install confirmation cold-booted the instance.'
+        Assert-Equal 1 (Get-Root12LaunchCount -Calls $ordinaryState.Calls) 'An ordinary Direct Install confirmation performed a step beyond the pre-install launch.'
 
         $promptState = @{ Text = ''; Calls = 0 }
         $answeringPrompt = {
@@ -4324,9 +4386,51 @@ function Invoke-Root12Tests {
         Assert-True ((@($launchCalls[0]) -join ' ') -match 'io\.github\.huskydg\.magisk') 'The Kitsune launch was not targeted at the Kitsune package.'
         $installCallIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern ('*' + $expectedInstallCommand + '*')
         $launchCallIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern ('*' + $confirmedState.LaunchCommand + '*')
-        $bootCallIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern 'control*-v*launch*'
+        $preInstallLaunchIndex = Get-Root12CallIndex -Calls $confirmedState.Calls -Pattern 'control*-v*launch*'
+        $coldBootLaunchIndex = Get-Root12LastCallIndex -Calls $confirmedState.Calls -Pattern 'control*-v*launch*'
+        Assert-Equal 2 (Get-Root12LaunchCount -Calls $confirmedState.Calls) 'The confirmed workflow did not perform exactly the pre-install and the cold-boot launch.'
+        Assert-True ($preInstallLaunchIndex -lt $installCallIndex) 'The verified APK was installed before the pre-install launch.'
         Assert-True ($installCallIndex -lt $launchCallIndex) 'The Kitsune APK was launched before it was installed.'
-        Assert-True ($launchCallIndex -lt $bootCallIndex) 'The Kitsune APK was launched after the confirmation gate.'
+        Assert-True ($launchCallIndex -lt $coldBootLaunchIndex) 'The Kitsune APK was launched after the confirmation gate.'
+
+        $stoppedAdbState = New-Root12ManagerState -Install $install
+        $stoppedAdbState.AdbRequiresRunning = $true
+        $stoppedAdbCase = Invoke-Root12Case -State $stoppedAdbState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-True ($stoppedAdbCase.Result.Status -eq 'Success') "The Android 12 workflow failed against a manager that rejects ADB on a stopped instance. $($stoppedAdbCase.Result.Message)"
+        $stoppedAdbInstallIndex = Get-Root12CallIndex -Calls $stoppedAdbState.Calls -Pattern ('*' + $expectedInstallCommand + '*')
+        $stoppedAdbPreLaunchIndex = Get-Root12CallIndex -Calls $stoppedAdbState.Calls -Pattern 'control*-v*launch*'
+        Assert-True ($stoppedAdbPreLaunchIndex -ge 0 -and $stoppedAdbPreLaunchIndex -lt $stoppedAdbInstallIndex) 'The manager rejected ADB on the stopped clone because the pre-install launch was missing.'
+        $stoppedAdbPreLaunch = @($stoppedAdbState.Calls[$stoppedAdbPreLaunchIndex])
+        Assert-Equal 'control' $stoppedAdbPreLaunch[0] 'The pre-install step is not a structured manager control command.'
+        Assert-Equal ([string]$stoppedAdbState.CloneIndex) $stoppedAdbPreLaunch[2] 'The pre-install launch did not target the clone.'
+        Assert-Equal 'launch' $stoppedAdbPreLaunch[3] 'The pre-install command is not a launch.'
+        $stoppedAdbPreBootIndex = Get-Root12CallIndex -Calls $stoppedAdbState.Calls -Pattern '*getprop sys.boot_completed*'
+        Assert-True ($stoppedAdbPreBootIndex -gt $stoppedAdbPreLaunchIndex -and $stoppedAdbPreBootIndex -lt $stoppedAdbInstallIndex) 'The pre-install step did not wait for sys.boot_completed=1 before the install.'
+        Assert-Equal 2 (Get-Root12LaunchCount -Calls $stoppedAdbState.Calls) 'The stopped-instance run did not perform exactly the pre-install and the cold-boot launch.'
+        Assert-Equal $false $stoppedAdbState.RootSettings[[string]$stoppedAdbState.CloneIndex] 'The temporary vendor root was not disabled after verification on the stopped-instance run.'
+        $stoppedAdbPreInstallEvents = @((Get-OperationJournal -Path $stoppedAdbCase.Journal.JournalPath).Checkpoints | Where-Object { [string]$_.Message -match 'sys\.boot_completed=1 before the APK install' })
+        Assert-Equal 1 $stoppedAdbPreInstallEvents.Count 'The pre-install launch was not journaled.'
+
+        $preInstallLaunchFailureState = New-Root12ManagerState -Install $install
+        $preInstallLaunchFailureState.LaunchFailAfterCount = 0
+        $preInstallLaunchFailureCase = Invoke-Root12Case -State $preInstallLaunchFailureState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $preInstallLaunchFailureCase.Result -Journal $preInstallLaunchFailureCase.Journal -Code 'PREINSTALL_LAUNCH_FAILED' -Message 'A failed pre-install launch was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $preInstallLaunchFailureState.Calls -Pattern '*getprop sys.boot_completed*') 'A failed pre-install launch still waited for the boot.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $preInstallLaunchFailureState.Calls -Pattern 'adb*-v*-c*install*') 'A failed pre-install launch still installed the APK.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $preInstallLaunchFailureState.Calls -Pattern '*root_permission*-val*false*') 'A failed pre-install launch disabled the temporary vendor root.'
+        Assert-Equal $true $preInstallLaunchFailureState.RootSettings[[string]$preInstallLaunchFailureState.CloneIndex] 'A failed pre-install launch did not leave the temporary vendor root enabled.'
+
+        $preInstallBootFailureState = New-Root12ManagerState -Install $install
+        $preInstallBootFailureState.BootReadyPolls = @{}
+        $preInstallBootFailureState.BootReadyPolls[[string]$preInstallBootFailureState.CloneIndex] = 99
+        $preInstallBootFailureCase = Invoke-Root12Case -State $preInstallBootFailureState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+        Assert-Root12Failure -Result $preInstallBootFailureCase.Result -Journal $preInstallBootFailureCase.Journal -Code 'PREINSTALL_BOOT_TIMEOUT' -Message 'A pre-install boot timeout was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $preInstallBootFailureState.Calls -Pattern 'adb*-v*-c*install*') 'A pre-install boot timeout still installed the APK.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $preInstallBootFailureState.Calls -Pattern '*root_permission*-val*false*') 'A pre-install boot timeout disabled the temporary vendor root.'
+        Assert-Equal $true $preInstallBootFailureState.RootSettings[[string]$preInstallBootFailureState.CloneIndex] 'A pre-install boot timeout did not leave the temporary vendor root enabled.'
 
         $launchFailureState = New-Root12ManagerState -Install $install
         $launchFailureState.AdbFailPattern = '*monkey*'
@@ -4336,7 +4440,7 @@ function Invoke-Root12Tests {
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt $launchFailurePrompt
         Assert-Root12Failure -Result $launchFailureCase.Result -Journal $launchFailureCase.Journal -Code 'APK_LAUNCH_FAILED' -Message 'A failed Kitsune launch was accepted.'
         Assert-Equal 0 $launchPromptState.Calls 'A failed Kitsune launch still asked the operator to confirm.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $launchFailureState.Calls -Pattern 'control*-v*launch*') 'A failed Kitsune launch cold-booted the instance.'
+        Assert-Equal 1 (Get-Root12LaunchCount -Calls $launchFailureState.Calls) 'A failed Kitsune launch performed a step beyond the pre-install launch.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $launchFailureState.Calls -Pattern '*root_permission*-val*false*') 'A failed Kitsune launch disabled the vendor root.'
 
         $resumeState = New-Root12VerifiedCloneState -Install $install -Instance $android12 -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot
@@ -4378,7 +4482,7 @@ function Invoke-Root12Tests {
         $resumeFailureCase = Invoke-Root12Case -State $resumeFailureState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition' `
             -ResumeClone ([pscustomobject]@{ CloneIndex = $resumeFailureState.CloneIndex })
-        Assert-Root12Failure -Result $resumeFailureCase.Result -Journal $resumeFailureCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A failed resume did not report a structured failure.'
+        Assert-Root12Failure -Result $resumeFailureCase.Result -Journal $resumeFailureCase.Journal -Code 'PREINSTALL_BOOT_TIMEOUT' -Message 'A failed resume did not report a structured failure.'
         Assert-Equal $resumeFailureState.CloneIndex $resumeFailureCase.Result.Data.CloneIndex 'A failed resume did not report the recoverable clone.'
         Assert-Equal 1 @($resumeFailureState.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'A failed resume created a second clone.'
 
@@ -4465,7 +4569,7 @@ function Invoke-Root12Tests {
         Assert-Equal -1 (Get-Root12CallIndex -Calls $cloneState.Calls -Pattern '*adb*') 'A failed instance clone reached the instance.'
 
         $bootTimeoutState = New-Root12ManagerState -Install $install
-        $bootTimeoutState.BootReadyPolls = 99
+        $bootTimeoutState.BootFailAfterReady = 1
         $bootTimeoutCase = Invoke-Root12Case -State $bootTimeoutState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
         Assert-Root12Failure -Result $bootTimeoutCase.Result -Journal $bootTimeoutCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A boot timeout was accepted.'
@@ -4474,11 +4578,11 @@ function Invoke-Root12Tests {
         Assert-Equal $bootTimeoutState.CloneIndex $bootTimeoutCase.Result.Data.CloneIndex 'A boot timeout did not report the recoverable clone.'
 
         $bootControlState = New-Root12ManagerState -Install $install
-        $bootControlState.ControlFailPattern = '*launch*'
+        $bootControlState.LaunchFailAfterCount = 1
         $bootControlCase = Invoke-Root12Case -State $bootControlState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
         Assert-Root12Failure -Result $bootControlCase.Result -Journal $bootControlCase.Journal -Code 'BOOT_CONTROL_FAILED' -Message 'A failed cold-boot launch was accepted.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $bootControlState.Calls -Pattern '*getprop sys.boot_completed*') 'A failed cold-boot launch still waited for the boot.'
+        Assert-Equal 1 @($bootControlState.Calls | Where-Object { (@($_) -join ' ') -like '*getprop sys.boot_completed*' }).Count 'A failed cold-boot launch still waited for the boot.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $bootControlState.Calls -Pattern '*root_permission*-val*false*') 'A failed cold-boot launch disabled the temporary vendor root.'
 
         $stopControlState = New-Root12ManagerState -Install $install
@@ -4487,7 +4591,7 @@ function Invoke-Root12Tests {
         $stopControlCase = Invoke-Root12Case -State $stopControlState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
         Assert-Root12Failure -Result $stopControlCase.Result -Journal $stopControlCase.Journal -Code 'BOOT_CONTROL_FAILED' -Message 'A failed cold-boot shutdown was accepted.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $stopControlState.Calls -Pattern '*getprop sys.boot_completed*') 'A failed cold-boot shutdown still waited for the boot.'
+        Assert-Equal 1 @($stopControlState.Calls | Where-Object { (@($_) -join ' ') -like '*getprop sys.boot_completed*' }).Count 'A failed cold-boot shutdown did not perform exactly the pre-install boot wait.'
 
         $missingPackageState = New-Root12ManagerState -Install $install
         $missingPackageState.PackageInstalled = $false
@@ -4592,7 +4696,9 @@ function Invoke-Root12Tests {
         $bootAdbState.AdbFailPattern = '*getprop*'
         $bootAdbCase = Invoke-Root12Case -State $bootAdbState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
-        Assert-Root12Failure -Result $bootAdbCase.Result -Journal $bootAdbCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A failed boot readiness query was accepted.'
+        Assert-Root12Failure -Result $bootAdbCase.Result -Journal $bootAdbCase.Journal -Code 'PREINSTALL_BOOT_TIMEOUT' -Message 'A failed pre-install readiness query was accepted.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $bootAdbState.Calls -Pattern 'adb*-v*-c*install*') 'A failed pre-install readiness query still installed the APK.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $bootAdbState.Calls -Pattern '*root_permission*-val*false*') 'A failed pre-install readiness query disabled the temporary vendor root.'
 
         $apkFailureState = New-Root12ManagerState -Install $install
         $apkFailureState.ApkInstallExitCode = 1
