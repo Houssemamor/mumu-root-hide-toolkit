@@ -24,7 +24,7 @@
 - Critical errors stop only the current action and prevent later mutation steps; recoverable errors use bounded retries and return to the menu.
 - Use ASCII-only source and documentation, with no code comments unless explicitly requested.
 - Test fixtures must never modify a real MuMu installation.
-- Tested references are MuMu Player 6.8.0.0, Android 12.0, Android 15.0 with built-in KernelSU 3.2.5, Kitsune v31.0-25fa2159, HMA-OSS oss-161, Vector v2.0, NeoZygisk v2.3, and CorePatch 4.9.
+- Tested references are MuMu Player 6.8.0.0 (Chinese edition), Android 12.0, Android 15.0 with built-in KernelSU 3.2.5, Kitsune v31.0-25fa2159, HMA-OSS oss-161, Vector v2.2, NeoZygisk v2.4, and CorePatch 4.9. Vector and NeoZygisk are pinned at the builds that were read from the live instance 0, so they match what that instance actually runs.
 
 ---
 
@@ -82,7 +82,7 @@ Add tests to `tests/Run-Tests.ps1` that load `src/Manifest.json`, require schema
 $manifest = Get-Content -LiteralPath (Join-Path $repoRoot 'src\Manifest.json') -Raw | ConvertFrom-Json
 Assert-True ($manifest.schemaVersion -eq 1) 'Manifest schema version is invalid.'
 Assert-True (@($manifest.dependencies | Where-Object { $_.assetName -match 'debug' }).Count -eq 0) 'Debug assets are not allowed.'
-$requiredAssets = @('app-release.apk', 'HMA-OSS-oss-161-release.apk', 'Vector-v2.0-3021-Release.zip', 'NeoZygisk-v2.3-275-release.zip', 'app-release.apk')
+$requiredAssets = @('app-release.apk', 'HMA-OSS-oss-161-release.apk', 'Vector-v2.2-3080-Release.zip', 'NeoZygisk-v2.4-289-release.zip', 'app-release.apk')
 Assert-True (@($manifest.dependencies).Count -eq $requiredAssets.Count) 'Manifest dependency count is invalid.'
 foreach ($dependency in $manifest.dependencies) {
     Assert-True ($dependency.sha256 -match '^[0-9a-f]{64}$') "Manifest hash is invalid: $($dependency.id)"
@@ -123,19 +123,19 @@ Create `src/Manifest.json` with schema version `1`, tested MuMu version `6.8.0.0
     },
     {
       "id": "vector",
-      "version": "v2.0",
-      "assetName": "Vector-v2.0-3021-Release.zip",
-      "url": "https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip",
-      "size": 8434264,
-      "sha256": "d5e39669c02c2c699ab948eb8f3639b348eefb7749553224a9c62fa4a2f2dc18"
+      "version": "v2.2",
+      "assetName": "Vector-v2.2-3080-Release.zip",
+      "url": "https://github.com/JingMatrix/Vector/releases/download/v2.2/Vector-v2.2-3080-Release.zip",
+      "size": 9316843,
+      "sha256": "9ee8323575d615f7b3f1076ff60b2a63a49390ef11881b52632311a37f6f79cc"
     },
     {
       "id": "neozygisk",
-      "version": "v2.3",
-      "assetName": "NeoZygisk-v2.3-275-release.zip",
-      "url": "https://github.com/JingMatrix/NeoZygisk/releases/download/v2.3/NeoZygisk-v2.3-275-release.zip",
-      "size": 3208704,
-      "sha256": "5c84df9f962c04855b3523a3a75022cf5e4f3ad3dfd94794ed92b43e911f3b9a"
+      "version": "v2.4",
+      "assetName": "NeoZygisk-v2.4-289-release.zip",
+      "url": "https://github.com/JingMatrix/NeoZygisk/releases/download/v2.4/NeoZygisk-v2.4-289-release.zip",
+      "size": 2401208,
+      "sha256": "93a1425c67bb89f58a0dcb9fc823ec93f6472214f221e667a70b67c6a6e061a1"
     },
     {
       "id": "corepatch",
@@ -149,7 +149,7 @@ Create `src/Manifest.json` with schema version `1`, tested MuMu version `6.8.0.0
 }
 ```
 
-The implementation must record that Vector build `3043` and NeoZygisk build `282` were used during the local verification, while the clean-room manifest uses the official tagged assets above. If a tagged asset fails qualification, it must be marked unverified rather than silently substituted.
+The implementation records that Vector build `3080` and NeoZygisk build `289` were read from the live instance 0, and the clean-room manifest pins the official tagged assets for exactly those builds. If a tagged asset fails qualification, it must be marked unverified rather than silently substituted.
 
 - [ ] **Step 4: Implement manifest validation and result helpers**
 
@@ -663,9 +663,9 @@ git commit -m "feat: add Android 15 built-in root workflow"
 - Produces `New-ReusableRootTemplate -Instance <object> -Journal <object> [-TargetIndex <int>] [-Runner <scriptblock>]` returning a verified HMA template record, including only the installed members of the four required root packages.
 - Produces `Set-AppConcealment -Instance <object> -VerifiedClone <object> -Packages <string[]> -Journal <object> [-Runner <scriptblock>]` returning per-package status. The configuration backup is read back and compared by byte length and SHA-256 before the original is overwritten, and a configuration the serializer would truncate is refused instead of written.
 - Produces `Test-Concealment -ManagerPath <string> -InstanceIndex <int> -Packages <string[]> [-Runner <scriptblock>]` returning HMA scope and KernelSU profile evidence. `Success` requires a stored blacklist `Root` template with a nonempty app list, every requested app assigned to it in the HMA `scope` map, and the KernelSU package observed installed; otherwise it reports `TEMPLATE_MISSING`, `TEMPLATE_NOT_BLACKLIST`, `SCOPE_INCOMPLETE`, or `KERNELSU_ABSENT`, and it never reports a root package it did not observe installed.
-- Produces `New-ConcealmentGuestCommand -Command <string> [-InstanceIndex <int>]` returning the one command element sent to the manager. The MuMu manager strips double quotes from a request, so the guest command is single quoted and only the command words, options, and operators concealment needs are accepted; every path must pass the existing plain-absolute-path allowlist, and a quote, a substitution, a newline, a control character, or a space inside a path is refused with `GUEST_COMMAND_INVALID` instead of being escaped. Every `su -c` request in this module goes through it, and a test asserts the module constructs no nested double-quoted `su -c` command at all.
+- Produces `New-ToolkitGuestCommand -Command <string>` in the always-loaded `src/Common.ps1`, the single funnel every `su -c` request in the toolkit goes through, plus `Test-ToolkitGuestPath` for the plain-absolute-path allowlist. The MuMu manager strips double quotes from a request, so the guest command is single quoted and only the command words, options, and operators the toolkit needs are accepted; every path must pass the allowlist, and a quote, a substitution, a newline, a control character, or a space inside a path is refused instead of being escaped. `New-ConcealmentGuestCommand` in this module wraps the funnel and reports the refusal as `GUEST_COMMAND_INVALID`; the read-only report in `src/Verification.ps1` calls the same funnel. A test scans every module file under `src/` and asserts none of them constructs a nested double-quoted `su -c` command at all.
 - HMA configuration version 93 stores the per-app assignment in `scope`, keyed by package name with the template name as the value. That is the only key the toolkit writes; it never creates an `apps` key, it preserves every other field it found, and a `scope` that is not a map of package to template name is refused as an unsupported schema.
-- The pinned Vector v2.0 asset is a flat Magisk module archive, so the staging directory itself is moved into `/data/adb/modules/vector` after its root `module.prop` is validated, including the declared module id, and a single top-level `vector/` directory is also accepted. An archive that is both, neither, carries another module root, declares another module id, or has no module script or `bin` directory is refused with `MODULE_LAYOUT_UNSUPPORTED`, and its staged archive and staging directory are removed before the failure is returned.
+- The pinned Vector v2.2 asset is a flat Magisk module archive, so the staging directory itself is moved into `/data/adb/modules/zygisk_vector` after its root `module.prop` is validated, including the declared module id, and a single top-level `zygisk_vector/` directory is also accepted. An archive that is both, neither, carries another module root, declares another module id, or has no module script or `bin` directory is refused with `MODULE_LAYOUT_UNSUPPORTED`, and its staged archive and staging directory are removed before the failure is returned. The module id is `zygisk_vector`, which is the id the live instance 0 reports, not `vector`.
 - Live qualification status: concealment is **not qualified**. The selected app `jp.pokemon.pokemontcgp` is not installed on the live clone, so the action refuses it with `PACKAGE_NOT_INSTALLED` and no scope is applied. No APK is invented for an absent package.
 
 - [ ] **Step 1: Write failing concealment tests**
@@ -879,8 +879,8 @@ foreach ($url in @(
     'https://www.mumuplayer.com/download/',
     'https://github.com/Jordan231111/KitsuneMagisk/releases/tag/v31.0-25fa2159',
     'https://github.com/frknkrc44/HMA-OSS/releases/tag/oss-161',
-    'https://github.com/JingMatrix/Vector/releases/tag/v2.0',
-    'https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.3',
+    'https://github.com/JingMatrix/Vector/releases/tag/v2.2',
+    'https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.4',
     'https://github.com/LSPosed/CorePatch/releases/tag/4.9'
 )) { Assert-True ($readme.Contains($url)) "README is missing tested link: $url" }
 Assert-True ($readme -match 'Direct Install into system partition') 'README lacks the exact Kitsune choice.'

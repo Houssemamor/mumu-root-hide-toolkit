@@ -15,18 +15,13 @@ $script:ConcealmentTemplateName = 'Root'
 $script:ConcealmentConfigPath = '/data/user/0/org.frknkrc44.hma_oss/files/config.json'
 $script:ConcealmentKernelSUAllowlistPath = '/data/adb/ksu/.allowlist'
 $script:ConcealmentModuleRoot = '/data/adb/modules'
-$script:ConcealmentVectorModuleName = 'vector'
-$script:ConcealmentVectorModulePath = '/data/adb/modules/vector'
+$script:ConcealmentVectorModuleName = 'zygisk_vector'
+$script:ConcealmentVectorModulePath = '/data/adb/modules/zygisk_vector'
 $script:ConcealmentGuestStagePath = '/data/local/tmp'
 $script:ConcealmentPackageListCommand = 'shell pm list packages'
 $script:ConcealmentPackagePattern = '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$'
 $script:ConcealmentMaximumPackageLength = 255
-$script:ConcealmentMaximumGuestPathLength = 255
 $script:ConcealmentJsonDepth = 12
-# The only command words, options, and operators a concealment guest command may use.
-$script:ConcealmentGuestCommandVerbs = @('base64', 'cat', 'echo', 'ls', 'mkdir', 'mv', 'rm', 'rmdir', 'unzip')
-$script:ConcealmentGuestCommandOptions = @('-d', '-f', '-l', '-o', '-p', '-rf')
-$script:ConcealmentGuestCommandOperators = @('|', '>', '&&')
 $script:ConcealmentStateFields = @(
     'Code', 'Step', 'InstanceIndex', 'CloneIndex', 'CloneName', 'Packages', 'OutOfScope',
     'TemplateName', 'TemplatePackages', 'TemplateFound', 'IsWhitelist', 'HmaConfigVersion',
@@ -185,17 +180,6 @@ function Test-ConcealmentPackageName {
     return ($Name -cmatch $script:ConcealmentPackagePattern)
 }
 
-function Test-ConcealmentGuestPath {
-    param([string]$Path)
-
-    if ($Path -isnot [string] -or $Path -notmatch '^/[A-Za-z0-9._/-]+$' -or
-        $Path -match '//' -or $Path -match '(^|/)\.\.(/|$)' -or
-        $Path.Length -gt $script:ConcealmentMaximumGuestPathLength) {
-        return $false
-    }
-    return $true
-}
-
 function New-ConcealmentGuestCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -203,40 +187,12 @@ function New-ConcealmentGuestCommand {
         [int]$InstanceIndex = -1
     )
 
-    $invalid = {
-        param([string]$Reason)
-
-        return Get-ToolkitResult -Status 'CriticalError' -Message ("The guest command is not sent: $Reason") -Data (New-ConcealmentState -Code 'GUEST_COMMAND_INVALID' -Step 'guest-command' -InstanceIndex $InstanceIndex)
+    # The shared funnel owns the quoting and the allowlist; this wrapper only adds the concealment state shape.
+    $request = New-ToolkitGuestCommand -Command $Command
+    if ($request.Status -ne 'Success') {
+        return Get-ToolkitResult -Status 'CriticalError' -Message $request.Message -Data (New-ConcealmentState -Code 'GUEST_COMMAND_INVALID' -Step 'guest-command' -InstanceIndex $InstanceIndex)
     }
-
-    if ($Command -isnot [string] -or [string]::IsNullOrWhiteSpace($Command)) {
-        return (& $invalid 'it is empty')
-    }
-    if ($Command -match '[\x00-\x1f\x7f]') {
-        return (& $invalid 'it carries a control character or a newline')
-    }
-    $tokens = @($Command -split ' ')
-    if ($script:ConcealmentGuestCommandVerbs -cnotcontains $tokens[0]) {
-        return (& $invalid "it does not start with a supported command word: $($tokens[0])")
-    }
-    # The MuMu manager strips double quotes from the request, so the guest command is single quoted and nothing that could end that quoting is accepted.
-    foreach ($token in $tokens) {
-        if ($script:ConcealmentGuestCommandVerbs -ccontains $token -or
-            $script:ConcealmentGuestCommandOptions -ccontains $token -or
-            $script:ConcealmentGuestCommandOperators -ccontains $token) {
-            continue
-        }
-        if ($token.StartsWith('/')) {
-            if (-not (Test-ConcealmentGuestPath -Path $token)) {
-                return (& $invalid "the path is not a plain absolute guest path: $token")
-            }
-            continue
-        }
-        if ($token -notmatch '^[A-Za-z0-9+/=]+$') {
-            return (& $invalid "the argument is neither a known command word nor a base64 payload: $token")
-        }
-    }
-    return Get-ToolkitResult -Status 'Success' -Message 'The guest command is safely quoted.' -Data (New-ConcealmentState -Code 'OK' -Step 'guest-command' -InstanceIndex $InstanceIndex -Fields @{ Command = ('shell su -c ' + [char]39 + $Command + [char]39) })
+    return Get-ToolkitResult -Status 'Success' -Message 'The guest command is safely quoted.' -Data (New-ConcealmentState -Code 'OK' -Step 'guest-command' -InstanceIndex $InstanceIndex -Fields @{ Command = [string]$request.Data })
 }
 
 function Get-ConcealmentRecordField {
@@ -724,7 +680,7 @@ function Set-ConcealmentGuestText {
     if ($null -eq $manager -or $InstanceIndex -lt 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The guest file manager path is invalid.' -Data (New-ConcealmentState -Code 'GUEST_WRITE_FAILED' -Step 'guest-write' -InstanceIndex $InstanceIndex)
     }
-    if (-not (Test-ConcealmentGuestPath -Path $Path)) {
+    if (-not (Test-ToolkitGuestPath -Path $Path)) {
         return New-ToolkitRootFailure -Journal $Journal -Message "The guest file path is not a plain absolute path: $Path" -Data (New-ConcealmentState -Code 'GUEST_WRITE_FAILED' -Step 'guest-write' -InstanceIndex $InstanceIndex)
     }
     if ($Text -isnot [string] -or [string]::IsNullOrWhiteSpace($Text)) {
@@ -762,7 +718,7 @@ function Get-ConcealmentGuestFile {
     )
 
     $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
-    if ($null -eq $manager -or $InstanceIndex -lt 0 -or -not (Test-ConcealmentGuestPath -Path $Path)) {
+    if ($null -eq $manager -or $InstanceIndex -lt 0 -or -not (Test-ToolkitGuestPath -Path $Path)) {
         return $null
     }
     $readCommand = New-ConcealmentGuestCommand -Command ('cat ' + $Path) -InstanceIndex $InstanceIndex
@@ -865,7 +821,7 @@ function Install-ConcealmentDependencies {
     else {
         $stagedPath = $script:ConcealmentGuestStagePath + '/' + [IO.Path]::GetFileName($vectorPath)
         $extractPath = $script:ConcealmentGuestStagePath + '/vector-extract-' + [Guid]::NewGuid().ToString('N')
-        if (-not (Test-ConcealmentGuestPath -Path $stagedPath) -or -not (Test-ConcealmentGuestPath -Path $extractPath)) {
+        if (-not (Test-ToolkitGuestPath -Path $stagedPath) -or -not (Test-ToolkitGuestPath -Path $extractPath)) {
             return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module staging path is not a plain absolute guest path, so nothing was staged.' -Data (New-ConcealmentState -Code 'ASSET_PATH_INVALID' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $push = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('push ' + [string]$quotedVector.Data + ' ' + $stagedPath) -Runner $Runner

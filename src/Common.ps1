@@ -1,3 +1,64 @@
+# The only command words, options, and operators a guest shell command may use.
+$script:ToolkitGuestCommandVerbs = @('base64', 'cat', 'echo', 'ls', 'mkdir', 'mv', 'rm', 'rmdir', 'unzip')
+$script:ToolkitGuestCommandOptions = @('-d', '-f', '-l', '-o', '-p', '-rf')
+$script:ToolkitGuestCommandOperators = @('|', '>', '&&')
+$script:ToolkitMaximumGuestPathLength = 255
+
+function Test-ToolkitGuestPath {
+    param([string]$Path)
+
+    if ($Path -isnot [string] -or $Path -notmatch '^/[A-Za-z0-9._/-]+$' -or
+        $Path -match '//' -or $Path -match '(^|/)\.\.(/|$)' -or
+        $Path.Length -gt $script:ToolkitMaximumGuestPathLength) {
+        return $false
+    }
+    return $true
+}
+
+# The single funnel that turns an allowlisted guest command into one adb request. The MuMu manager
+# strips double quotes from the request, so the command is single quoted and nothing that could end
+# that quoting is accepted. On success the request is the Data; on refusal the reason is the Message.
+function New-ToolkitGuestCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command
+    )
+
+    $refused = {
+        param([string]$Reason)
+
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The guest command is not sent: $Reason"
+    }
+
+    if ($Command -isnot [string] -or [string]::IsNullOrWhiteSpace($Command)) {
+        return (& $refused 'it is empty')
+    }
+    if ($Command -match '[\x00-\x1f\x7f]') {
+        return (& $refused 'it carries a control character or a newline')
+    }
+    $tokens = @($Command -split ' ')
+    if ($script:ToolkitGuestCommandVerbs -cnotcontains $tokens[0]) {
+        return (& $refused "it does not start with a supported command word: $($tokens[0])")
+    }
+    foreach ($token in $tokens) {
+        if ($script:ToolkitGuestCommandVerbs -ccontains $token -or
+            $script:ToolkitGuestCommandOptions -ccontains $token -or
+            $script:ToolkitGuestCommandOperators -ccontains $token) {
+            continue
+        }
+        if ($token.StartsWith('/')) {
+            if (-not (Test-ToolkitGuestPath -Path $token)) {
+                return (& $refused "the path is not a plain absolute guest path: $token")
+            }
+            continue
+        }
+        if ($token -notmatch '^[A-Za-z0-9+/=]+$') {
+            return (& $refused "the argument is neither a known command word nor a base64 payload: $token")
+        }
+    }
+    return Get-ToolkitResult -Status 'Success' -Message 'The guest command is safely quoted.' -Data ('shell su -c ' + [char]39 + $Command + [char]39)
+}
+
 function Get-ToolkitResult {
     param(
         [Parameter(Mandatory = $true)]

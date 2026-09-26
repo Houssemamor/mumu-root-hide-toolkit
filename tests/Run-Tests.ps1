@@ -121,19 +121,19 @@ function Invoke-ManifestTests {
         },
         [pscustomobject]@{
             Id = 'vector'
-            Version = 'v2.0'
-            AssetName = 'Vector-v2.0-3021-Release.zip'
-            Url = 'https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip'
-            Size = [long]8434264
-            Sha256 = 'd5e39669c02c2c699ab948eb8f3639b348eefb7749553224a9c62fa4a2f2dc18'
+            Version = 'v2.2'
+            AssetName = 'Vector-v2.2-3080-Release.zip'
+            Url = 'https://github.com/JingMatrix/Vector/releases/download/v2.2/Vector-v2.2-3080-Release.zip'
+            Size = [long]9316843
+            Sha256 = '9ee8323575d615f7b3f1076ff60b2a63a49390ef11881b52632311a37f6f79cc'
         },
         [pscustomobject]@{
             Id = 'neozygisk'
-            Version = 'v2.3'
-            AssetName = 'NeoZygisk-v2.3-275-release.zip'
-            Url = 'https://github.com/JingMatrix/NeoZygisk/releases/download/v2.3/NeoZygisk-v2.3-275-release.zip'
-            Size = [long]3208704
-            Sha256 = '5c84df9f962c04855b3523a3a75022cf5e4f3ad3dfd94794ed92b43e911f3b9a'
+            Version = 'v2.4'
+            AssetName = 'NeoZygisk-v2.4-289-release.zip'
+            Url = 'https://github.com/JingMatrix/NeoZygisk/releases/download/v2.4/NeoZygisk-v2.4-289-release.zip'
+            Size = [long]2401208
+            Sha256 = '93a1425c67bb89f58a0dcb9fc823ec93f6472214f221e667a70b67c6a6e061a1'
         },
         [pscustomobject]@{
             Id = 'corepatch'
@@ -6547,12 +6547,12 @@ function New-ConcealmentAssetFixture {
     param(
         [string]$CacheRoot,
         [string]$HmaAssetName = 'HMA-OSS-oss-161-release.apk',
-        [string]$VectorAssetName = 'Vector-v2.0-3021-Release.zip'
+        [string]$VectorAssetName = 'Vector-v2.2-3080-Release.zip'
     )
 
     $records = @(
         [pscustomobject]@{ Id = 'hma'; Directory = 'hma'; AssetName = $HmaAssetName; Url = 'https://github.com/frknkrc44/HMA-OSS/releases/download/oss-161/HMA-OSS-oss-161-release.apk'; Payload = 'pinned hma apk payload' },
-        [pscustomobject]@{ Id = 'vector'; Directory = 'vector'; AssetName = $VectorAssetName; Url = 'https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip'; Payload = 'pinned vector module payload' }
+        [pscustomobject]@{ Id = 'vector'; Directory = 'vector'; AssetName = $VectorAssetName; Url = 'https://github.com/JingMatrix/Vector/releases/download/v2.2/Vector-v2.2-3080-Release.zip'; Payload = 'pinned vector module payload' }
     )
     $dependencies = @()
     foreach ($record in $records) {
@@ -6628,9 +6628,9 @@ function New-ConcealmentGuestState {
         AdbFailPattern = ''
         CatFailPattern = ''
         CatCorruptPattern = ''
-        ExtractEntries = @('vector')
+        ExtractEntries = @('zygisk_vector')
         ExtractExtraFiles = @()
-        ModulePropText = 'id=vector
+        ModulePropText = 'id=zygisk_vector
 name=Vector
 '
         PushExitCode = 0
@@ -6754,7 +6754,7 @@ function Invoke-ConcealmentGuestShell {
             return [pscustomobject]@{ ExitCode = 1; Text = ('mv: cannot stat ' + $extractPath + '/' + $child) }
         }
         $State.Modules = @($State.Modules) + $target
-        $State.Files[($script:ConcealmentModuleRoot + '/' + $child + '/module.prop')] = 'id=vector'
+        $State.Files[($script:ConcealmentModuleRoot + '/' + $child + '/module.prop')] = 'id=zygisk_vector'
         return [pscustomobject]@{ ExitCode = 0; Text = '' }
     }
     if ($Command -match '^rm -rf (.+)$') {
@@ -6768,7 +6768,7 @@ function Invoke-ConcealmentGuestShell {
         }
         return [pscustomobject]@{ ExitCode = 0; Text = '' }
     }
-    if ($Command -match '^mv (\S+) ' + [regex]::Escape($script:ConcealmentModuleRoot) + '/vector$') {
+    if ($Command -match '^mv (\S+) ' + [regex]::Escape($script:ConcealmentModuleRoot) + '/zygisk_vector$') {
         if ($State.MoveExitCode -ne 0) {
             return [pscustomobject]@{ ExitCode = $State.MoveExitCode; Text = 'mv: cannot move the extracted module' }
         }
@@ -6776,7 +6776,7 @@ function Invoke-ConcealmentGuestShell {
         if (-not $State.Files.ContainsKey(($stagedRoot + '/module.prop'))) {
             return [pscustomobject]@{ ExitCode = 1; Text = ('mv: cannot stat ' + $stagedRoot + '/module.prop') }
         }
-        $State.Modules = @($State.Modules) + 'vector'
+        $State.Modules = @($State.Modules) + 'zygisk_vector'
         return [pscustomobject]@{ ExitCode = 0; Text = '' }
     }
     return [pscustomobject]@{ ExitCode = 1; Text = 'unsupported guest command' }
@@ -6970,7 +6970,17 @@ function Invoke-ConcealmentTests {
     Assert-True (Test-Path -LiteralPath $concealmentScriptPath -PathType Leaf) 'src/Concealment.ps1 does not exist.'
 
     $concealmentSource = [IO.File]::ReadAllText($concealmentScriptPath)
-    Assert-Equal 0 ([regex]::Matches($concealmentSource, 'su -c "')).Count 'A nested double-quoted su -c command is still constructed, which the MuMu manager strips.'
+    # The MuMu manager strips double quotes, so no module may build its own double-quoted su -c form. One shared funnel in Common.ps1 does it.
+    $modulePaths = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'src') -Filter '*.ps1' -File | Sort-Object Name)
+    Assert-True ($modulePaths.Count -ge 1) 'No module files were found under src/.'
+    foreach ($moduleFile in $modulePaths) {
+        $moduleSource = [IO.File]::ReadAllText($moduleFile.FullName)
+        Assert-Equal 0 ([regex]::Matches($moduleSource, 'su -c "')).Count "A nested double-quoted su -c command is still constructed in $($moduleFile.Name), which the MuMu manager strips."
+    }
+    $commonSource = [IO.File]::ReadAllText($commonPath)
+    Assert-True ($commonSource -match 'function New-ToolkitGuestCommand') 'The shared guest command funnel does not live in the always-loaded Common module.'
+    Assert-True ($concealmentSource -match 'New-ToolkitGuestCommand') 'The concealment flow does not use the shared guest command funnel.'
+    Assert-True ([IO.File]::ReadAllText($verificationScriptPath) -match 'New-ToolkitGuestCommand') 'The read-only report does not use the shared guest command funnel.'
     $removalCompositions = @([regex]::Matches($concealmentSource, "'rm -rf ' \+"))
     Assert-Equal 1 $removalCompositions.Count 'A guest removal is not composed exactly once through the quoting helper with the validated staging paths.'
     foreach ($forbidden in @(
@@ -7014,7 +7024,8 @@ function Invoke-ConcealmentTests {
         Assert-True (@($script:ConcealmentTemplatePackages) -ccontains $requiredPackage) "The reusable Root template omits the required package: $requiredPackage"
     }
     Assert-Equal $script:ConcealmentRootPackages.Count @($script:ConcealmentTemplatePackages).Count 'The reusable Root template package set is not exactly the four required packages.'
-    Assert-Equal ($script:ConcealmentModuleRoot + '/vector') $script:ConcealmentVectorModulePath 'The Vector module path is not the pinned module directory.'
+    Assert-Equal ($script:ConcealmentModuleRoot + '/zygisk_vector') $script:ConcealmentVectorModulePath 'The Vector module path is not the installed zygisk_vector module directory.'
+    Assert-Equal 'zygisk_vector' $script:ConcealmentVectorModuleName 'The Vector module name is not the installed zygisk_vector module id.'
     Assert-Equal 2 ([regex]::Matches($concealmentSource, 'Save-ToolkitManifestAsset')).Count 'The concealment flow does not call the manifest asset helper exactly twice.'
     Assert-Equal 2 ([regex]::Matches($concealmentSource, 'Save-ToolkitManifestAsset[^\r\n]*-RequireCached')).Count 'A concealment asset call does not use the cached-only contract, so a mutating phase could reach the network.'
     Assert-True ($concealmentSource -notmatch 'Save-ToolkitManifestAsset[^\r\n]*-Fetch') 'A concealment asset call injects a downloader into a mutating phase.'
@@ -7047,7 +7058,7 @@ function Invoke-ConcealmentTests {
     Assert-Equal 'Success' $safeGuestCommand.Status 'The guest command guard refused a plain allowlisted path.'
     Assert-Equal "shell su -c 'cat /data/user/0/org.frknkrc44.hma_oss/files/config.json'" $safeGuestCommand.Data.Command 'The guest command is not single quoted for the MuMu manager.'
     foreach ($safeGuestCase in @(
-            [pscustomobject]@{ Command = 'ls /data/adb/modules/vector'; Label = 'a plain ls' },
+            [pscustomobject]@{ Command = 'ls /data/adb/modules/zygisk_vector'; Label = 'a plain ls' },
             [pscustomobject]@{ Command = 'ls -l /data/adb/modules/ksu/.allowlist'; Label = 'a read-only ls -l' },
             [pscustomobject]@{ Command = 'mkdir -p /data/local/tmp/x && unzip -o /data/local/tmp/v.zip -d /data/local/tmp/x'; Label = 'a staged extraction' },
             [pscustomobject]@{ Command = 'echo QUJDRA== | base64 -d > /data/user/0/a/config.json.toolkit.tmp && mv /data/user/0/a/config.json.toolkit.tmp /data/user/0/a/config.json'; Label = 'a base64 write' },
@@ -7073,6 +7084,12 @@ function Invoke-ConcealmentTests {
         Assert-Equal 'GUEST_COMMAND_INVALID' $unsafeGuest.Data.Code "The guest command guard reported the wrong code for $($unsafeGuestCase.Reason)."
     }
     Assert-Equal 'CriticalError' (New-ConcealmentGuestCommand -Command '/data/local/tmp/x').Status 'The guest command guard accepted a bare path with no command.'
+
+    # The shared funnel is the only place a su -c request is built, so it must refuse on its own and keep the reason the wrapper reports.
+    Assert-Equal 'Success' (New-ToolkitGuestCommand -Command 'ls /data/adb/modules/zygisk_vector').Status 'The shared guest command funnel refused a plain read-only ls.'
+    Assert-Equal 'CriticalError' (New-ToolkitGuestCommand -Command 'curl http://host/').Status 'The shared guest command funnel accepted an unsupported command word.'
+    $refusedGuest = New-ConcealmentGuestCommand -Command 'cat /data/user/0/../0/config.json'
+    Assert-True ($refusedGuest.Message -match 'not a plain absolute guest path') "The guest command guard lost the refusal reason: $($refusedGuest.Message)"
 
     $concealmentRoot = Join-Path $testRoot 'concealment fixtures'
     $journalRoot = Join-Path $concealmentRoot 'journals'
@@ -7190,7 +7207,7 @@ function Invoke-ConcealmentTests {
     Assert-True (@($dependencyResult.Data.Installed) -ccontains 'vector') 'The verified Vector module was not reported as installed.'
     Assert-Equal 0 @($dependencyResult.Data.AlreadyPresent).Count 'Concealment dependency installation reported an absent dependency as already present.'
     Assert-True (@($installState.Packages) -ccontains $script:ConcealmentRootPackages[0]) 'The HMA package was not installed on the clone.'
-    Assert-True (@($installState.Modules) -ccontains 'vector') 'The Vector module was not installed on the clone.'
+    Assert-True (@($installState.Modules) -ccontains 'zygisk_vector') 'The Vector module was not installed on the clone.'
     Assert-ConcealmentCloneOnly -State $installState -Message 'Concealment dependency installation acted outside the verified clone.'
     Assert-Equal 1 @(Get-ConcealmentCalls -State $installState -Pattern '*install -r*').Count 'The verified HMA APK was not installed exactly once.'
     Assert-Equal 1 @(Get-ConcealmentCalls -State $installState -Pattern '*push*').Count 'The verified Vector module was not pushed exactly once.'
@@ -7199,15 +7216,15 @@ function Invoke-ConcealmentTests {
     Assert-True ($installCallText -match [regex]::Escape($assets.Vector)) 'The Vector module was not pushed from the verified cache path.'
     $pushArguments = [string[]]@(@(Get-ConcealmentCalls -State $installState -Pattern '*push*')[0])
     Assert-Equal 5 $pushArguments.Count 'The Vector module push carried an unexpected argument count.'
-    Assert-Equal ('push "' + $assets.Vector + '" /data/local/tmp/Vector-v2.0-3021-Release.zip') $pushArguments[4] 'The Vector module push was not one quoted structured element.'
+    Assert-Equal ('push "' + $assets.Vector + '" /data/local/tmp/Vector-v2.2-3080-Release.zip') $pushArguments[4] 'The Vector module push was not one quoted structured element.'
     $apkArguments = [string[]]@(@(Get-ConcealmentCalls -State $installState -Pattern '*install -r*')[0])
     Assert-Equal ('install -r "' + $assets.Hma + '"') $apkArguments[4] 'The HMA APK install was not one quoted structured element.'
-    $moduleCall = Get-ConcealmentCallIndex -Calls $installState.Calls -Pattern ('*mv*' + $script:ConcealmentModuleRoot + '/vector*')
+    $moduleCall = Get-ConcealmentCallIndex -Calls $installState.Calls -Pattern ('*mv*' + $script:ConcealmentModuleRoot + '/zygisk_vector*')
     Assert-True ($moduleCall -ge 0) 'The extracted Vector module was not moved into the module directory.'
 
     $presentState = New-ConcealmentGuestState -Install $install
     $presentState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3])
-    $presentState.Modules = @('vector')
+    $presentState.Modules = @('zygisk_vector')
     $presentJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
     $presentResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $presentJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $presentState)
     Assert-Equal 'AlreadyApplied' $presentResult.Status 'Present concealment dependencies were not reported as already applied.'
@@ -7363,9 +7380,10 @@ function Invoke-ConcealmentTests {
         }
     }
     foreach ($layoutDefect in @(
-            [pscustomobject]@{ Entries = @('vector-inner'); Label = 'a nested module directory' },
+            [pscustomobject]@{ Entries = @('zygisk_vector-inner'); Label = 'a nested module directory' },
             [pscustomobject]@{ Entries = @('Vector'); Label = 'a differently named module directory' },
-            [pscustomobject]@{ Entries = @('vector.zip'); Label = 'a file instead of the module directory' }
+            [pscustomobject]@{ Entries = @('vector'); Label = 'a legacy vector module directory' },
+            [pscustomobject]@{ Entries = @('zygisk_vector.zip'); Label = 'a file instead of the module directory' }
         )) {
         $defectState = New-ConcealmentGuestState -Install $install
         $defectState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
@@ -7399,7 +7417,7 @@ function Invoke-ConcealmentTests {
                 id        = 'vector'
                 version   = 'pinned'
                 assetName = '..\evil.zip'
-                url       = 'https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip'
+                url       = 'https://github.com/JingMatrix/Vector/releases/download/v2.2/Vector-v2.2-3080-Release.zip'
                 size      = [long]28
                 sha256    = '0000000000000000000000000000000000000000000000000000000000000000'
             }
@@ -7761,17 +7779,22 @@ function Invoke-ConcealmentTests {
     $flatLayoutState = New-ConcealmentGuestState -Install $install
     $flatLayoutState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
     $flatLayoutState.ExtractEntries = @('module.prop', 'service.sh', 'bin')
+    $flatLayoutState.ModulePropText = 'id=zygisk_vector
+name=Vector
+'
     $flatLayoutJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
     $flatLayoutResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $flatLayoutJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $flatLayoutState)
     Assert-Equal 'Success' $flatLayoutResult.Status "The pinned flat Vector module archive was refused. $($flatLayoutResult.Message)"
     Assert-Equal 1 @($flatLayoutState.Modules).Count 'The flat Vector module archive did not install exactly one module.'
+    Assert-True (@($flatLayoutState.Modules) -ccontains 'zygisk_vector') 'The flat Vector module archive was not installed under the zygisk_vector module id.'
     Assert-Equal 1 @(Get-ConcealmentCalls -State $flatLayoutState -Pattern "*'mv /data/local/tmp/vector-extract-*'").Count 'The flat Vector module archive did not move the staging directory itself.'
 
     foreach ($flatLayoutDefect in @(
-            [pscustomobject]@{ Entries = @('vector', 'module.prop'); Prop = 'id=vector'; Label = 'a layout that is both a module directory and a flat module' },
+            [pscustomobject]@{ Entries = @('zygisk_vector', 'module.prop'); Prop = 'id=zygisk_vector'; Label = 'a layout that is both a module directory and a flat module' },
             [pscustomobject]@{ Entries = @('module.prop', 'service.sh'); Prop = 'id=other'; Label = 'a root module.prop for another module' },
-            [pscustomobject]@{ Entries = @('module.prop', 'readme.txt'); Prop = 'id=vector'; Label = 'a flat archive with no module script' },
-            [pscustomobject]@{ Entries = @('readme.txt', 'logo.png'); Prop = 'id=vector'; Label = 'an archive that is not a module at all' }
+            [pscustomobject]@{ Entries = @('module.prop', 'service.sh'); Prop = 'id=vector'; Label = 'a flat archive that declares the legacy vector module id' },
+            [pscustomobject]@{ Entries = @('module.prop', 'readme.txt'); Prop = 'id=zygisk_vector'; Label = 'a flat archive with no module script' },
+            [pscustomobject]@{ Entries = @('readme.txt', 'logo.png'); Prop = 'id=zygisk_vector'; Label = 'an archive that is not a module at all' }
         )) {
         $flatDefectState = New-ConcealmentGuestState -Install $install
         $flatDefectState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
@@ -7976,6 +7999,7 @@ function Get-MenuGuestResponses {
         [switch]$NoKitsune,
         [switch]$NoRootShell,
         [switch]$NoVectorModule,
+        [switch]$LegacyVectorModule,
         [switch]$NoPackageList,
         [switch]$Android15
     )
@@ -7987,7 +8011,7 @@ function Get-MenuGuestResponses {
         'pidof magiskd' = @(0, '1234')
         'su -c id' = @(0, 'uid=0(root) gid=0(root) groups=0(root)')
         'pm list packages' = @(0, ('package:me.weishu.kernelsu' + $newline + 'package:org.frknkrc44.hma_oss' + $newline + 'package:io.github.huskydg.magisk'))
-        'ls /data/adb/modules/vector' = @(0, 'vector')
+        'ls /data/adb/modules/zygisk_vector' = @(0, 'zygisk_vector')
     }
     if ($Android15) {
         $responses['pm list packages'] = @(0, ('package:me.weishu.kernelsu' + $newline + 'package:org.frknkrc44.hma_oss'))
@@ -7999,7 +8023,12 @@ function Get-MenuGuestResponses {
         $responses['su -c id'] = @(0, 'uid=2000(shell) gid=2000(shell) groups=2000(shell)')
     }
     if ($NoVectorModule) {
-        $responses.Remove('ls /data/adb/modules/vector')
+        $responses.Remove('ls /data/adb/modules/zygisk_vector')
+    }
+    if ($LegacyVectorModule) {
+        # A guest that still carries only the legacy module directory must not be read as the pinned module.
+        $responses.Remove('ls /data/adb/modules/zygisk_vector')
+        $responses['ls /data/adb/modules/vector'] = @(0, 'vector')
     }
     if ($NoPackageList) {
         $responses.Remove('pm list packages')
@@ -8221,12 +8250,12 @@ function Invoke-MenuTests {
             'adb -v 2 -c shell pidof magiskd'
             'adb -v 2 -c shell su -c id'
             'adb -v 2 -c shell pm list packages'
-            'adb -v 2 -c shell su -c "ls /data/adb/modules/vector"'
+            "adb -v 2 -c shell su -c 'ls /data/adb/modules/zygisk_vector'"
         )
         $actualGuestCommands = @(@($reportGuestLog.Keys) | Sort-Object)
         Assert-Equal (@($expectedGuestCommands | Sort-Object) -join '|') ($actualGuestCommands -join '|') "The report issued guest requests other than the expected read-only ones: $($actualGuestCommands -join '|')"
         foreach ($command in @($reportGuestLog.Keys)) {
-            Assert-True ($command -notmatch '(?i)\bsu -c ".*(rm |chmod|chown|echo|mv |cp )|pm uninstall|pm install|pm clear|pm disable|monkey|-val|control ') "The report issued a mutating guest request: $command"
+            Assert-True ($command -notmatch '(?i)\bsu -c [''"].*(rm |chmod|chown|echo|mv |cp )|pm uninstall|pm install|pm clear|pm disable|monkey|-val|control ') "The report issued a mutating guest request: $command"
         }
 
         $unrootedReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -NoKitsune -NoRootShell -NoVectorModule -NoPackageList))
@@ -8237,6 +8266,10 @@ function Invoke-MenuTests {
         Assert-True (@($unrootedReport.Failures).Count -ge 1) 'The report did not record its unreadable guest sections.'
         Assert-Equal 'None' $unrootedReport.JournalState 'The report invented a journal state without a journal.'
         Assert-Equal 0 $unrootedReport.Mutated 'The unverified report claims a mutation.'
+
+        # The installed Vector module id is zygisk_vector, so a guest that still carries only the legacy vector directory is not the pinned module.
+        $legacyModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -LegacyVectorModule))
+        Assert-Equal $false $legacyModuleReport.Guest.VectorModuleInstalled 'A guest with only a legacy vector module directory was read as the pinned Vector module.'
 
         $unsupportedReport = Get-ToolkitReport -Install $unsupportedInstall.Install -Instance ([pscustomobject]@{ Index = 2; Install = $unsupportedInstall.Install }) -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
         Assert-Equal 'Unsupported' $unsupportedReport.Guest.Root 'The report probed an unsupported Android version.'
@@ -9511,7 +9544,7 @@ function Invoke-DocsTests {
         Assert-True ($readme.Contains($mumuLink)) "README is missing a tested reference link: $mumuLink"
     }
     Assert-True ($readme.Contains([string]$manifest.mumu.testedVersion)) "README does not state the tested MuMu version: $([string]$manifest.mumu.testedVersion)"
-    Assert-True ($readme.Contains('https://github.com/JingMatrix/Vector/releases/tag/v2.0')) 'README does not link the canonical Vector release page that the manifest pins.'
+    Assert-True ($readme.Contains('https://github.com/JingMatrix/Vector/releases/tag/v2.2')) 'README does not link the canonical Vector release page that the manifest pins.'
 
     # The exact Kitsune phrase is taken from the product constant, not retyped here.
     $kitsuneChoice = [string]$script:ToolkitKitsuneChoice
@@ -9549,13 +9582,34 @@ function Invoke-DocsTests {
             @{ Pattern = '(?m)Warning.*\b0\b'; Message = 'README does not map Warning to exit code 0.' }
             @{ Pattern = '(?m)RecoverableError.*\b2\b'; Message = 'README does not map RecoverableError to exit code 2.' }
             @{ Pattern = '(?m)CriticalError.*\b1\b'; Message = 'README does not map CriticalError to exit code 1.' }
-            @{ Pattern = '(?i)no live (qualification|run|test)'; Message = 'README does not disclose that no live qualification was performed here.' }
             @{ Pattern = '(?i)transport'; Message = 'README does not disclose the transport assumptions.' }
             @{ Pattern = '(?i)Play Integrity'; Message = 'README does not address Play Integrity.' }
             @{ Pattern = '(?i)no guarantee|does not guarantee'; Message = 'README does not disclaim any Play Integrity or attestation guarantee.' }
             @{ Pattern = '(?i)no binaries'; Message = 'README does not state that no binaries are bundled.' }
         )) {
         Assert-True ($readme -match $statement.Pattern) $statement.Message
+    }
+
+    # The live runs happened, so README must state what each one actually proved and forbid the old denial.
+    Assert-True ($readme -notmatch '(?i)no live (qualification|run|test)') 'README still claims that no live qualification was performed, which is false.'
+    foreach ($liveStatement in @(
+            @{ Pattern = '(?is)Android 12.{0,200}?\bqualified\b'; Message = 'README does not state that Android 12 is qualified.' }
+            @{ Pattern = '(?i)retained vendor root'; Message = 'README does not state that the Android 12 qualification retained the vendor root.' }
+            @{ Pattern = '(?i)Chinese[- ]edition MuMu 6\.8\.0\.0'; Message = 'README does not scope the live results to the Chinese-edition MuMu 6.8.0.0 build.' }
+            @{ Pattern = '(?is)Android 15.{0,200}?\bunqualified\b'; Message = 'README does not state that Android 15 is unqualified.' }
+            @{ Pattern = '(?i)inherited.{0,80}Kitsune'; Message = 'README does not state that the Android 15 clone inherited Kitsune.' }
+            @{ Pattern = '(?i)clone 5'; Message = 'README does not name the Android 15 clone index.' }
+            @{ Pattern = '(?is)concealment.{0,200}?\bunqualified\b'; Message = 'README does not state that concealment is unqualified.' }
+            @{ Pattern = 'jp\.pokemon\.pokemontcgp'; Message = 'README does not name the concealment target package.' }
+            @{ Pattern = '(?i)clone 4'; Message = 'README does not name the concealment clone index.' }
+            @{ Pattern = '(?is)RemoveAds.{0,200}?\bno-op\b'; Message = 'README does not state that RemoveAds was a no-op on this host.' }
+            @{ Pattern = '(?i)no campaign file'; Message = 'README does not state that no campaign file exists on this host.' }
+            @{ Pattern = 'zygisk_vector'; Message = 'README does not record the installed Vector module id.' }
+            @{ Pattern = '31\.0-kitsune'; Message = 'README does not record the observed Kitsune app version.' }
+            @{ Pattern = '7304644'; Message = 'README does not record the observed HMA version code.' }
+            @{ Pattern = '(?m)\|\s*`?2047`?\s*\|'; Message = 'README does not record the observed CorePatch version code.' }
+        )) {
+        Assert-True ($readme -match $liveStatement.Pattern) $liveStatement.Message
     }
 
     # The documented action set is bound to the dispatcher catalog, and every example must be accurate.

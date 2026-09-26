@@ -544,8 +544,19 @@ function Get-ToolkitGuestState {
         $guest['Failure'] = $guest['Failure'] + ' ' + [string]$packages.Message
     }
     $modulePath = Get-ToolkitSharedValue -Name 'ConcealmentVectorModulePath'
-    if (-not [string]::IsNullOrWhiteSpace($modulePath) -and (Test-ToolkitCommandAvailable -Name 'Invoke-ToolkitManagerAdb')) {
-        $module = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell su -c "ls ' + $modulePath + '"') -Runner $Runner
+    $moduleCommand = ''
+    if (-not [string]::IsNullOrWhiteSpace($modulePath)) {
+        # The shared funnel is the only place a su -c request is built, so the report cannot emit the double-quoted form.
+        $moduleRequest = New-ToolkitGuestCommand -Command ('ls ' + $modulePath)
+        if ($moduleRequest.Status -ceq 'Success') {
+            $moduleCommand = [string]$moduleRequest.Data
+        }
+        else {
+            $guest['Failure'] = $guest['Failure'] + ' ' + $moduleRequest.Message
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($moduleCommand) -and (Test-ToolkitCommandAvailable -Name 'Invoke-ToolkitManagerAdb')) {
+        $module = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command $moduleCommand -Runner $Runner
         if ($null -ne $module -and $module.ExitCode -eq 0) {
             $guest['VectorModuleInstalled'] = $true
         }

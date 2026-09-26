@@ -33,17 +33,17 @@ Supported targets:
 
 ## Tested setup versions
 
-These are the versions used for the live setup verification on 2026-09-25. The implementation will pin these versions and hashes in its manifest; a newer release is not treated as compatible until it is separately tested. The live verification used the Global edition. Chinese-edition support remains fixture-tested until a live Chinese installation is verified.
+These are the versions used for the live setup verification on 2026-09-25 and 2026-09-26. The implementation pins these versions and hashes in its manifest; a newer release is not treated as compatible until it is separately tested. The live verification used the Chinese edition of MuMu Player 6.8.0.0. Global-edition support remains fixture-tested.
 
 | Component | Tested version | Reference |
 | --- | --- | --- |
-| MuMu Player Global | 6.8.0.0 | [Official download page](https://www.mumuplayer.com/download/) |
+| MuMu Player Chinese edition | 6.8.0.0 | [Official download page](https://www.mumuplayer.com/download/) |
 | Android 12 instance | Android 12.0 | [MuMu Android-version documentation](https://www.mumuplayer.com/help/win/how-to-upgrade-mumuplayer.html) |
 | Android 15 instance | Android 15.0, built-in KernelSU 3.2.5 | [MuMu Android-version documentation](https://www.mumuplayer.com/help/win/how-to-upgrade-mumuplayer.html) |
 | Kitsune Magisk | v31.0-25fa2159 | [Kitsune release](https://github.com/Jordan231111/KitsuneMagisk/releases/tag/v31.0-25fa2159) |
 | Hide My Applist OSS | oss-161 | [HMA-OSS release](https://github.com/frknkrc44/HMA-OSS/releases/tag/oss-161) |
-| Vector | v2.0, build 3043 | [Vector release](https://github.com/JingMatrix/LSPosed/releases/tag/v2.0) |
-| NeoZygisk | v2.3, build 282-8b12252 | [NeoZygisk release](https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.3) |
+| Vector | v2.2, build 3080, installed as the `zygisk_vector` module | [Vector release](https://github.com/JingMatrix/Vector/releases/tag/v2.2) |
+| NeoZygisk | v2.4, build 289, installed as the `zygisksu` module | [NeoZygisk release](https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.4) |
 | CorePatch | 4.9 | [CorePatch release](https://github.com/LSPosed/CorePatch/releases/tag/4.9) |
 
 Explicit non-goals:

@@ -53,19 +53,19 @@ function Get-ToolkitManifest {
         },
         [pscustomobject]@{
             Id = 'vector'
-            Version = 'v2.0'
-            AssetName = 'Vector-v2.0-3021-Release.zip'
-            Url = 'https://github.com/JingMatrix/Vector/releases/download/v2.0/Vector-v2.0-3021-Release.zip'
-            Size = [long]8434264
-            Sha256 = 'd5e39669c02c2c699ab948eb8f3639b348eefb7749553224a9c62fa4a2f2dc18'
+            Version = 'v2.2'
+            AssetName = 'Vector-v2.2-3080-Release.zip'
+            Url = 'https://github.com/JingMatrix/Vector/releases/download/v2.2/Vector-v2.2-3080-Release.zip'
+            Size = [long]9316843
+            Sha256 = '9ee8323575d615f7b3f1076ff60b2a63a49390ef11881b52632311a37f6f79cc'
         },
         [pscustomobject]@{
             Id = 'neozygisk'
-            Version = 'v2.3'
-            AssetName = 'NeoZygisk-v2.3-275-release.zip'
-            Url = 'https://github.com/JingMatrix/NeoZygisk/releases/download/v2.3/NeoZygisk-v2.3-275-release.zip'
-            Size = [long]3208704
-            Sha256 = '5c84df9f962c04855b3523a3a75022cf5e4f3ad3dfd94794ed92b43e911f3b9a'
+            Version = 'v2.4'
+            AssetName = 'NeoZygisk-v2.4-289-release.zip'
+            Url = 'https://github.com/JingMatrix/NeoZygisk/releases/download/v2.4/NeoZygisk-v2.4-289-release.zip'
+            Size = [long]2401208
+            Sha256 = '93a1425c67bb89f58a0dcb9fc823ec93f6472214f221e667a70b67c6a6e061a1'
         },
         [pscustomobject]@{
             Id = 'corepatch'

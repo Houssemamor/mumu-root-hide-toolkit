@@ -32,7 +32,7 @@ license in the upstream project before you redistribute anything.
 | NetEase MuMu Player | the emulator this toolkit configures; not affiliated with or supported by NetEase | https://www.mumuplayer.com/ |
 | Jordan231111/KitsuneMagisk | Kitsune Magisk, the Android 12 root implementation | https://github.com/Jordan231111/KitsuneMagisk |
 | frknkrc44/HMA-OSS | Hide My Applist OSS, the per-app concealment app | https://github.com/frknkrc44/HMA-OSS |
-| JingMatrix/Vector | the LSPosed module runtime used by Hide My Applist OSS, now published as Vector | https://github.com/JingMatrix/Vector |
+| JingMatrix/Vector | the LSPosed module runtime used by Hide My Applist OSS, now published as Vector and installed as the `zygisk_vector` module | https://github.com/JingMatrix/Vector |
 | JingMatrix/NeoZygisk | pinned for future use; no action installs it yet | https://github.com/JingMatrix/NeoZygisk |
 | LSPosed/CorePatch | pinned for future use; no action installs it yet | https://github.com/LSPosed/CorePatch |
 

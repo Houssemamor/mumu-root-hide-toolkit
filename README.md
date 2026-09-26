@@ -33,13 +33,30 @@ not treated as compatible until it has been tested and pinned again.
 | MuMu Android version selection | Android 12.0 and Android 15.0 | choosing the instance image | [Android version documentation](https://www.mumuplayer.com/help/win/how-to-upgrade-mumuplayer.html) |
 | Kitsune Magisk | v31.0-25fa2159 | Android 12 root | [Kitsune release](https://github.com/Jordan231111/KitsuneMagisk/releases/tag/v31.0-25fa2159) |
 | Hide My Applist OSS | oss-161 | app and module concealment | [HMA-OSS release](https://github.com/frknkrc44/HMA-OSS/releases/tag/oss-161) |
-| Vector | v2.0 | LSPosed module runtime used by HMA OSS | [Vector release](https://github.com/JingMatrix/Vector/releases/tag/v2.0) |
-| NeoZygisk | v2.3 | pinned for future use; no action installs it yet | [NeoZygisk release](https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.3) |
+| Vector | v2.2 | LSPosed module runtime used by HMA OSS; installs as the `zygisk_vector` module | [Vector release](https://github.com/JingMatrix/Vector/releases/tag/v2.2) |
+| NeoZygisk | v2.4 | pinned for future use; no action installs it yet | [NeoZygisk release](https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.4) |
 | CorePatch | 4.9 | pinned for future use; no action installs it yet | [CorePatch release](https://github.com/LSPosed/CorePatch/releases/tag/4.9) |
 
 Vector is the current name of the LSPosed project. The pinned artifact comes from the
-`JingMatrix/Vector` repository, whose v2.0 release page is the canonical link; the older
+`JingMatrix/Vector` repository, whose v2.2 release page is the canonical link; the older
 `JingMatrix/LSPosed` release path only redirects there.
+
+These are the tool versions that were read from the live MuMu instance 0 of the
+Chinese-edition MuMu 6.8.0.0 installation, and they are the versions the toolkit pins:
+
+| Observed on instance 0 | Version | Version code |
+| --- | --- | --- |
+| Kitsune Magisk app `io.github.huskydg.magisk` | `31.0-kitsune` | `31000` |
+| `magisk` binary and `su` | `31.0-kitsune` | `31000` |
+| Hide My Applist OSS `org.frknkrc44.hma_oss` | `oss-161` | `7304644` |
+| CorePatch `com.coderstory.toolkit` | `4.9` | `2047` |
+| Vector module `zygisk_vector` | `v2.2` | `3080` |
+| NeoZygisk module `zygisksu` | `v2.4` | `289` |
+
+The HMA configuration schema observed there is version `93`, which is the version this
+toolkit reads and writes. The Vector module is installed on that instance under the id
+`zygisk_vector`, not `vector`, and this toolkit installs and probes it at
+`/data/adb/modules/zygisk_vector`.
 
 Dependencies are downloaded at run time from those official release pages into
 `%LOCALAPPDATA%\mumu-root-hide-toolkit\assets`, and each one is verified against its pinned size
@@ -254,11 +271,12 @@ Three contracts come from what the live guest actually accepts:
   writes; it never creates an `apps` key, and it preserves every other field of the configuration
   as it found them. A `scope` that is not a map of package to template name is refused as an
   unsupported schema.
-- **The Vector archive.** The pinned Vector v2.0 asset is a flat Magisk module archive, so the
-  staging directory itself is moved into `/data/adb/modules/vector` after its root `module.prop`
-  is validated, including the declared module id. A single top-level `vector/` directory is also
-  accepted. An archive that is both, neither, carries another module root, or declares another
-  module id is refused and its staged archive and staging directory are removed.
+- **The Vector archive.** The pinned Vector v2.2 asset is a flat Magisk module archive, so the
+  staging directory itself is moved into `/data/adb/modules/zygisk_vector` after its root
+  `module.prop` is validated, including the declared module id. A single top-level
+  `zygisk_vector/` directory is also accepted. An archive that is both, neither, carries another
+  module root, or declares another module id is refused and its staged archive and staging
+  directory are removed.
 
 `Test-Concealment` reports `Warning` with `KERNELSU_ABSENT` on a clone where the KernelSU package
 is not installed, such as an Android 12 Kitsune clone, and claims no KernelSU profile state there;
@@ -269,8 +287,8 @@ Hide My Applist OSS must already be installed on the clone. The manifest pins th
 Vector artifacts and `src/Concealment.ps1` can install them from the verified cache, but the
 menu does not run that step yet.
 
-**Concealment is not qualified on this host yet.** The selected app
-`jp.pokemon.pokemontcgp` is not installed on the live clone, so the action refuses it with
+**Concealment is unqualified on this host.** The selected app
+`jp.pokemon.pokemontcgp` is not installed on the live clone 4, so the action refuses it with
 `PACKAGE_NOT_INSTALLED` and no concealment scope is applied. No APK is invented for a package
 that is absent; install the app on the clone yourself, or select apps that are installed, before
 concealment can be called qualified.
@@ -337,38 +355,43 @@ recovery guidance, and never closes the window.
 
 These are the honest limits of the current state of the code.
 
-- No live qualification was performed in this repository. Every behavior here is covered by
-  fixture tests and parser checks; the end-to-end MuMu, ADB, UAC, and cold-boot paths have not
-  been exercised on a real installation from this repository.
-- The transport assumptions are unverified: the workflow depends on `MuMuManager.exe` reporting
-  the documented instance, clone, and root-setting responses, and on its bundled ADB accepting
-  the commands the toolkit sends. A different manager version, a localized response, or a
-  blocked port makes the action fail closed rather than guess.
+- Live runs were performed on a real installation, on the Chinese-edition MuMu 6.8.0.0 build
+  described above. The results are mixed and are stated one action at a time. Every other
+  statement here is still covered only by fixture tests and parser checks.
+- Android 12 is qualified on this build, with one honest caveat: the Kitsune root is installed and
+  verified, and the MuMu vendor root is then left enabled, so the action reports `Warning` with
+  `ROOT_AFTER_DISABLE_ROLLED_BACK` and `RootVerified=true` rather than `Success`. On MuMu 6.8 the
+  Kitsune `su` path is `/system/bin/su` and disabling the vendor root removes it while the adb
+  shell stays `uid=2000`, so the retained vendor root is the working state, not a leftover. The
+  retained vendor root is recorded in the journal and in the result.
+- Android 15 is unqualified. The live run produced a clone that inherited Kitsune, so clone 5
+  carries `io.github.huskydg.magisk` and has no built-in KernelSU target. `Root15` reports
+  `KITSUNE_PRESENT` for it, and a source instance that already carries Kitsune cannot be
+  qualified.
+- Concealment is unqualified. The target package `jp.pokemon.pokemontcgp` is not installed on the
+  live clone 4, so `Set-AppConcealment` refused it and no scope was applied. No APK is invented
+  for an absent package.
+- `RemoveAds` was a no-op on this host. There is no campaign file anywhere in the Chinese-edition
+  installation, so the action reported success with an empty path set and wrote nothing. That is a
+  fact about this installation, not evidence that the advertisement logic works.
+- The transport assumptions are only partly verified. Discovery, the instance clone transport, resume
+  from a real recovery record, the manager responses, and the bundled ADB were exercised live. Other
+  manager versions, a localized response, or a blocked port still make an action fail closed rather
+  than guess.
 - `Target Create` and `Target Clone` are the only actions that add an instance, and both depend on
   the manager accepting the `create` and `clone` commands with these exact arguments. The manager
   assigns the created index itself, so `Target Create` reports the index MuMu returned and never
-  assumes the requested index. Neither mode has been exercised against a live MuMu installation
-  from this repository.
+  assumes the requested index.
 - Root concealment reduces package and module visibility. It is not attestation bypass, and
   there is no guarantee about Play Integrity, device integrity, or any other hardware-backed
   signal.
 - The temporary MuMu vendor root is left enabled on an Android 12 clone when root
   verification fails, because disabling it would hide the state that needs investigation.
-- The temporary MuMu vendor root stays enabled on an Android 12 clone when the Kitsune root does not
-  survive the cleanup, because on MuMu 6.8 the Kitsune `su` path is `/system/bin/su` and disabling
-  the vendor root removes it while the adb shell stays `uid=2000`. That state is reported as a
-  `Warning`, never as a `Success`, and the retained vendor root is recorded in the journal.
-- Android 15 is not qualified. The live run on the instance at index 1 produced a clone that
-  inherited `io.github.huskydg.magisk` and had no usable `su` and no built-in KernelSU daemon, so
-  that clone is not a valid built-in-KernelSU target. `Root15` reports `KITSUNE_PRESENT` for it and
-  a source instance that already carries Kitsune cannot be qualified.
-- Concealment is not qualified. The selected app `jp.pokemon.pokemontcgp` is not installed on the
-  live clone, so the action refuses it and no scope is applied. No APK is invented for an absent
-  package.
 - no binaries are bundled: no APK, archive, installer, or image is committed here, and the
   repository ignores those file types on purpose.
-- The Chinese edition is fixture-tested only. The live setup verification behind the tested
-  version statement used the Global edition.
+- Every live result above is scoped to the Chinese-edition MuMu 6.8.0.0 build with a pinned Kitsune
+  `31.0-kitsune`. The Global edition is fixture-tested only; the live verification behind the
+  tested version statement used the Chinese edition, not the Global one.
 - The menu does not yet self-elevate or install the concealment dependencies; see the sections
   above for the current fail-closed behavior.
 
