@@ -7119,7 +7119,8 @@ function New-MenuInstallFixture {
         [switch]$Campaign
     )
 
-    $root = Join-Path $testRoot (Join-Path 'menu fixtures' (Join-Path 'MuMu Global' $Name))
+    $parentName = if ($Edition -ceq 'Chinese') { 'MuMuPlayer' } else { 'MuMu Global' }
+    $root = Join-Path $testRoot (Join-Path 'menu fixtures' (Join-Path $parentName $Name))
     $vms = Join-Path $root 'vms'
     [void][IO.Directory]::CreateDirectory($vms)
     $manager = New-DiscoveryManagerFixture -InstallRoot $root -InfoJson $InfoJson -SettingJson '{"root_permission":"true"}'
@@ -7142,12 +7143,18 @@ function New-MenuInstallFixture {
 }
 
 function New-MenuGuestRunner {
-    param([hashtable]$Responses)
+    param(
+        [hashtable]$Responses,
+        [hashtable]$Log = $null
+    )
 
     return {
         param($ActualFilePath, $ActualArgumentList)
 
         $command = (@($ActualArgumentList) -join ' ')
+        if ($null -ne $Log) {
+            $Log[$command] = $true
+        }
         if (-not $command.StartsWith('adb')) {
             return Invoke-CheckedProcess -FilePath $ActualFilePath -ArgumentList $ActualArgumentList
         }
@@ -7315,7 +7322,7 @@ function Invoke-MenuTests {
         Assert-True ($launcherSource -match 'powershell\.exe\s+-NoProfile\s+-ExecutionPolicy\s+RemoteSigned\s+-File\s+"%ROOT%src\\Invoke-MumuToolkit\.ps1"') 'The launcher does not invoke the controller with the required PowerShell options.'
         Assert-True ($launcherSource -match 'exit\s+/b\s+%CODE%') 'The launcher does not propagate the controller exit code.'
         Assert-Equal 1 ([regex]::Matches($launcherSource, '(?i)\bpause\b')).Count 'The launcher does not pause exactly once.'
-        Assert-True ($launcherSource -match '(?is)if\s+not\s+"%CODE%"=="0"\s*\r?\n?\s*pause') 'The launcher does not pause only after a failure.'
+        Assert-True ($launcherSource -match '(?i)if\s+not\s+"%CODE%"=="0"\s+if\s+"%~1"==""\s+pause') 'The launcher does not pause only after an interactive failure.'
         foreach ($forbidden in @(
                 'runas',
                 '-Verb',
@@ -7372,7 +7379,8 @@ function Invoke-MenuTests {
         $reportManagerCallsBefore = @(Get-MenuManagerCalls -Fixture $reportInstall)
         $reportSnapshotBefore = New-MenuSnapshot -Root $reportInstall.Install.InstallRoot
         $reportStateBefore = New-MenuSnapshot -Root $menuStateRoot
-        $report = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $reportJournal -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
+        $reportGuestLog = @{}
+        $report = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $reportJournal -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses) -Log $reportGuestLog)
         $reportDelta = @(Get-MenuSnapshotDelta -Before $reportSnapshotBefore -After (New-MenuSnapshot -Root $reportInstall.Install.InstallRoot))
         $reportStateDelta = @(Get-MenuSnapshotDelta -Before $reportStateBefore -After (New-MenuSnapshot -Root $menuStateRoot))
         $reportMutation = @($reportDelta + $reportStateDelta | Where-Object { [IO.Path]::GetFileName($_) -ne 'args.log' })
@@ -7401,9 +7409,23 @@ function Invoke-MenuTests {
         Assert-Equal 'Missing' $report.Ads.RestorePoint 'The report reported a restore point that does not exist.'
         Assert-Equal -1 $report.Backups.CloneIndex 'The report invented a verified clone record.'
         $reportManagerCalls = @(Get-MenuManagerCalls -Fixture $reportInstall)
+        $reportManagerDelta = @($reportManagerCalls | Select-Object -Skip $reportManagerCallsBefore.Count)
         Assert-Equal ($reportManagerCallsBefore.Count + 2) $reportManagerCalls.Count 'The report issued an unexpected number of manager requests.'
-        foreach ($call in @($reportManagerCalls | Select-Object -Skip $reportManagerCallsBefore.Count)) {
-            Assert-True (($call -match '^(info|setting)\|') -or ($call -match '^adb\|')) "The report issued a mutating manager request: $call"
+        Assert-Equal (@('info|-v|all', 'setting|-v|2|-k|root_permission') -join '|') ($reportManagerDelta -join '|') "The report issued manager requests other than the two read-only ones: $($reportManagerDelta -join '|')"
+        foreach ($call in $reportManagerDelta) {
+            Assert-True ($call -notmatch '(?i)\|-val($|\|)|\|control\||\|clone\||\|delete\||\|uninstall\|') "The report issued a mutating manager request: $call"
+        }
+        $expectedGuestCommands = @(
+            'adb -v 2 -c shell dumpsys package io.github.huskydg.magisk'
+            'adb -v 2 -c shell pidof magiskd'
+            'adb -v 2 -c shell su -c id'
+            'adb -v 2 -c shell pm list packages'
+            'adb -v 2 -c shell su -c "ls /data/adb/modules/vector"'
+        )
+        $actualGuestCommands = @(@($reportGuestLog.Keys) | Sort-Object)
+        Assert-Equal (@($expectedGuestCommands | Sort-Object) -join '|') ($actualGuestCommands -join '|') "The report issued guest requests other than the expected read-only ones: $($actualGuestCommands -join '|')"
+        foreach ($command in @($reportGuestLog.Keys)) {
+            Assert-True ($command -notmatch '(?i)\bsu -c ".*(rm |chmod|chown|echo|mv |cp )|pm uninstall|pm install|pm clear|pm disable|monkey|-val|control ') "The report issued a mutating guest request: $command"
         }
 
         $unrootedReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -NoKitsune -NoRootShell -NoVectorModule -NoPackageList))
@@ -7600,8 +7622,8 @@ function Invoke-MenuTests {
         Assert-Equal $suppressedCampaign $repeatedCampaign 'A repeated RemoveAds did not leave the campaign file suppressed.'
 
         $wrongBoundary = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsOtherInstall.Install.InstallRoot -StateRoot $adsStateRoot
-        Assert-Equal 'CriticalError' $wrongBoundary.Status 'A campaign restore accepted another installation as its boundary.'
-        Assert-True ($wrongBoundary.Message -match '(?i)boundary') "A cross-installation restore did not report a boundary failure: $($wrongBoundary.Message)"
+        Assert-Equal 'CriticalError' $wrongBoundary.Status 'A campaign restore for an installation without its own restore point was accepted.'
+        Assert-True ($wrongBoundary.Message -match '(?i)restore point|boundary') "A restore for an installation without its own restore point did not explain itself: $($wrongBoundary.Message)"
         Assert-Equal $repeatedCampaign ([IO.File]::ReadAllText($adsInstall.CampaignPath)) 'A refused cross-installation restore changed the campaign file.'
         Assert-Equal 'victim fixture' ([IO.File]::ReadAllText($adsVictimPath)) 'A refused cross-installation restore wrote a file outside the boundary.'
 
@@ -7629,6 +7651,42 @@ function Invoke-MenuTests {
         Assert-Equal 'Completed' $plainJournals[0].State 'The advertisement action left its operation journal open.'
         Assert-Equal 'AlreadyApplied' $plainJournals[0].Result.Status 'The advertisement journal did not persist the result.'
 
+        $scopeGlobal = New-MenuInstallFixture -Name 'scope global' -Edition 'Global' -Campaign
+        $scopeChinese = New-MenuInstallFixture -Name 'scope chinese' -Edition 'Chinese' -Campaign
+        $scopeStateRoot = Join-Path $testRoot 'menu ads scope state'
+        $script:MenuFallbackRoots = @($scopeGlobal.Install.InstallRoot, $scopeChinese.Install.InstallRoot)
+        $scopeOriginal = $script:MenuCampaignJson
+
+        $scopeGlobalRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        Assert-Equal 'Success' $scopeGlobalRemove.Status "The Global suppression failed: $($scopeGlobalRemove.Message)"
+        $scopeGlobalReport = Get-ToolkitReport -Install $scopeGlobal.Install -Instance ([pscustomobject]@{ Index = 2 }) -StateRoot $scopeStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
+        Assert-Equal 'Present' $scopeGlobalReport.Ads.RestorePoint 'The report did not find the restore point of the suppressed installation.'
+        $scopeChineseReport = Get-ToolkitReport -Install $scopeChinese.Install -Instance ([pscustomobject]@{ Index = 2 }) -StateRoot $scopeStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
+        Assert-Equal 'Missing' $scopeChineseReport.Ads.RestorePoint 'The report reported another edition restore point for the selected installation.'
+
+        $scopeChineseRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeChinese.Install.InstallRoot -StateRoot $scopeStateRoot
+        Assert-Equal 'Success' $scopeChineseRemove.Status "The Chinese suppression failed: $($scopeChineseRemove.Message)"
+        Assert-Equal 2 @(Get-ChildItem -LiteralPath (Join-Path $scopeStateRoot 'campaigns') -Recurse -Filter 'restore-point.json' -File).Count 'The two editions did not keep one restore point each.'
+
+        $scopeChineseRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeChinese.Install.InstallRoot -StateRoot $scopeStateRoot
+        Assert-Equal 'Success' $scopeChineseRestore.Status "The Chinese restore failed: $($scopeChineseRestore.Message)"
+        Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeChinese.CampaignPath)) 'The Chinese restore did not restore the Chinese campaign file.'
+        Assert-Equal $false (([IO.File]::ReadAllText($scopeGlobal.CampaignPath) | ConvertFrom-Json).campaigns[0].display) 'The Chinese restore restored another edition campaign file.'
+
+        $scopeGlobalRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        Assert-Equal 'Success' $scopeGlobalRestore.Status "The Global restore failed: $($scopeGlobalRestore.Message)"
+        Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeGlobal.CampaignPath)) 'The Global restore did not restore the Global campaign file.'
+        Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeChinese.CampaignPath)) 'The Global restore changed the Chinese campaign file.'
+
+        $scopeRepeat = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        Assert-Equal 'Success' $scopeRepeat.Status "A repeated suppression after a restore was not recoverable: $($scopeRepeat.Message)"
+        Assert-Equal $false (([IO.File]::ReadAllText($scopeGlobal.CampaignPath) | ConvertFrom-Json).campaigns[0].display) 'A repeated suppression did not suppress the campaign file again.'
+        $scopeRepeatRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        Assert-Equal 'Success' $scopeRepeatRestore.Status "A repeated restore was not recoverable: $($scopeRepeatRestore.Message)"
+        Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeGlobal.CampaignPath)) 'A repeated restore did not restore the campaign file again.'
+        Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeChinese.CampaignPath)) 'A repeated restore changed the other edition campaign file.'
+        $script:MenuFallbackRoots = @($adsInstall.Install.InstallRoot, $adsOtherInstall.Install.InstallRoot, $adsPlainInstall.Install.InstallRoot)
+
         $childStateRoot = Join-Path $testRoot 'menu child state'
         $childRun = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @(
             '-NoProfile'
@@ -7647,6 +7705,203 @@ function Invoke-MenuTests {
         $childStateFiles = @((New-MenuSnapshot -Root $childStateRoot).Keys)
         Assert-Equal 1 $childStateFiles.Count "A refused noninteractive action wrote state other than its log: $($childStateFiles -join '|')"
         Assert-True ($childStateFiles[0] -match '\.log$') "A refused noninteractive action wrote state other than its log: $($childStateFiles[0])"
+
+        $flowState = @{ Calls = @(); Confirmed = $null; Packages = @() }
+        function Install-Android12Root {
+            param([object]$Instance, [object]$Manifest, [object]$Journal, [bool]$Interactive = $false, [string]$Confirmation = '', [string]$CacheRoot = '', [scriptblock]$Runner = $null, [scriptblock]$Prompt = $null, [object]$ResumeClone = $null, [switch]$RequireCachedAsset)
+            $flowState.Calls += 'Root12'
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed Android 12 flow.')
+        }
+        function Enable-Android15Root {
+            param([object]$Instance, [object]$Journal, [switch]$Confirmed, [scriptblock]$Runner = $null)
+            $flowState.Calls += 'Root15'
+            $flowState.Confirmed = [bool]$Confirmed
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed Android 15 flow.')
+        }
+        function Set-AppConcealment {
+            param([object]$Instance, [object]$VerifiedClone, [string[]]$Packages, [object]$Journal, [scriptblock]$Runner = $null)
+            $flowState.Calls += 'Conceal'
+            $flowState.Packages = @($Packages)
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed concealment flow.')
+        }
+        function Suppress-MuMuAds {
+            param([string[]]$Paths, [string]$BackupRoot, [object]$Journal)
+            $flowState.Calls += 'RemoveAds'
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed advertisement suppression.')
+        }
+        function Restore-MuMuAds {
+            param([string]$BackupRoot, [string]$AllowedRoot, [object]$Journal)
+            $flowState.Calls += 'Restore'
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed advertisement restore.')
+        }
+
+        $unknownDispatch = Invoke-ToolkitAction -Action 'Bogus' -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $unknownDispatch.Status 'An unknown action was accepted by the dispatcher.'
+        Assert-Equal 'ACTION_UNKNOWN' $unknownDispatch.Data.Code 'An unknown action did not report the unknown action code.'
+        $quitDispatch = Invoke-ToolkitAction -Action 'Q' -StateRoot $menuStateRoot
+        Assert-Equal 'CriticalError' $quitDispatch.Status 'The quit action was dispatched as a toolkit action.'
+        Assert-Equal 0 $flowState.Calls.Count "A refused action called a mutating flow: $($flowState.Calls -join '|')"
+
+        $script:ToolkitActions = @($script:ToolkitActions) + @('FutureAction')
+        Assert-True ($script:ToolkitDispatchedActions -cnotcontains 'FutureAction') 'The dispatcher reports an implementation for an action that has none.'
+        try {
+            $futureDispatch = Invoke-ToolkitAction -Action 'FutureAction' -InstallRoot $reportInstall.Install.InstallRoot -StateRoot $menuStateRoot
+            Assert-Equal 'CriticalError' $futureDispatch.Status 'A catalog action with no implementation was dispatched.'
+            Assert-Equal 'ACTION_UNKNOWN' $futureDispatch.Data.Code 'A catalog action with no implementation did not report the unknown action code.'
+            Assert-Equal 0 $flowState.Calls.Count "A catalog action with no implementation called a mutating flow: $($flowState.Calls -join '|')"
+            $futureMenu = Invoke-MenuAction -Action 'FutureAction' -Runner ({ param($Action) Get-ToolkitResult -Status 'Success' -Message 'injected' }) -StateRoot $menuStateRoot -LogPath $menuLogPath
+            Assert-Equal 'CriticalError' $futureMenu.Status 'A catalog action with no implementation reached the menu.'
+        }
+        finally {
+            $script:ToolkitActions = @(@($script:ToolkitActions) | Where-Object { $_ -cne 'FutureAction' })
+        }
+
+        $controllerStateRoot = Join-Path $testRoot 'menu controller state'
+        $script:MenuFallbackRoots = @($reportInstall.Install.InstallRoot, $android15Install.Install.InstallRoot)
+        $toolbarState = @{ Lines = @() ; Calls = @() ; Questions = @() ; Answers = @('   ', 'Q') }
+        $toolbarWriter = { param($Line) $toolbarState.Lines += [string]$Line }.GetNewClosure()
+        $toolbarPrompt = {
+            param($Question)
+            $toolbarState.Questions += [string]$Question
+            if ($toolbarState.Answers.Count -eq 0) { return '' }
+            return $toolbarState.Answers[0]
+        }.GetNewClosure()
+        $toolbarRunner = { param($Choice) $toolbarState.Calls += $Choice }.GetNewClosure()
+        $toolbarCode = Start-ToolkitController -StateRoot $controllerStateRoot -Reader (New-MenuReader -Answers @('   ', 'Q')) -Writer $toolbarWriter -Prompt $toolbarPrompt -ActionRunner $toolbarRunner
+        Assert-Equal 0 $toolbarCode 'The menu did not exit normally after a blank answer and Q.'
+        Assert-Equal 0 $toolbarState.Calls.Count 'A blank answer or Q ran an action.'
+        Assert-True ((@($toolbarState.Lines) -join "`n") -match 'MuMu Root Hide Toolkit') 'The interactive toolbar was not printed.'
+        foreach ($catalogName in @($catalogNames)) {
+            Assert-True ((@($toolbarState.Lines) -join "`n") -match ('\b' + [regex]::Escape($catalogName) + '\b')) "The toolbar does not list an action: $catalogName"
+        }
+        $toolbarText = @($toolbarState.Lines) -join "`n"
+        Assert-True ($toolbarText -match '(?i)verified clone') 'The toolbar does not state the verified clone requirement.'
+        Assert-True ($toolbarText -match '(?i)RemoveAds and Restore') 'The toolbar does not name the advertisement actions.'
+        Assert-True ($toolbarText -match '(?i)campaign files inside the selected installation') 'The toolbar does not scope the advertisement actions to the selected installation.'
+        Assert-True ($toolbarText -match '(?i)keeps an exact backup') 'The toolbar does not state the advertisement backup boundary.'
+        Assert-True ($toolbarText -notmatch '(?i)Every other action acts on a verified clone only') 'The toolbar claims that every other action acts on a verified clone only.'
+        Assert-True ($toolbarText -match '(?i)Root12, Root15, and Conceal change only a verified clone') 'The toolbar does not name the clone-only actions.'
+
+        $skipState = @{ Lines = @() }
+        $skipCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) $skipState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner ({ param($Choice) }).GetNewClosure()
+        Assert-Equal 0 $skipCode 'The menu did not exit normally with a skipped toolbar.'
+        Assert-Equal 0 $skipState.Lines.Count 'A skipped toolbar printed output.'
+
+        $loopControllerState = @{ Lines = @(); Calls = @() }
+        $criticalControllerRunner = {
+            param($Choice)
+            $loopControllerState.Calls += $Choice
+            throw 'injected controller failure token=controller_runner_secret'
+        }.GetNewClosure()
+        $criticalControllerCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Root12', 'Q')) -Writer ({ param($Line) $loopControllerState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner $criticalControllerRunner
+        Assert-Equal 1 $criticalControllerCode 'A critical error did not return a nonzero controller exit code.'
+        Assert-Equal 1 $loopControllerState.Calls.Count 'A critical error ran the next action.'
+        Assert-True ((@($loopControllerState.Lines) -join "`n") -notmatch 'controller_runner_secret') 'The controller printed a raw secret.'
+
+        $recoverableControllerState = @{ Lines = @(); Calls = @() }
+        $recoverableControllerCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Verify', 'Q')) -Writer ({ param($Line) $recoverableControllerState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner ({
+                param($Choice)
+                $recoverableControllerState.Calls += $Choice
+                return (Get-ToolkitResult -Status 'RecoverableError' -Message 'injected recoverable failure')
+            }).GetNewClosure()
+        Assert-Equal 2 $recoverableControllerCode 'A recoverable error did not return controller exit code 2.'
+        Assert-Equal 1 $recoverableControllerState.Calls.Count 'A recoverable error did not return to the menu.'
+
+        $confirmState = @{ Questions = @(); Answers = @('CONFIRM') }
+        $confirmPrompt = {
+            param($Question)
+            $confirmState.Questions += [string]$Question
+            if ($confirmState.Answers.Count -eq 0) { return '' }
+            $answer = $confirmState.Answers[0]
+            $confirmState.Answers = @(@($confirmState.Answers) | Select-Object -Skip 1)
+            return $answer
+        }.GetNewClosure()
+        $root15Controller = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -Reader (New-MenuReader -Answers @('Root15', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $confirmPrompt
+        Assert-Equal 0 $root15Controller 'The menu did not exit normally after the Android 15 action.'
+        Assert-True ((@($confirmState.Questions) -join '|') -match 'CONFIRM') 'The interactive Android 15 action did not ask for an explicit confirmation.'
+        Assert-Equal 1 @($flowState.Calls | Where-Object { $_ -ceq 'Root15' }).Count 'The interactive Android 15 action did not reach the flow exactly once.'
+        Assert-Equal $true $flowState.Confirmed 'The interactive Android 15 action did not pass the explicit confirmation.'
+
+        $refuseState = @{ Questions = @(); Answers = @('no') }
+        $refusePrompt = {
+            param($Question)
+            $refuseState.Questions += [string]$Question
+            if ($refuseState.Answers.Count -eq 0) { return '' }
+            $answer = $refuseState.Answers[0]
+            $refuseState.Answers = @(@($refuseState.Answers) | Select-Object -Skip 1)
+            return $answer
+        }.GetNewClosure()
+        $flowState.Confirmed = $null
+        $flowState.Calls = @()
+        $root15Refused = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -Reader (New-MenuReader -Answers @('Root15', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $refusePrompt
+        Assert-Equal 1 $root15Refused 'A refused Android 15 action did not keep its failure exit code through the menu.'
+        Assert-True ((@($refuseState.Questions) -join '|') -match 'CONFIRM') 'The refused Android 15 action did not ask for a confirmation.'
+        Assert-Equal $null $flowState.Confirmed 'A refused Android 15 action reached the flow.'
+        Assert-Equal 0 @($flowState.Calls | Where-Object { $_ -ceq 'Root15' }).Count 'A refused Android 15 action reached the flow.'
+
+        $packageState = @{ Questions = @(); Answers = @(' jp.pokemon.pokemontcgp , com.example.other ') }
+        $packagePrompt = {
+            param($Question)
+            $packageState.Questions += [string]$Question
+            if ($packageState.Answers.Count -eq 0) { return '' }
+            $answer = $packageState.Answers[0]
+            $packageState.Answers = @(@($packageState.Answers) | Select-Object -Skip 1)
+            return $answer
+        }.GetNewClosure()
+        $flowState.Packages = @()
+        $concealController = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $packagePrompt
+        Assert-Equal 0 $concealController 'The menu did not exit normally after the concealment action.'
+        Assert-True ((@($packageState.Questions) -join '|') -match '(?i)package') 'The interactive concealment action did not ask for the selected applications.'
+        Assert-Equal (@('jp.pokemon.pokemontcgp', 'com.example.other') -join '|') ($flowState.Packages -join '|') 'The interactive concealment action did not pass the trimmed package selection.'
+
+        $standaloneRoot = Join-Path $testRoot 'standalone verification'
+        $standaloneShell = Join-Path $standaloneRoot 'shell'
+        [void][IO.Directory]::CreateDirectory($standaloneShell)
+        $standaloneManager = Join-Path $standaloneShell 'MuMuManager.exe'
+        [IO.File]::WriteAllText($standaloneManager, 'standalone manager fixture')
+        $standaloneScript = @'
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+. '__COMMON__'
+. '__VERIFICATION__'
+$install = [pscustomobject]@{
+    Edition = 'Global'
+    InstallRoot = '__ROOT__'
+    VmsPath = '__VMS__'
+    ManagerPath = '__MANAGER__'
+    Source = 'Fallback'
+}
+$report = Get-ToolkitReport -Install $install -Instance $null -Journal $null -StateRoot '__STATE__'
+if ($report.Mutated -ne $false) { throw 'The report claims a mutation.' }
+if (@($report.Install.Edition) -cne 'Global') { throw 'The report lost the installation.' }
+$guest = Get-ToolkitGuestState -ManagerPath '__MANAGER__' -InstanceIndex 2 -AndroidVersion '12.0'
+if ([string]::IsNullOrWhiteSpace([string]$guest.Failure)) { throw 'The guest state reported no reason for being unread.' }
+if ($guest.HmaInstalled -ne $false) { throw 'The guest state invented an HMA package state.' }
+$restorePoints = @(Get-ToolkitCampaignRestorePoints -StateRoot '__STATE__' -Install $install)
+if ($restorePoints.Count -ne 0) { throw 'An empty state root reported a restore point.' }
+$unassigned = Get-ToolkitSharedValue -Name 'ConcealmentHmaPackage' -Default 'absent'
+if ($unassigned -cne 'absent') { throw 'An unloaded module constant did not fall back to the default.' }
+$scopeKey = Get-ToolkitCampaignScopeKey -Install $install
+if ($scopeKey -notmatch '^[0-9a-f]{16}$') { throw 'The campaign scope key is invalid.' }
+Write-Output ('FAILURES=' + @($report.Failures).Count)
+Write-Output 'STANDALONE_OK'
+'@
+        $standaloneScript = $standaloneScript.Replace('__COMMON__', $commonPath).Replace('__VERIFICATION__', $verificationScriptPath).Replace('__ROOT__', $standaloneRoot).Replace('__VMS__', (Join-Path $standaloneRoot 'vms')).Replace('__MANAGER__', $standaloneManager).Replace('__STATE__', (Join-Path $testRoot 'standalone state'))
+        $standaloneRun = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-Command', $standaloneScript)
+        Assert-Equal 0 $standaloneRun.ExitCode "The standalone verification run failed: $($standaloneRun.Text)"
+        Assert-True ($standaloneRun.Text -match 'STANDALONE_OK') "The standalone verification run did not finish: $($standaloneRun.Text)"
+        Assert-True ($standaloneRun.Text -notmatch 'not recognized|PropertyNotFound|is not defined|You cannot call a method on a null') "The standalone verification run dereferenced an unloaded module: $($standaloneRun.Text)"
+
+        $launcherScriptedFixture = Join-Path $testRoot 'launcher scripted.cmd'
+        [IO.File]::WriteAllText($launcherScriptedFixture, ('@echo off' + "`r`n" + 'set LOCALAPPDATA=' + "`r`n" + 'call "' + $launcherPath + '" -Action Bogus -NonInteractive < nul' + "`r`n"))
+        $launcherInteractiveFixture = Join-Path $testRoot 'launcher interactive.cmd'
+        [IO.File]::WriteAllText($launcherInteractiveFixture, ('@echo off' + "`r`n" + 'set LOCALAPPDATA=' + "`r`n" + 'call "' + $launcherPath + '" < nul' + "`r`n"))
+        $cmdPath = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        $launcherScripted = Invoke-CheckedProcess -FilePath $cmdPath -ArgumentList @('/c', $launcherScriptedFixture)
+        Assert-True ($launcherScripted.Text -notmatch 'Press any key') "A scripted launcher invocation paused for a key press: $($launcherScripted.Text)"
+        Assert-Equal 1 $launcherScripted.ExitCode "A scripted launcher invocation did not propagate the controller exit code: $($launcherScripted.Text)"
+        $launcherInteractive = Invoke-CheckedProcess -FilePath $cmdPath -ArgumentList @('/c', $launcherInteractiveFixture)
+        Assert-True ($launcherInteractive.Text -match 'Press any key') "An interactive launcher failure did not pause for a key press: $($launcherInteractive.Text)"
     }
     finally {
         $script:MenuFallbackRoots = @()

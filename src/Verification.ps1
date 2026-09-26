@@ -285,6 +285,94 @@ function Get-ToolkitVerifiedClone {
     return Get-ToolkitResult -Status 'CriticalError' -Message "No verified instance clone record for the instance at index $Index was found in the operation journal. The selected instance is never changed without one, so the change was refused. Complete the matching Android 12 or Android 15 root action first." -Data (@{ Code = 'CLONE_RECORD_MISSING' })
 }
 
+function Get-ToolkitSharedValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Default = ''
+    )
+
+    $variable = Get-Variable -Name $Name -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $variable) {
+        return $Default
+    }
+    $value = $variable.Value
+    if ($null -eq $value -or ($value -isnot [string] -and $value -isnot [int] -and $value -isnot [long])) {
+        return $Default
+    }
+    return [string]$value
+}
+
+function Test-ToolkitCommandAvailable {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    return ($null -ne (Get-Command $Name -ErrorAction SilentlyContinue))
+}
+
+function Get-ToolkitCampaignScopeKey {
+    param([object]$Install)
+
+    $installRoot = $null
+    if ($null -ne $Install -and $null -ne $Install.PSObject) {
+        $property = $Install.PSObject.Properties['InstallRoot']
+        if ($null -ne $property -and $property.Value -is [string]) {
+            $installRoot = ConvertTo-ToolkitFullPath -Path $property.Value
+        }
+    }
+    if ($null -eq $installRoot) {
+        return ''
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($installRoot.ToUpperInvariant())
+        $hash = $sha.ComputeHash($bytes)
+    }
+    finally {
+        $sha.Dispose()
+    }
+    return (($hash | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 16)
+}
+
+function Get-ToolkitCampaignRestorePoints {
+    param(
+        [string]$StateRoot,
+        [object]$Install
+    )
+
+    $records = @()
+    $manifestName = Get-ToolkitSharedValue -Name 'ToolkitCampaignRestorePointFile' -Default 'restore-point.json'
+    $scope = Get-ToolkitCampaignScopeKey -Install $Install
+    if ([string]::IsNullOrWhiteSpace($StateRoot) -or [string]::IsNullOrWhiteSpace($scope)) {
+        return $records
+    }
+    $parent = [IO.Path]::Combine([IO.Path]::Combine($StateRoot, 'campaigns'), $scope)
+    if (-not [IO.Directory]::Exists($parent)) {
+        return $records
+    }
+    $roots = @()
+    foreach ($directory in @([IO.Directory]::GetDirectories($parent))) {
+        $manifestPath = [IO.Path]::Combine($directory, $manifestName)
+        if (-not [IO.File]::Exists($manifestPath)) {
+            continue
+        }
+        $written = [DateTime]::MinValue
+        try {
+            $written = [IO.File]::GetLastWriteTimeUtc($manifestPath)
+        }
+        catch {
+            $written = [DateTime]::MinValue
+        }
+        $roots += [pscustomobject]@{
+            BackupRoot = $directory
+            ManifestPath = $manifestPath
+            Written = $written
+        }
+    }
+    return @($roots | Sort-Object -Property Written -Descending)
+}
+
 function Get-ToolkitVirtualizationState {
     try {
         $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
@@ -331,6 +419,10 @@ function Get-ToolkitGuestState {
 
     $checks = $null
     if ($AndroidVersion -ceq '12.0') {
+        if (-not (Test-ToolkitCommandAvailable -Name 'Test-Android12Root')) {
+            $guest['Failure'] = 'The Android 12 verification command is not loaded, so the guest root state is unread.'
+            return $guest
+        }
         $checks = Test-Android12Root -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
         if ($null -ne $checks -and $null -ne $checks.Data) {
             $guest['Kitsune'] = [string](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('VersionName'))
@@ -338,6 +430,10 @@ function Get-ToolkitGuestState {
         }
     }
     elseif ($AndroidVersion -ceq '15.0') {
+        if (-not (Test-ToolkitCommandAvailable -Name 'Test-Android15Root')) {
+            $guest['Failure'] = 'The Android 15 verification command is not loaded, so the guest root state is unread.'
+            return $guest
+        }
         $checks = Test-Android15Root -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
         if ($null -ne $checks -and $null -ne $checks.Data) {
             $guest['RootPermission'] = [bool](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('RootPermission'))
@@ -367,16 +463,26 @@ function Get-ToolkitGuestState {
         }
     }
 
-    $packages = Get-ConcealmentPackageList -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
-    if ([string]$packages.Status -ceq 'Success') {
-        $guest['HmaInstalled'] = @($packages.Data) -ccontains [string]$script:ConcealmentHmaPackage
+    $packages = $null
+    if (Test-ToolkitCommandAvailable -Name 'Get-ConcealmentPackageList') {
+        $packages = Get-ConcealmentPackageList -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
     }
-    elseif ([string]::IsNullOrWhiteSpace([string]$guest['Failure'])) {
-        $guest['Failure'] = [string]$packages.Message
+    if ($null -eq $packages) {
+        $guest['Failure'] = $guest['Failure'] + ' The concealment package list command is not loaded, so the HMA package state is unread.'
     }
-    $module = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell su -c "ls ' + [string]$script:ConcealmentVectorModulePath + '"') -Runner $Runner
-    if ($null -ne $module -and $module.ExitCode -eq 0) {
-        $guest['VectorModuleInstalled'] = $true
+    elseif ([string]$packages.Status -ceq 'Success') {
+        $hmaPackage = Get-ToolkitSharedValue -Name 'ConcealmentHmaPackage'
+        $guest['HmaInstalled'] = @($packages.Data) -ccontains $hmaPackage
+    }
+    else {
+        $guest['Failure'] = $guest['Failure'] + ' ' + [string]$packages.Message
+    }
+    $modulePath = Get-ToolkitSharedValue -Name 'ConcealmentVectorModulePath'
+    if (-not [string]::IsNullOrWhiteSpace($modulePath) -and (Test-ToolkitCommandAvailable -Name 'Invoke-ToolkitManagerAdb')) {
+        $module = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell su -c "ls ' + $modulePath + '"') -Runner $Runner
+        if ($null -ne $module -and $module.ExitCode -eq 0) {
+            $guest['VectorModuleInstalled'] = $true
+        }
     }
     return $guest
 }
@@ -480,23 +586,28 @@ function Get-ToolkitReport {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($managerPath)) {
-        $discovered = @(Get-MuMuInstances -Install $Install -ManagerPath $managerPath)
-        if ($discovered.Count -eq 1 -and $null -ne $discovered[0].PSObject.Properties['Status']) {
-            $failures += "The instance list could not be read. $($discovered[0].Message)"
+        if (-not (Test-ToolkitCommandAvailable -Name 'Get-MuMuInstances')) {
+            $failures += 'The instance discovery command is not loaded, so no instance state was read.'
         }
         else {
-            $summaries = @()
-            foreach ($record in $discovered) {
-                $summaries += [ordered]@{
-                    Index = [int](Get-ToolkitRecordValue -Record $record -PropertyNames @('Index'))
-                    Name = [string](Get-ToolkitRecordValue -Record $record -PropertyNames @('Name'))
-                    AndroidVersion = [string](Get-ToolkitRecordValue -Record $record -PropertyNames @('AndroidVersion'))
-                    Running = Get-ToolkitRecordValue -Record $record -PropertyNames @('Running')
-                    RootSetting = Get-ToolkitRecordValue -Record $record -PropertyNames @('RootSetting')
-                    Eligible = Get-ToolkitRecordValue -Record $record -PropertyNames @('Eligible')
-                }
+            $discovered = @(Get-MuMuInstances -Install $Install -ManagerPath $managerPath)
+            if ($discovered.Count -eq 1 -and $null -ne $discovered[0].PSObject.Properties['Status']) {
+                $failures += "The instance list could not be read. $($discovered[0].Message)"
             }
-            $report['Instances'] = $summaries
+            else {
+                $summaries = @()
+                foreach ($record in $discovered) {
+                    $summaries += [ordered]@{
+                        Index = [int](Get-ToolkitRecordValue -Record $record -PropertyNames @('Index'))
+                        Name = [string](Get-ToolkitRecordValue -Record $record -PropertyNames @('Name'))
+                        AndroidVersion = [string](Get-ToolkitRecordValue -Record $record -PropertyNames @('AndroidVersion'))
+                        Running = Get-ToolkitRecordValue -Record $record -PropertyNames @('Running')
+                        RootSetting = Get-ToolkitRecordValue -Record $record -PropertyNames @('RootSetting')
+                        Eligible = Get-ToolkitRecordValue -Record $record -PropertyNames @('Eligible')
+                    }
+                }
+                $report['Instances'] = $summaries
+            }
         }
     }
 
@@ -529,16 +640,20 @@ function Get-ToolkitReport {
 
     $report['Virtualization'] = Get-ToolkitVirtualizationState
 
-    $campaign = Get-MuMuCampaignPaths -Install $Install
-    if ([string]$campaign.Status -ceq 'Success') {
-        $report['Ads']['CampaignFiles'] = @($campaign.Data)
+    if (-not (Test-ToolkitCommandAvailable -Name 'Get-MuMuCampaignPaths')) {
+        $failures += 'The advertisement discovery command is not loaded, so no advertisement state was read.'
     }
     else {
-        $failures += [string]$campaign.Message
+        $campaign = Get-MuMuCampaignPaths -Install $Install
+        if ([string]$campaign.Status -ceq 'Success') {
+            $report['Ads']['CampaignFiles'] = @($campaign.Data)
+        }
+        else {
+            $failures += [string]$campaign.Message
+        }
     }
     if (-not [string]::IsNullOrWhiteSpace($StateRoot)) {
-        $restorePointPath = [IO.Path]::Combine($StateRoot, 'campaigns', [string]$script:ToolkitCampaignRestorePointFile)
-        $report['Ads']['RestorePoint'] = if ([IO.File]::Exists($restorePointPath)) { 'Present' } else { 'Missing' }
+        $report['Ads']['RestorePoint'] = if (@(Get-ToolkitCampaignRestorePoints -StateRoot $StateRoot -Install $Install).Count -gt 0) { 'Present' } else { 'Missing' }
     }
     if ($null -eq $installRoot) {
         $failures += 'The installation root could not be resolved.'

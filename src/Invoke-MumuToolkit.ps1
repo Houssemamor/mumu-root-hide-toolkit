@@ -11,6 +11,7 @@ param(
 )
 
 $script:ToolkitActions = @('Detect', 'Verify', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+$script:ToolkitDispatchedActions = @('Detect', 'Verify', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
 $script:ToolkitActionDescriptions = @{
     Detect    = 'Discover MuMu installations and instances and report their state.'
     Verify    = 'Collect the read-only status report for the selected instance.'
@@ -83,6 +84,18 @@ function Get-ToolkitDiscoverySources {
         ProcessSnapshot = $processSnapshot
         FallbackRoots = @()
     }
+}
+
+function Get-ToolkitActionRefusal {
+    param([string]$Action)
+
+    if ($script:ToolkitActions -cnotcontains $Action) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The requested action is not a toolkit action: $Action" -Data (@{ Code = 'ACTION_UNKNOWN'; Requested = Protect-ToolkitText $Action })
+    }
+    if ($script:ToolkitDispatchedActions -cnotcontains $Action) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The requested action has no implementation: $Action" -Data (@{ Code = 'ACTION_UNKNOWN'; Requested = Protect-ToolkitText $Action })
+    }
+    return $null
 }
 
 function Get-ToolkitStatePath {
@@ -241,9 +254,13 @@ function Close-ToolkitActionJournal {
 }
 
 function New-ToolkitCampaignRoot {
-    param([string]$StateRoot)
+    param(
+        [string]$StateRoot,
+        [object]$Install
+    )
 
-    $parent = [IO.Path]::Combine($StateRoot, 'campaigns')
+    $scope = Get-ToolkitCampaignScopeKey -Install $Install
+    $parent = [IO.Path]::Combine([IO.Path]::Combine($StateRoot, 'campaigns'), $scope)
     [void][IO.Directory]::CreateDirectory($parent)
     $name = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
     $root = [IO.Path]::Combine($parent, $name)
@@ -252,19 +269,12 @@ function New-ToolkitCampaignRoot {
 }
 
 function Get-ToolkitCampaignBackupRoots {
-    param([string]$StateRoot)
+    param(
+        [string]$StateRoot,
+        [object]$Install
+    )
 
-    $parent = [IO.Path]::Combine($StateRoot, 'campaigns')
-    if (-not [IO.Directory]::Exists($parent)) {
-        return @()
-    }
-    $roots = @()
-    foreach ($directory in @([IO.Directory]::GetDirectories($parent))) {
-        if ([IO.File]::Exists([IO.Path]::Combine($directory, [string]$script:ToolkitCampaignRestorePointFile))) {
-            $roots += $directory
-        }
-    }
-    return @($roots | Sort-Object -Descending)
+    return @(Get-ToolkitCampaignRestorePoints -StateRoot $StateRoot -Install $Install | ForEach-Object { [string]$_.BackupRoot })
 }
 
 function Invoke-ToolkitAdvertisements {
@@ -284,7 +294,7 @@ function Invoke-ToolkitAdvertisements {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The selected installation has no campaign root, so the advertisement restore boundary cannot be resolved and no advertisement file is changed.' -Data (@{ Code = 'CAMPAIGN_BOUNDARY_REQUIRED' })
     }
 
-    $existing = @(Get-ToolkitCampaignBackupRoots -StateRoot $StateRoot)
+    $existing = @(Get-ToolkitCampaignBackupRoots -StateRoot $StateRoot -Install $Install)
     if ($existing.Count -gt 0) {
         $journal = New-ToolkitActionJournal -StateRoot $StateRoot -Operation 'RestoreAds' -Instance $Install
         $restored = Restore-MuMuAds -BackupRoot $existing[0] -AllowedRoot $boundary -Journal $journal
@@ -294,10 +304,10 @@ function Invoke-ToolkitAdvertisements {
         }
     }
     elseif ($Restore) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The toolkit campaign backup root holds no restore point, so no advertisement file is changed.' -Data (@{ Code = 'CAMPAIGN_RESTORE_POINT_MISSING' })
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The toolkit holds no advertisement restore point for the selected installation, so no advertisement file is changed.' -Data (@{ Code = 'CAMPAIGN_RESTORE_POINT_MISSING' })
     }
 
-    $backupRoot = New-ToolkitCampaignRoot -StateRoot $StateRoot
+    $backupRoot = New-ToolkitCampaignRoot -StateRoot $StateRoot -Install $Install
     $journal = New-ToolkitActionJournal -StateRoot $StateRoot -Operation 'RemoveAds' -Instance $Install
     $suppressed = Suppress-MuMuAds -Paths @($campaign.Data) -BackupRoot $backupRoot -Journal $journal
     return (Close-ToolkitActionJournal -Journal $journal -Result $suppressed)
@@ -316,8 +326,9 @@ function Invoke-ToolkitAction {
         [scriptblock]$Runner = $null
     )
 
-    if ($script:ToolkitActions -cnotcontains $Action) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message "The requested action is not a toolkit action: $Action" -Data (@{ Code = 'ACTION_UNKNOWN'; Requested = Protect-ToolkitText $Action })
+    $refusal = Get-ToolkitActionRefusal -Action $Action
+    if ($null -ne $refusal) {
+        return $refusal
     }
 
     $statePath = Get-ToolkitStatePath -Requested $StateRoot -Create
@@ -383,16 +394,20 @@ function Invoke-ToolkitAction {
         return (Close-ToolkitActionJournal -Journal $journal -Result $result)
     }
 
-    if (@($Packages).Count -eq 0) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'No application package was selected, so the concealment template was not applied. Pass -Packages with the exact package names to change.' -Data (@{ Code = 'PACKAGES_REQUIRED' })
+    if ($Action -ceq 'Conceal') {
+        if (@($Packages).Count -eq 0) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'No application package was selected, so the concealment template was not applied. Pass -Packages with the exact package names to change.' -Data (@{ Code = 'PACKAGES_REQUIRED' })
+        }
+        $clone = Get-ToolkitVerifiedClone -StateRoot $statePath -Install $install.Data -Index $selectedIndex
+        if ($clone.Status -ne 'Success') {
+            return $clone
+        }
+        $journal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'Conceal' -Instance $selected
+        $result = Set-AppConcealment -Instance $selected -VerifiedClone $clone.Data -Packages $Packages -Journal $journal
+        return (Close-ToolkitActionJournal -Journal $journal -Result $result)
     }
-    $clone = Get-ToolkitVerifiedClone -StateRoot $statePath -Install $install.Data -Index $selectedIndex
-    if ($clone.Status -ne 'Success') {
-        return $clone
-    }
-    $journal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'Conceal' -Instance $selected
-    $result = Set-AppConcealment -Instance $selected -VerifiedClone $clone.Data -Packages $Packages -Journal $journal
-    return (Close-ToolkitActionJournal -Journal $journal -Result $result)
+
+    return Get-ToolkitResult -Status 'CriticalError' -Message "The requested action has no implementation: $Action" -Data (@{ Code = 'ACTION_UNKNOWN'; Requested = Protect-ToolkitText $Action })
 }
 
 function Format-ToolkitResult {
@@ -435,8 +450,9 @@ function Invoke-MenuAction {
     )
 
     $result = $null
-    if ($script:ToolkitActions -cnotcontains $Action) {
-        $result = Get-ToolkitResult -Status 'CriticalError' -Message "The requested action is not a toolkit action: $Action" -Data (@{ Code = 'ACTION_UNKNOWN'; Requested = Protect-ToolkitText $Action })
+    $refusal = Get-ToolkitActionRefusal -Action $Action
+    if ($null -ne $refusal) {
+        $result = $refusal
     }
     else {
         try {
@@ -567,7 +583,11 @@ function Start-ToolkitController {
         [string[]]$Packages = @(),
         [switch]$Confirmed,
         [switch]$NonInteractive,
-        [switch]$SkipToolbar
+        [switch]$SkipToolbar,
+        [scriptblock]$Reader = $null,
+        [scriptblock]$Writer = $null,
+        [scriptblock]$Prompt = $null,
+        [scriptblock]$ActionRunner = $null
     )
 
     $statePath = $null
@@ -582,9 +602,12 @@ function Start-ToolkitController {
         return 1
     }
     $logPath = [IO.Path]::Combine($statePath, 'logs', 'mumu-root-hide-toolkit.log')
+    $write = $Writer
+    if ($null -eq $write) {
+        $write = { param($Line) Write-Host $Line }
+    }
 
     if ($NonInteractive) {
-        $write = { param($Line) [Console]::Out.WriteLine([string]$Line) }
         if ([string]::IsNullOrWhiteSpace($Action)) {
             $result = Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive run requires -Action. Use -Action Detect for a read-only run.' -Data (@{ Code = 'ACTION_REQUIRED' })
             foreach ($line in @(Format-ToolkitResult -Result $result)) {
@@ -599,29 +622,41 @@ function Start-ToolkitController {
         return (Get-ToolkitExitCode $result)
     }
 
+    $read = $Reader
+    if ($null -eq $read) {
+        $read = { param() Read-Host 'Select an action' }
+    }
+    $ask = $Prompt
+    if ($null -eq $ask) {
+        $ask = { param($Question) [string](Read-Host $Question) }
+    }
+    $runner = $ActionRunner
+    if ($null -eq $runner) {
+        $runner = {
+            param($Choice)
+
+            $selectedPackages = @($Packages)
+            if ($Choice -ceq 'Conceal' -and $selectedPackages.Count -eq 0) {
+                $answer = [string](& $ask 'Comma-separated application package names for the Root template')
+                $selectedPackages = @($answer -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+            $confirmed = $Confirmed
+            if ($Choice -ceq 'Root15' -and -not $confirmed) {
+                $confirmed = ([string](& $ask 'Type CONFIRM to enable the built-in Android 15 root') -ceq 'CONFIRM')
+            }
+            return (Invoke-ToolkitAction -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $selectedPackages -Confirmed:$confirmed -Prompt $ask)
+        }.GetNewClosure()
+    }
+
     if (-not $SkipToolbar) {
-        Write-Host 'MuMu Root Hide Toolkit'
-        Write-Host 'Detect and Verify change nothing. Every other action acts on a verified clone only.'
+        & $write 'MuMu Root Hide Toolkit'
+        & $write 'Detect and Verify change nothing. Root12, Root15, and Conceal change only a verified clone of the selected instance.'
+        & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
         foreach ($entry in @(Get-ToolkitActionCatalog)) {
-            Write-Host ('  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)
+            & $write ('  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)
         }
     }
-    $prompt = { param($Question) [string](Read-Host $Question) }.GetNewClosure()
-    $runner = {
-        param($Choice)
-
-        $selectedPackages = @($Packages)
-        if ($Choice -ceq 'Conceal' -and $selectedPackages.Count -eq 0) {
-            $answer = [string](& $prompt 'Comma-separated application package names for the Root template')
-            $selectedPackages = @($answer -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        }
-        $confirmed = $Confirmed
-        if ($Choice -ceq 'Root15' -and -not $confirmed) {
-            $confirmed = ([string](& $prompt 'Type CONFIRM to enable the built-in Android 15 root') -ceq 'CONFIRM')
-        }
-        return (Invoke-ToolkitAction -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -StateRoot $statePath -Packages $selectedPackages -Confirmed:$confirmed -Prompt $prompt)
-    }.GetNewClosure()
-    return (Invoke-MenuLoop -Reader ({ param() Read-Host 'Select an action' }).GetNewClosure() -Runner $runner -StateRoot $statePath -LogPath $logPath)
+    return (Invoke-MenuLoop -Reader $read -Writer $write -Runner $runner -StateRoot $statePath -LogPath $logPath)
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
