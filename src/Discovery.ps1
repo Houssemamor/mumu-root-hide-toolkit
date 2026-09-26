@@ -254,6 +254,27 @@ function Get-ToolkitMetadataPath {
     return ConvertTo-ToolkitFullPath -Path $Path
 }
 
+function Test-ToolkitVmsRootHasInstances {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $false
+    }
+    $childDirectories = @()
+    try {
+        $childDirectories = @([IO.Directory]::GetDirectories($Path))
+    }
+    catch {
+        return $false
+    }
+    foreach ($childDirectory in $childDirectories) {
+        if ([IO.Path]::GetFileName($childDirectory) -notmatch '(?i)(^|-)base$') {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Get-ToolkitVmsPath {
     param(
         [string]$InstallRoot,
@@ -322,11 +343,16 @@ function Get-ToolkitVmsPath {
         }
     }
 
-    if ($inferredPaths.Count -gt 1) {
+    $candidates = @($inferredPaths.Values)
+    $instanceRoots = @($candidates | Where-Object { Test-ToolkitVmsRootHasInstances -Path $_ })
+    if ($instanceRoots.Count -eq 1) {
+        return $instanceRoots[0]
+    }
+    if ($instanceRoots.Count -gt 1 -or $candidates.Count -gt 1) {
         throw 'Multiple VMS paths were inferred.'
     }
-    if ($inferredPaths.Count -eq 1) {
-        return @($inferredPaths.Values)[0]
+    if ($candidates.Count -eq 1) {
+        return $candidates[0]
     }
     return $null
 }

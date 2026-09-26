@@ -908,6 +908,18 @@ function Invoke-JournalTests {
     Assert-Throws { Invoke-WithRetry -Operation { 1 } -Attempts 1 -DelaySeconds 61 } 'Excessive retry delay was accepted.'
 }
 
+function New-DiscoveryVmsChildren {
+    param(
+        [string]$VmsPath,
+        [string[]]$ChildNames
+    )
+
+    [void][IO.Directory]::CreateDirectory($VmsPath)
+    foreach ($childName in $ChildNames) {
+        [void][IO.Directory]::CreateDirectory((Join-Path $VmsPath $childName))
+    }
+}
+
 function New-DiscoveryInstallFixture {
     param(
         [string]$InstallRoot,
@@ -1511,6 +1523,62 @@ function Invoke-DiscoveryTests {
     }
     $nonStringVmsResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\LiveNonStringVmsPath') -ProcessSnapshot @() -FallbackRoots @()
     Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $nonStringVmsResult) 'A non-string registry VMS value was accepted.'
+
+    # A real Global layout keeps base-only staging roots next to the root that holds the instances.
+    $layoutAppData = $env:APPDATA
+    $env:APPDATA = Join-Path $fixtureProfileRoot 'empty'
+    try {
+        $layoutRoot = Join-Path $discoveryRoot 'Real Layout\MuMuPlayer'
+        $layoutVms = Join-Path $layoutRoot 'vms'
+        $layoutFixture = New-DiscoveryInstallFixture -InstallRoot $layoutRoot -VmsPath $layoutVms
+        New-DiscoveryVmsChildren -VmsPath $layoutVms -ChildNames @(
+            'MuMuPlayerGlobal-12.0-0',
+            'MuMuPlayerGlobal-15.0-1',
+            'MuMuPlayerGlobal-15.0-2',
+            'MuMuPlayerGlobal-12.0-base'
+        )
+        New-DiscoveryVmsChildren -VmsPath (Join-Path $layoutRoot 'nx_device\12.0\vms') -ChildNames @('MuMuPlayerGlobal-12.0-base')
+        New-DiscoveryVmsChildren -VmsPath (Join-Path $layoutRoot 'nx_device\15.0\vms') -ChildNames @('MuMuPlayerGlobal-15.0-base')
+        $script:discoveryRegistryEntries = @($script:discoveryRegistryEntries) + @(
+            [pscustomobject]@{
+                Root = 'FixtureRegistry:\RealLayout'
+                DisplayName = 'MuMuPlayer'
+                Publisher = 'NetEase'
+                InstallLocation = $layoutFixture.InstallRoot
+                Edition = 'Chinese'
+            }
+        )
+        $layoutResult = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots @('FixtureRegistry:\RealLayout') -ProcessSnapshot @() -FallbackRoots @())
+        $layoutStatus = Get-DiscoveryResultStatus $layoutResult[0]
+        $layoutMessage = ''
+        if ($layoutStatus -eq 'CriticalError') {
+            $layoutMessage = ': ' + $layoutResult[0].Message
+        }
+        Assert-Equal 1 $layoutResult.Count "The real Global layout was not discovered$layoutMessage"
+        Assert-True ($layoutStatus -ne 'CriticalError') "The real Global layout was rejected$layoutMessage"
+        Assert-Equal $layoutVms $layoutResult[0].VmsPath "The real Global layout did not select the VMS root that holds the instances$layoutMessage"
+
+        $twoRealRootsFixture = New-DiscoveryInstallFixture -InstallRoot (Join-Path $discoveryRoot 'Two Real Roots\MuMu Global') -VmsPath (Join-Path $discoveryRoot 'Two Real Roots\MuMu Global\vms')
+        New-DiscoveryVmsChildren -VmsPath (Join-Path $twoRealRootsFixture.InstallRoot 'vms') -ChildNames @('MuMuPlayerGlobal-15.0-1')
+        New-DiscoveryVmsChildren -VmsPath (Join-Path $twoRealRootsFixture.InstallRoot 'nx_device\15.0\vms') -ChildNames @('MuMuPlayerGlobal-15.0-2')
+        $twoRealRootsResult = Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @() -FallbackRoots @($twoRealRootsFixture.InstallRoot)
+        Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus $twoRealRootsResult) 'Two VMS roots that both hold instances were merged silently.'
+
+        $versionedOnlyFixture = New-DiscoveryInstallFixture -InstallRoot (Join-Path $discoveryRoot 'Versioned Only\MuMu Global') -VmsPath (Join-Path $discoveryRoot 'Versioned Only\MuMu Global\nx_device\12.0\vms')
+        New-DiscoveryVmsChildren -VmsPath $versionedOnlyFixture.VmsPath -ChildNames @('MuMuPlayerGlobal-12.0-3', 'MuMuPlayerGlobal-12.0-base')
+        $versionedOnlyResult = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots @() -ProcessSnapshot @() -FallbackRoots @($versionedOnlyFixture.InstallRoot))
+        $versionedOnlyStatus = Get-DiscoveryResultStatus $versionedOnlyResult[0]
+        $versionedOnlyMessage = ''
+        if ($versionedOnlyStatus -eq 'CriticalError') {
+            $versionedOnlyMessage = ': ' + $versionedOnlyResult[0].Message
+        }
+        Assert-Equal 1 $versionedOnlyResult.Count "A versioned-only VMS root was not discovered$versionedOnlyMessage"
+        Assert-True ($versionedOnlyStatus -ne 'CriticalError') "A versioned-only VMS root was rejected$versionedOnlyMessage"
+        Assert-Equal $versionedOnlyFixture.VmsPath $versionedOnlyResult[0].VmsPath "A versioned-only VMS root was not selected$versionedOnlyMessage"
+    }
+    finally {
+        $env:APPDATA = $layoutAppData
+    }
 
     $conflictingVmsRoot = Join-Path $discoveryRoot 'Conflicting VMS\MuMu Global'
     $conflictingVmsManager = Join-Path $conflictingVmsRoot 'shell\MuMuManager.exe'
@@ -8058,8 +8126,10 @@ function New-TargetFixture {
     $root = Join-Path $testRoot ('target fixtures\MuMu Global\' + $Name)
     $fixture = New-SafetyInstallFixture -InstallRoot $root -InstanceIndexes $InstanceIndexes
     if ($AmbiguousVms) {
-        [void][IO.Directory]::CreateDirectory((Join-Path $root 'nx_device\12.0\vms'))
-        [void][IO.Directory]::CreateDirectory((Join-Path $root 'nx_device\15.0\vms'))
+        foreach ($versionedName in @('12.0', '15.0')) {
+            $versionedVms = Join-Path $root ('nx_device\' + $versionedName + '\vms')
+            [void][IO.Directory]::CreateDirectory((Join-Path $versionedVms ('MuMuPlayerGlobal-' + $versionedName + '-4')))
+        }
     }
     return [pscustomobject]@{
         Install = [pscustomobject]@{
