@@ -1716,6 +1716,44 @@ function Invoke-DiscoveryTests {
     Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($invalidJsonCase.Result)[0]) 'Invalid manager JSON was accepted.'
     Assert-True (@($invalidJsonCase.Result)[0].Message -match '(?i)json') 'Invalid manager JSON error omitted field context.'
 
+    $numericKeyInfo = @'
+{
+  "0": { "index": "0", "name": "MuMuPlayerGlobal-12.0-0", "android_version": "12.0", "is_main": "true", "is_process_started": "false", "is_android_started": "false", "disk_size_bytes": 0, "error_code": 0, "hyperv_enabled": false },
+  "1": { "index": "1", "name": "MuMuPlayerGlobal-15.0-1", "android_version": "15.0", "is_main": "false", "is_process_started": "true", "is_android_started": "true", "disk_size_bytes": 21474836480, "error_code": 0, "hyperv_enabled": true },
+  "2": { "index": "2", "name": "MuMuPlayerGlobal-15.0-2", "android_version": "15.0", "is_main": "false", "is_process_started": "false", "is_android_started": "false", "disk_size_bytes": 21474836480, "error_code": 0, "hyperv_enabled": true }
+}
+'@
+    $numericKeyCase = Invoke-DiscoveryManagerCase -Name 'numeric-key-map' -InfoJson $numericKeyInfo
+    $numericKeyInstances = @($numericKeyCase.Result)
+    $numericKeyStatus = Get-DiscoveryResultStatus $numericKeyInstances[0]
+    $numericKeyMessage = ''
+    if ($numericKeyStatus -eq 'CriticalError') {
+        $numericKeyMessage = ': ' + $numericKeyInstances[0].Message
+    }
+    Assert-True ($numericKeyStatus -ne 'CriticalError') "A numeric-key manager map was rejected$numericKeyMessage"
+    Assert-Equal 3 $numericKeyInstances.Count "A numeric-key manager map did not report every instance$numericKeyMessage"
+    Assert-Equal 0 $numericKeyInstances[0].Index 'A numeric-key manager map reported the wrong first index.'
+    Assert-Equal 'MuMuPlayerGlobal-12.0-0' $numericKeyInstances[0].Name 'A numeric-key manager map reported the wrong first name.'
+    Assert-Equal '12.0' $numericKeyInstances[0].AndroidVersion 'A numeric-key manager map reported the wrong first Android version.'
+    Assert-Equal 1 $numericKeyInstances[1].Index 'A numeric-key manager map reported the wrong second index.'
+    Assert-Equal 'MuMuPlayerGlobal-15.0-1' $numericKeyInstances[1].Name 'A numeric-key manager map reported the wrong second name.'
+    Assert-Equal 2 $numericKeyInstances[2].Index 'A numeric-key manager map reported the wrong third index.'
+    Assert-Equal 'MuMuPlayerGlobal-15.0-2' $numericKeyInstances[2].Name 'A numeric-key manager map reported the wrong third name.'
+    Assert-Equal '15.0' $numericKeyInstances[2].AndroidVersion 'A numeric-key manager map reported the wrong third Android version.'
+    Assert-Equal $false $numericKeyInstances[0].Eligible 'A numeric-key manager map base instance is eligible.'
+    Assert-Equal $true $numericKeyInstances[2].Eligible 'A numeric-key manager map supported instance is not eligible.'
+
+    $numericKeyInvalidInfo = '{"0":{"index":"0","name":"MuMuPlayerGlobal-12.0-0","android_version":"12.0","is_main":"true","is_process_started":"false"},"1":"MuMuPlayerGlobal-15.0-1"}'
+    $numericKeyInvalidCase = Invoke-DiscoveryManagerCase -Name 'numeric-key-invalid' -InfoJson $numericKeyInvalidInfo
+    Assert-Equal 'CriticalError' (Get-DiscoveryResultStatus @($numericKeyInvalidCase.Result)[0]) 'A numeric-key manager map with a non-record value was accepted.'
+    Assert-True (@($numericKeyInvalidCase.Result)[0].Message -match '(?i)json') 'A numeric-key manager map with a non-record value omitted field context.'
+    $numericKeyInvalidArguments = @()
+    if ([IO.File]::Exists($numericKeyInvalidCase.ArgumentsPath)) {
+        $numericKeyInvalidArguments = @([IO.File]::ReadAllLines($numericKeyInvalidCase.ArgumentsPath))
+    }
+    Assert-Equal 1 $numericKeyInvalidArguments.Count "A rejected numeric-key manager map issued more than the single enumeration: $($numericKeyInvalidArguments -join '|')"
+    Assert-Equal 'info|-v|all' $numericKeyInvalidArguments[0] "A rejected numeric-key manager map issued an unexpected manager command: $($numericKeyInvalidArguments -join '|')"
+
     $duplicateIndexInfo = @(
         [pscustomobject]@{ index = '1'; name = 'First'; is_main = $false; is_process_started = $false; android_version = '12.0' },
         [pscustomobject]@{ index = 1; name = 'Duplicate'; is_main = $false; is_process_started = $false; android_version = '12.0' }

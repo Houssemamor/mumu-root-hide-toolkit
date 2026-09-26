@@ -868,6 +868,22 @@ function ConvertFrom-ToolkitJson {
         if ($records.Count -eq 0 -and $null -ne $parsed.PSObject.Properties['index']) {
             $records = @($parsed)
         }
+        if ($records.Count -eq 0) {
+            $mapRecords = @()
+            $isInstanceMap = $true
+            foreach ($mapProperty in $parsed.PSObject.Properties) {
+                if ($mapProperty.Name -notmatch '^[0-9]+$' -or
+                    $mapProperty.Value -isnot [pscustomobject] -or
+                    $null -eq $mapProperty.Value.PSObject.Properties['index']) {
+                    $isInstanceMap = $false
+                    break
+                }
+                $mapRecords += $mapProperty.Value
+            }
+            if ($isInstanceMap -and $mapRecords.Count -gt 0) {
+                $records = $mapRecords
+            }
+        }
     }
 
     if ($records.Count -eq 0 -and -not $RequireInstance) {
