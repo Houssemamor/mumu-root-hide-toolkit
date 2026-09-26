@@ -112,9 +112,17 @@ Run-MumuToolkit.bat -Action Target -Mode Create -StartIndex 5 -Confirmed -NonInt
 Run-MumuToolkit.bat -Action Target -Mode Clone -SourceIndex 2 -Confirmed -NonInteractive
 ```
 
-`-Mode`, `-StartIndex`, and `-SourceIndex` belong to `Target`; any other action refuses them.
-Without `-Mode` a noninteractive run changes nothing and reports `TARGET_MODE_REQUIRED`, a
-noninteractive `Create` without `-StartIndex` reports `TARGET_START_INDEX_REQUIRED`, and
+`-Mode`, `-StartIndex`, and `-SourceIndex` belong to `Target`; any other action refuses them. Every
+refusal changes nothing and reports a code:
+
+| Code | Meaning |
+| --- | --- |
+| `TARGET_MODE_REQUIRED` | a noninteractive run supplied no `-Mode` |
+| `TARGET_MODE_INVALID` | the supplied mode is not `Identify`, `Create`, or `Clone` |
+| `TARGET_START_INDEX_REQUIRED` | a noninteractive `Create` supplied no usable `-StartIndex` |
+| `TARGET_START_INDEX_INVALID` | the free instance index answered in the menu is not a non-negative integer |
+| `TARGET_PARAMETER_MISUSE` | `-Mode`, `-StartIndex`, or `-SourceIndex` was supplied to another action |
+
 `Target Clone` refuses a source instance that is a base instance, has an unsupported Android
 version, or has an unknown state, so it never returns an unusable target.
 

@@ -323,6 +323,7 @@ function Get-ToolkitTargetParameterRefusal {
     param(
         [string]$Action,
         [string]$Mode,
+        [int]$SourceIndex = -1,
         [object]$StartIndex,
         [scriptblock]$Prompt
     )
@@ -332,10 +333,10 @@ function Get-ToolkitTargetParameterRefusal {
         $requestedMode = $Mode.Trim()
     }
     if ($Action -cne 'Target') {
-        if ([string]::IsNullOrWhiteSpace($requestedMode) -and $null -eq $StartIndex) {
+        if ([string]::IsNullOrWhiteSpace($requestedMode) -and $null -eq $StartIndex -and $SourceIndex -lt 0) {
             return $null
         }
-        return Get-ToolkitResult -Status 'CriticalError' -Message "-Mode and -StartIndex belong to the Target action, so the $Action action was not started." -Data (@{ Code = 'TARGET_PARAMETER_MISUSE' })
+        return Get-ToolkitResult -Status 'CriticalError' -Message "-Mode, -StartIndex, and -SourceIndex belong to the Target action, so the $Action action was not started." -Data (@{ Code = 'TARGET_PARAMETER_MISUSE' })
     }
     if (-not [string]::IsNullOrWhiteSpace($requestedMode) -and $script:ToolkitTargetModes -cnotcontains $requestedMode) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The target mode must be Identify, Create, or Clone, so no instance was created or changed.' -Data (@{ Code = 'TARGET_MODE_INVALID' })
@@ -359,20 +360,26 @@ function Invoke-ToolkitTarget {
         [scriptblock]$Runner = $null
     )
 
-    $targetMode = $Mode
-    if ([string]::IsNullOrWhiteSpace($targetMode) -and $null -ne $Prompt) {
+    $targetMode = ''
+    if (-not [string]::IsNullOrWhiteSpace($Mode)) {
+        $targetMode = $Mode.Trim()
+    }
+    elseif ($null -ne $Prompt) {
         $targetMode = ([string](& $Prompt 'Target mode: Identify, Create, or Clone')).Trim()
     }
     if ([string]::IsNullOrWhiteSpace($targetMode)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive target run requires an explicit mode. Pass -Mode Identify, -Mode Create, or -Mode Clone. No instance was created or changed.' -Data (@{ Code = 'TARGET_MODE_REQUIRED' })
     }
-    $modeRefusal = Get-ToolkitTargetParameterRefusal -Action 'Target' -Mode $targetMode -StartIndex $StartIndex -Prompt $Prompt
+    $modeRefusal = Get-ToolkitTargetParameterRefusal -Action 'Target' -Mode $targetMode -SourceIndex $SourceIndex -StartIndex $StartIndex -Prompt $Prompt
     if ($null -ne $modeRefusal) {
         return $modeRefusal
     }
 
     $targetStartIndex = $StartIndex
     if ($targetMode -ceq 'Create' -and $null -eq (ConvertTo-ToolkitInstanceIndex -Value $targetStartIndex)) {
+        if ($null -eq $Prompt) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive create target run requires an explicit -StartIndex that is a non-negative integer. No instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_REQUIRED' })
+        }
         $targetStartIndex = ConvertTo-ToolkitInstanceIndex -Value ([string](& $Prompt 'Free instance index for the new instance'))
         if ($null -eq $targetStartIndex) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'The free instance index must be a non-negative integer, so no instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_INVALID' })
@@ -419,7 +426,7 @@ function Invoke-ToolkitAction {
         return $refusal
     }
 
-    $parameterRefusal = Get-ToolkitTargetParameterRefusal -Action $Action -Mode $Mode -StartIndex $StartIndex -Prompt $Prompt
+    $parameterRefusal = Get-ToolkitTargetParameterRefusal -Action $Action -Mode $Mode -SourceIndex $SourceIndex -StartIndex $StartIndex -Prompt $Prompt
     if ($null -ne $parameterRefusal) {
         return $parameterRefusal
     }

@@ -8515,8 +8515,28 @@ function Invoke-TargetTests {
         $modeMisuse = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Identify'
         Assert-Equal 'CriticalError' $modeMisuse.Status 'A target parameter was accepted by another action.'
         Assert-Equal 'TARGET_PARAMETER_MISUSE' $modeMisuse.Data.Code 'A target parameter on another action did not report the misuse code.'
-        $sourceIndexMisuse = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -SourceIndex 2
+        $misuseFixture = New-TargetFixture -Name 'parameter misuse'
+        $script:TargetFallbackRoots = @($script:TargetFallbackRoots) + @($misuseFixture.Install.InstallRoot)
+        $misuseStateRoot = Join-Path $testRoot 'target misuse state'
+        $sourceIndexMisuse = Invoke-ToolkitAction -Action 'Detect' -InstallRoot $misuseFixture.Install.InstallRoot -StateRoot $misuseStateRoot -SourceIndex 2 -Runner (New-SafetyManagerRunner -State $misuseFixture.State)
         Assert-Equal 'CriticalError' $sourceIndexMisuse.Status 'A target source parameter was accepted by another action.'
+        Assert-Equal 'TARGET_PARAMETER_MISUSE' $sourceIndexMisuse.Data.Code 'A target source parameter on another action did not report the misuse code.'
+        Assert-True ($sourceIndexMisuse.Message -match '-SourceIndex') "A target source parameter refusal does not name the parameter: $($sourceIndexMisuse.Message)"
+        Assert-Equal 0 $misuseFixture.State.Calls.Count "A non-target action with a target source parameter reached the manager: $(@(Get-TargetManagerCommands -State $misuseFixture.State) -join '|')"
+        Assert-True (-not (Test-Path -LiteralPath $misuseStateRoot)) 'A refused target parameter created the toolkit state directory.'
+        $misuseJournalCount = @(Get-ToolkitJournalRecords -StateRoot $controllerStateRoot).Count
+        $startIndexMisuse = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -StartIndex 5 -Runner (New-SafetyManagerRunner -State $controllerIdentify.State)
+        Assert-Equal 'TARGET_PARAMETER_MISUSE' $startIndexMisuse.Data.Code 'A target start index on another action did not report the misuse code.'
+        Assert-Equal $misuseJournalCount @(Get-ToolkitJournalRecords -StateRoot $controllerStateRoot).Count 'A refused target parameter wrote an operation journal.'
+        $directTarget = Invoke-ToolkitTarget -Install $controllerCreate.Install -StateRoot $controllerStateRoot -Mode 'Create'
+        Assert-Equal 'CriticalError' $directTarget.Status 'A direct target call without a prompt and without a start index was accepted.'
+        Assert-Equal 'TARGET_START_INDEX_REQUIRED' $directTarget.Data.Code 'A direct target call without a prompt did not report the structured start index refusal.'
+        Assert-True ($null -ne $directTarget.PSObject.Properties['Message']) 'A direct target call returned no structured result.'
+        $directPaddedTarget = Invoke-ToolkitTarget -Install $controllerCreate.Install -StateRoot $controllerStateRoot -Mode ' Create '
+        Assert-Equal 'CriticalError' $directPaddedTarget.Status 'A direct target call with a padded mode was accepted.'
+        Assert-Equal 'TARGET_START_INDEX_REQUIRED' $directPaddedTarget.Data.Code 'A direct target call with a padded mode did not normalize the mode.'
+        $directNoMode = Invoke-ToolkitTarget -Install $controllerCreate.Install -StateRoot $controllerStateRoot
+        Assert-Equal 'TARGET_MODE_REQUIRED' $directNoMode.Data.Code 'A direct target call without a mode did not report the missing mode.'
 
         $identifyAction = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerIdentify.Install.InstallRoot -InstanceIndex 2 -StateRoot $controllerStateRoot -Mode 'Identify' -Runner (New-SafetyManagerRunner -State $controllerIdentify.State)
         Assert-Equal 'Success' $identifyAction.Status "The Target action failed: $($identifyAction.Message)"
@@ -8528,6 +8548,11 @@ function Invoke-TargetTests {
         Assert-True ((@(Format-ToolkitResult -Result $identifyAction) -join "`n") -match 'Instance 3 \| Target') 'The controller Target result did not render every discovered instance.'
         Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerIdentify.State).Count "The controller Identify target mode issued a mutating manager command: $(@(Get-TargetManagerCommands -State $controllerIdentify.State) -join '|')"
         Assert-Equal 1 @(Get-ToolkitJournalRecords -StateRoot $controllerStateRoot | Where-Object { [string]$_.Operation -ceq 'Target' -and [string]$_.State -ceq 'Completed' }).Count 'The Target action did not keep exactly one completed target journal.'
+
+        $targetSourceAccepted = Invoke-ToolkitAction -Action 'Target' -InstallRoot $misuseFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Clone' -SourceIndex 3 -Confirmed -Runner (New-SafetyManagerRunner -State $misuseFixture.State)
+        Assert-Equal 'Success' $targetSourceAccepted.Status "A target source parameter was refused for the Target action: $($targetSourceAccepted.Message)"
+        Assert-Equal 3 $targetSourceAccepted.Data.SourceIndex 'The Target action did not use the supplied source index.'
+        Assert-Equal 1 @(@(Get-TargetManagerCommands -State $misuseFixture.State) | Where-Object { $_ -eq 'clone|-v|3|-n|1' }).Count "A target source parameter did not reach the manager clone command: $(@(Get-TargetManagerCommands -State $misuseFixture.State) -join '|')"
 
         $nonInteractiveStartIndex = Invoke-MenuAction -Action 'Target' -InstallRoot $absentInstallRoot -StateRoot $controllerStateRoot -Mode 'Create' -LogPath (Join-Path $controllerStateRoot 'target.log')
         Assert-Equal 'TARGET_START_INDEX_REQUIRED' $nonInteractiveStartIndex.Data.Code 'A noninteractive create target run without a start index was accepted.'
@@ -8782,7 +8807,10 @@ function Invoke-DocsTests {
             @{ Pattern = '(?i)lists every discovered instance'; Message = 'The target selection section does not state that Identify lists every instance.' }
             @{ Pattern = '(?i)noninteractive run never prompts and\s+never confirms'; Message = 'The target selection section does not state that a noninteractive run never prompts or confirms.' }
             @{ Pattern = 'TARGET_MODE_REQUIRED'; Message = 'The target selection section does not document the fail-closed code for a missing mode.' }
+            @{ Pattern = 'TARGET_MODE_INVALID'; Message = 'The target selection section does not document the fail-closed code for an unsupported mode.' }
             @{ Pattern = 'TARGET_START_INDEX_REQUIRED'; Message = 'The target selection section does not document the fail-closed code for a missing start index.' }
+            @{ Pattern = 'TARGET_START_INDEX_INVALID'; Message = 'The target selection section does not document the fail-closed code for an invalid free instance index.' }
+            @{ Pattern = 'TARGET_PARAMETER_MISUSE'; Message = 'The target selection section does not document the fail-closed code for a target parameter on another action.' }
         )) {
         Assert-True ($targetSection.Value -match $targetStatement.Pattern) $targetStatement.Message
     }

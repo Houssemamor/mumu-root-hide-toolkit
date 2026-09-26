@@ -936,8 +936,12 @@ Target selection is a prerequisite, so it is qualified first and in this order:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Target -Mode Identify -NonInteractive
 powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Target -Mode Create -StartIndex 5 -Confirmed -NonInteractive
-powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Target -Mode Clone -InstanceIndex 2 -Confirmed -NonInteractive
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File src\Invoke-MumuToolkit.ps1 -Action Target -Mode Clone -SourceIndex 2 -Confirmed -NonInteractive
 ```
+
+`-SourceIndex` names the clone source directly; `-InstanceIndex` is the equivalent form and is what
+Identify reports, so `-Mode Clone -InstanceIndex 2` selects the same source. Use the index the
+`Create` run reported as `Index`, never the requested `-StartIndex` value.
 
 Expected: `Identify` exits `0`, lists every discovered instance with its index, name, Android version, running state, and eligibility, and issues no manager command other than `info` and `setting`. `Create` and `Clone` exit `0` only after the explicit confirmation, add exactly one instance, and return a verified non-base instance with a readable Android version and a usable disk. Confirm that the noninteractive dispatcher never prompts and never auto-confirms: a `Target` run without `-Mode` returns `TARGET_MODE_REQUIRED`, and `Create` or `Clone` without `-Confirmed` changes nothing. Confirm that a refused `Create` over an existing `-StartIndex` index issues no `create` command, that an ambiguous new-index report is refused, and that no other instance is deleted, renamed, or changed. Record the reported target index; the later steps use it as `-InstanceIndex`. No root or concealment work runs in this step.
 
