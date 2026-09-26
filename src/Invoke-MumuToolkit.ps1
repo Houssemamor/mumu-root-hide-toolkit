@@ -650,7 +650,8 @@ function Start-ToolkitController {
 
     if (-not $SkipToolbar) {
         & $write 'MuMu Root Hide Toolkit'
-        & $write 'Detect and Verify change nothing. Root12, Root15, and Conceal change only a verified clone of the selected instance.'
+        & $write 'Detect and Verify change nothing.'
+        & $write 'Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone. Conceal changes only the verified clone.'
         & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
         foreach ($entry in @(Get-ToolkitActionCatalog)) {
             & $write ('  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)

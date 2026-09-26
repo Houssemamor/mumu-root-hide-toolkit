@@ -7685,6 +7685,11 @@ function Invoke-MenuTests {
         Assert-Equal 'Success' $scopeRepeatRestore.Status "A repeated restore was not recoverable: $($scopeRepeatRestore.Message)"
         Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeGlobal.CampaignPath)) 'A repeated restore did not restore the campaign file again.'
         Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeChinese.CampaignPath)) 'A repeated restore changed the other edition campaign file.'
+        $scopeKeyRecord = Get-ToolkitCampaignScopeKey -Install $scopeGlobal.Install
+        $scopeKeyDictionary = Get-ToolkitCampaignScopeKey -Install @{ InstallRoot = $scopeGlobal.Install.InstallRoot }
+        Assert-True ($scopeKeyRecord -match '^[0-9a-f]{16}$') 'The campaign scope key is invalid for a discovered installation.'
+        Assert-Equal $scopeKeyRecord $scopeKeyDictionary 'A dictionary shaped install produced a different campaign scope key and would strand its campaign roots.'
+        Assert-Equal '' (Get-ToolkitCampaignScopeKey -Install $null) 'A missing install produced a campaign scope key.'
         $script:MenuFallbackRoots = @($adsInstall.Install.InstallRoot, $adsOtherInstall.Install.InstallRoot, $adsPlainInstall.Install.InstallRoot)
 
         $childStateRoot = Join-Path $testRoot 'menu child state'
@@ -7779,8 +7784,9 @@ function Invoke-MenuTests {
         Assert-True ($toolbarText -match '(?i)RemoveAds and Restore') 'The toolbar does not name the advertisement actions.'
         Assert-True ($toolbarText -match '(?i)campaign files inside the selected installation') 'The toolbar does not scope the advertisement actions to the selected installation.'
         Assert-True ($toolbarText -match '(?i)keeps an exact backup') 'The toolbar does not state the advertisement backup boundary.'
-        Assert-True ($toolbarText -notmatch '(?i)Every other action acts on a verified clone only') 'The toolbar claims that every other action acts on a verified clone only.'
-        Assert-True ($toolbarText -match '(?i)Root12, Root15, and Conceal change only a verified clone') 'The toolbar does not name the clone-only actions.'
+        Assert-True ($toolbarText -match '(?i)Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone') 'The toolbar does not describe what Root12 and Root15 do to the selected instance.'
+        Assert-True ($toolbarText -match '(?i)Conceal changes only the verified clone') 'The toolbar does not describe what Conceal changes.'
+        Assert-True ($toolbarText -notmatch '(?i)change only a verified clone of the selected instance') 'The toolbar hides that Root12 and Root15 also stop the selected instance.'
 
         $skipState = @{ Lines = @() }
         $skipCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) $skipState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner ({ param($Choice) }).GetNewClosure()
@@ -7879,10 +7885,15 @@ if ([string]::IsNullOrWhiteSpace([string]$guest.Failure)) { throw 'The guest sta
 if ($guest.HmaInstalled -ne $false) { throw 'The guest state invented an HMA package state.' }
 $restorePoints = @(Get-ToolkitCampaignRestorePoints -StateRoot '__STATE__' -Install $install)
 if ($restorePoints.Count -ne 0) { throw 'An empty state root reported a restore point.' }
-$unassigned = Get-ToolkitSharedValue -Name 'ConcealmentHmaPackage' -Default 'absent'
+        $unassigned = Get-ToolkitSharedValue -Name 'ConcealmentHmaPackage' -Default 'absent'
 if ($unassigned -cne 'absent') { throw 'An unloaded module constant did not fall back to the default.' }
+if ([string]$script:ToolkitCampaignRestorePointFile -cne 'restore-point.json') { throw 'The campaign restore point file name is not available without the advertisement module.' }
 $scopeKey = Get-ToolkitCampaignScopeKey -Install $install
 if ($scopeKey -notmatch '^[0-9a-f]{16}$') { throw 'The campaign scope key is invalid.' }
+$scopeKeyFromRecord = Get-ToolkitCampaignScopeKey -Install ([pscustomobject]@{ InstallRoot = '__ROOT__' })
+if ($scopeKeyFromRecord -cne $scopeKey) { throw 'The campaign scope key is not stable for an equivalent record.' }
+$scopeKeyFromDictionary = Get-ToolkitCampaignScopeKey -Install @{ InstallRoot = '__ROOT__' }
+if ($scopeKeyFromDictionary -cne $scopeKey) { throw 'A dictionary shaped install produced a different campaign scope key.' }
 Write-Output ('FAILURES=' + @($report.Failures).Count)
 Write-Output 'STANDALONE_OK'
 '@

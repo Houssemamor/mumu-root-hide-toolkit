@@ -4,6 +4,9 @@ if (-not (Test-Path variable:script:ToolkitBootPollAttempts)) {
 if (-not (Test-Path variable:script:ToolkitBootPollDelaySeconds)) {
     $script:ToolkitBootPollDelaySeconds = 3
 }
+if (-not (Test-Path variable:script:ToolkitCampaignRestorePointFile)) {
+    $script:ToolkitCampaignRestorePointFile = 'restore-point.json'
+}
 
 function Invoke-ToolkitManagerAdb {
     param(
@@ -198,7 +201,13 @@ function Get-ToolkitRecordValue {
         }
         return $null
     }
-    return Get-ToolkitFirstProperty -InputObject $Record -PropertyNames $PropertyNames
+    foreach ($propertyName in $PropertyNames) {
+        $property = $Record.PSObject.Properties[$propertyName]
+        if ($null -ne $property) {
+            return $property.Value
+        }
+    }
+    return $null
 }
 
 function Get-ToolkitJournalRecords {
@@ -315,11 +324,9 @@ function Get-ToolkitCampaignScopeKey {
     param([object]$Install)
 
     $installRoot = $null
-    if ($null -ne $Install -and $null -ne $Install.PSObject) {
-        $property = $Install.PSObject.Properties['InstallRoot']
-        if ($null -ne $property -and $property.Value -is [string]) {
-            $installRoot = ConvertTo-ToolkitFullPath -Path $property.Value
-        }
+    $reported = Get-ToolkitRecordValue -Record $Install -PropertyNames @('InstallRoot')
+    if ($reported -is [string]) {
+        $installRoot = ConvertTo-ToolkitFullPath -Path $reported
     }
     if ($null -eq $installRoot) {
         return ''
@@ -342,7 +349,6 @@ function Get-ToolkitCampaignRestorePoints {
     )
 
     $records = @()
-    $manifestName = Get-ToolkitSharedValue -Name 'ToolkitCampaignRestorePointFile' -Default 'restore-point.json'
     $scope = Get-ToolkitCampaignScopeKey -Install $Install
     if ([string]::IsNullOrWhiteSpace($StateRoot) -or [string]::IsNullOrWhiteSpace($scope)) {
         return $records
@@ -353,7 +359,7 @@ function Get-ToolkitCampaignRestorePoints {
     }
     $roots = @()
     foreach ($directory in @([IO.Directory]::GetDirectories($parent))) {
-        $manifestPath = [IO.Path]::Combine($directory, $manifestName)
+        $manifestPath = [IO.Path]::Combine($directory, [string]$script:ToolkitCampaignRestorePointFile)
         if (-not [IO.File]::Exists($manifestPath)) {
             continue
         }
