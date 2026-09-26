@@ -2,17 +2,56 @@ param(
     [string]$ChildAction = ''
 )
 
+# The elevated child is launched with -File, so this module is a process entry point as well as a
+# dot-sourced dependency. When it is the entry point it loads the two primitives it needs itself,
+# because nothing else has run by then.
+if ($MyInvocation.InvocationName -ne '.') {
+    . (Join-Path $PSScriptRoot 'Common.ps1')
+    . (Join-Path $PSScriptRoot 'Discovery.ps1')
+}
+
 $script:ToolkitElevationEntryPath = $PSCommandPath
+# The boundary is this file's own directory, which is already absolute, so this assignment must not
+# depend on a helper that a dot-sourcing caller may not have loaded yet.
+$script:ToolkitSourceRoot = $PSScriptRoot
 $script:ToolkitNotElevatedExitCode = 1223
 $script:ToolkitStopPollAttempts = 5
 $script:ToolkitStopPollDelaySeconds = 1
 $script:ToolkitStableStopReadings = 2
 $script:ToolkitDiskFileLimit = 100000
+# Only the actions that change MuMu may ask for administrator rights. Detect and Verify change
+# nothing, and the quit action is not an action at all, so a read-only run never raises a prompt.
+$script:ToolkitElevatableActions = @('Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+# A .NET access denial and a manager that names one are the same condition, so the seam recognizes
+# both the exception type and the Windows message. Nothing else may ask for rights.
+$script:ToolkitPermissionFailurePattern = '(?i)unauthorizedaccess|access (?:to the path .+ )?is denied|permission denied|e_accessdenied'
+
+# The process entry point arms the elevation seam. It is kept here, next to the relaunch it performs,
+# so no embedded caller can raise a UAC prompt by accident: an unarmed seam simply does not elevate.
+$script:ToolkitProductionElevationRunner = {
+    param($ScriptPath, $Arguments)
+
+    return (Invoke-ElevatedToolkitAction -ScriptPath $ScriptPath -Arguments $Arguments)
+}
 
 function Test-ToolkitAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return [bool]$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-ToolkitPermissionFailure {
+    param([object]$Result)
+
+    if ($null -eq $Result -or $Result -isnot [pscustomobject]) {
+        return $false
+    }
+    $statusProperty = $Result.PSObject.Properties['Status']
+    if ($null -eq $statusProperty -or [string]$statusProperty.Value -ceq 'Success' -or
+        [string]$statusProperty.Value -ceq 'AlreadyApplied') {
+        return $false
+    }
+    return ([string]$Result.Message -match $script:ToolkitPermissionFailurePattern)
 }
 
 function Assert-ToolkitPowerShellAction {
@@ -28,6 +67,12 @@ function Assert-ToolkitPowerShellAction {
     $actionItem = Get-Item -LiteralPath $actionPath -Force -ErrorAction Stop
     if ($actionItem -isnot [IO.FileInfo] -or ($actionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Label is not a regular file."
+    }
+    # The elevated child runs the script a Base64 payload names, so the payload may not reach outside
+    # this toolkit's own source directory. The comparison is made on resolved paths, so a junction or
+    # symlink on the way in cannot carry the child out of the boundary.
+    if (-not (Test-ToolkitPathWithinRoot -Path $actionPath -Root $script:ToolkitSourceRoot)) {
+        throw "$Label is outside the toolkit source directory."
     }
     return $actionPath
 }
@@ -58,6 +103,59 @@ function New-ToolkitElevatedArgumentList {
         '-ChildAction'
         $payload
     )
+}
+
+# The elevated child repeats the caller's own request, so the operator's confirmation and every
+# bound path survive the relaunch and nothing is invented on the operator's behalf. Only parameters
+# the caller actually set are bound, so an action never receives a parameter it does not take.
+function New-ToolkitElevatedChildArguments {
+    param(
+        [string]$Action,
+        [string]$InstallRoot = '',
+        [int]$InstanceIndex = -1,
+        [int]$SourceIndex = -1,
+        [string]$StateRoot = '',
+        [string[]]$Packages = @(),
+        [string]$Mode = '',
+        [object]$StartIndex = $null,
+        [switch]$Confirmed
+    )
+
+    if ($script:ToolkitElevatableActions -cnotcontains $Action) {
+        throw 'The requested action is not one that may be relaunched with administrator rights.'
+    }
+    $arguments = @(
+        '-NonInteractive'
+        '-Action'
+        $Action
+        '-ElevatedChild'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $arguments += @('-InstallRoot', $InstallRoot)
+    }
+    if ($InstanceIndex -ge 0) {
+        $arguments += @('-InstanceIndex', [string]$InstanceIndex)
+    }
+    if ($SourceIndex -ge 0) {
+        $arguments += @('-SourceIndex', [string]$SourceIndex)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StateRoot)) {
+        $arguments += @('-StateRoot', $StateRoot)
+    }
+    if (@($Packages).Count -gt 0) {
+        $arguments += @('-Packages', (@($Packages) -join ','))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Mode)) {
+        $arguments += @('-Mode', $Mode)
+    }
+    $startIndexValue = if ($null -eq $StartIndex) { '' } else { [string]$StartIndex }
+    if (-not [string]::IsNullOrWhiteSpace($startIndexValue)) {
+        $arguments += @('-StartIndex', $startIndexValue)
+    }
+    if ($Confirmed) {
+        $arguments += '-Confirmed'
+    }
+    return $arguments
 }
 
 function Invoke-ToolkitElevatedChild {

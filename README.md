@@ -61,8 +61,8 @@ toolkit reads and writes. The Vector module is installed on that instance under 
 Dependencies are downloaded at run time from those official release pages into
 `%LOCALAPPDATA%\mumu-root-hide-toolkit\assets`, and each one is verified against its pinned size
 and SHA-256 hash before it is used. Design intent: a dependency is never fetched from an
-elevated phase, so nothing is downloaded after rights are raised. The actions do not raise
-rights themselves yet, so there is no elevated phase today.
+elevated phase, so nothing is downloaded after rights are raised. `Conceal` therefore only fetches
+when you pass `-FetchDependencies`, and an elevated retry never fetches at all.
 
 ## Setup order
 
@@ -135,6 +135,17 @@ searched for a single field:
   Ads.RestorePoint = Missing
   Backups.CloneIndex = 7
   Backups.CloneName = Android 12 clone
+  Concealment.Target = 7
+  Concealment.Status = Warning
+  Concealment.Code = KERNELSU_ABSENT
+  Concealment.Packages = jp.pokemon.pokemontcgp
+  Concealment.InScope = jp.pokemon.pokemontcgp
+  Concealment.OutOfScope = none
+  Concealment.TemplateFound = True
+  Concealment.IsWhitelist = False
+  Concealment.HmaConfigVersion = 93
+  Concealment.KernelSUInstalled = False
+  Concealment.AllowlistPresent = False
   JournalState = Completed
   JournalOperation = Root12
   JournalId = 8fd6a6a800534e6c8b643490f7bb26df
@@ -145,10 +156,19 @@ searched for a single field:
 The report names the installation identity, every discovered instance with its index, Android
 version, and vendor root setting, the virtualization state, the guest root and root daemon
 evidence, the Hide My Applist and Vector module state, the advertisement restore point, the
-verified clone backup, the last journal state, and every failure it collected. A value the manager
-or the guest did not report is printed as `not-detected`, and a value that is present but empty is
-printed as `none`, so a field is never silently dropped. A clean instance prints `Failures: none`
-after the same field list, so an empty failure list is stated rather than implied.
+verified clone backup, the concealment scope observed on that clone, the last journal state, and
+every failure it collected. A value the manager or the guest did not report is printed as
+`not-detected`, and a value that is present but empty is printed as `none`, so a field is never
+silently dropped. A clean instance prints `Failures: none` after the same field list, so an empty
+failure list is stated rather than implied.
+
+The `Concealment` lines are the evidence `Test-Concealment` collected by reading the installed
+Hide My Applist configuration on the verified clone, so the verifier is reachable and no concealment
+claim exists without an observation behind it. The packages under test are the ones the toolkit
+itself assigned to the blacklist `Root` template, so nothing has to be named again. An Android 12
+Kitsune clone has no KernelSU package, so it honestly reports `KERNELSU_ABSENT` and
+`Concealment.Status = Warning` instead of a claimed success, and an instance with no verified clone
+record reports `CLONE_UNVERIFIED` with `Concealment.Target = none`.
 
 ## Target selection
 
@@ -217,6 +237,7 @@ Command-line parameters:
 | `-StartIndex <n>` | a free instance index that `Target Create` insists on before it calls the manager; it is never sent to the manager and never overwritten |
 | `-Confirmed` | the explicit confirmation required by `Root15`, `Target Create`, and `Target Clone` |
 | `-NonInteractive` | run one action and exit instead of opening the menu |
+| `-FetchDependencies` | `Conceal` only: fetch and verify the pinned HMA and Vector artifacts into the per-user cache before installing them; without it the run requires an already verified cache |
 | `-SkipToolbar` | omit the menu banner |
 
 ## Android 12: the exact Kitsune choice
@@ -325,11 +346,26 @@ Three contracts come from what the live guest actually accepts:
 `Test-Concealment` reports `Warning` with `KERNELSU_ABSENT` on a clone where the KernelSU package
 is not installed, such as an Android 12 Kitsune clone, and claims no KernelSU profile state there;
 the manual handoff stays. On that clone the root comes from Kitsune, and the HMA scope and Vector
-module are the parts this toolkit can verify from observation.
+module are the parts this toolkit can verify from observation. That result is also carried in the
+read-only `Verify` report, so it is not a claim you have to take on trust.
 
-Hide My Applist OSS must already be installed on the clone. The manifest pins the HMA OSS and
-Vector artifacts and `src/Concealment.ps1` can install them from the verified cache, but the
-menu does not run that step yet.
+`Conceal` installs or verifies its declared dependencies before it writes anything: the pinned HMA
+OSS artifact is installed as a package and the pinned Vector artifact is installed as the
+`zygisk_vector` module, both on the verified clone only, and both read back from the guest
+afterwards. HMA and Vector are exactly the two concealment dependencies. NeoZygisk is a root-side
+module, not a concealment dependency, so `Conceal` never acquires or installs it.
+
+Acquisition and mutation are separate phases. The install step is cached-only, so it can never
+reach the network. The pinned assets are fetched and verified first, and only when you ask for it
+with `-FetchDependencies`:
+
+```text
+Run-MumuToolkit.bat -Action Conceal -FetchDependencies -Packages com.example.app -NonInteractive
+```
+
+Without `-FetchDependencies` the run uses the already verified per-user cache and fails closed with
+`ASSET_VERIFICATION_FAILED` if an asset is not there. An elevated retry never fetches: the toolkit
+downloads nothing after rights are raised.
 
 **Concealment is unqualified on this host.** The selected app
 `jp.pokemon.pokemontcgp` is not installed on the live clone 4, so the action refuses it with
@@ -364,19 +400,40 @@ installation scope, each with its own `restore-point.json`.
 
 ## UAC and administrator rights
 
-Actions never bypass, weaken, or reconfigure Windows security. The toolkit never relaunches itself with higher rights, never creates a scheduled task, never changes the
-execution policy permanently, and never takes ownership of files or weakens an access
-control list. `src/Elevation.ps1` implements a direct `RunAs` relaunch of a single action
-script and a child that verifies its own administrator token before it runs, but the action
-dispatcher does not call it yet.
+Actions never bypass, weaken, or reconfigure Windows security. The toolkit never suppresses the UAC
+prompt, never creates a scheduled task, never changes the execution policy permanently, and never
+takes ownership of files or weakens an access control list.
 
-Current behavior: if an action needs rights the current process does not have, it fails closed.
-The action stops, the operation journal records the failure, nothing that changes MuMu is retried,
-and no configuration is left half-written on purpose. Start `Run-MumuToolkit.bat` from an
-elevated console (Run as administrator) for the actions that write into the MuMu installation.
-`Detect` and `Verify` never change MuMu and do not need elevation; they still
-create the toolkit state directory, and a non-success result appends a redacted line to the
+The mutating actions that write inside the MuMu installation are `RemoveAds`, `Restore`, `Target`
+create and clone, `Root12`, `Root15`, and `Conceal`. They are reachable through elevation, and the
+sequence is deliberate:
+
+1. The action is attempted in this process, exactly once. A host whose manager calls and file writes
+   already succeed unelevated is never prompted at all.
+2. Only a permission failure asks for administrator rights, once and only once. The elevated child
+   is a direct `RunAs` relaunch of `src/Invoke-MumuToolkit.ps1` with the same allowlisted action, the
+   same bound paths, and the same operator confirmation, so nothing is retried with more authority
+   than you gave.
+3. The elevated child never asks for rights again. It runs with the internal `-ElevatedChild` switch
+   and the process entry point does not arm the elevation seam for it, so a second attempt is not
+   possible even if the dispatcher misreads the failure.
+4. The child may run only a script inside this toolkit's own `src` directory. The check is made on
+   resolved paths, so a junction or symlink on the way in cannot carry it out of the boundary.
+
+The read-only actions `Detect` and `Verify` never ask for rights: they change nothing in MuMu. They
+still create the toolkit state directory, and a non-success result appends a redacted line to the
 toolkit log.
+
+If elevation is declined or fails, the action fails closed: the result is a `CriticalError` naming
+the permission problem, the operation journal records the failure, nothing that changes MuMu is
+retried in this process, and no configuration is left half-written on purpose. The interactive menu
+stays open. Starting `Run-MumuToolkit.bat` from an elevated console (Run as administrator) is still
+supported and skips the prompt entirely, because a process that already holds rights is never asked
+for them again.
+
+The elevated retry is noninteractive. Bind every selection explicitly on the command line, with
+`-InstallRoot`, `-InstanceIndex`, `-SourceIndex`, `-Mode`, `-StartIndex`, and `-Packages`, or the
+elevated child reports the missing selection instead of prompting for it.
 
 ## Transport bounds
 
@@ -452,8 +509,13 @@ These are the honest limits of the current state of the code.
 - Every live result above is scoped to the Chinese-edition MuMu 6.8.0.0 build with a pinned Kitsune
   `31.0-kitsune`. The Global edition is fixture-tested only; the live verification behind the
   tested version statement used the Chinese edition, not the Global one.
-- The menu does not yet self-elevate or install the concealment dependencies; see the sections
-  above for the current fail-closed behavior.
+- A mutating action only reaches elevation after a real permission failure, so a host whose manager
+  calls and file writes already succeed unelevated never sees a UAC prompt. On a host that reports
+  the failure in some other form, the action still fails closed and the operator has to start the
+  toolkit from an elevated console; see the section above.
+- The elevated retry is noninteractive, so a mutating action that would have prompted for an
+  installation, an instance, a target mode, or a confirmation must have those bound on the command
+  line or the elevated child reports the missing selection instead.
 
 ## Tests
 

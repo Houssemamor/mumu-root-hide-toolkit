@@ -10,7 +10,9 @@ param(
     [object]$StartIndex = $null,
     [switch]$Confirmed,
     [switch]$NonInteractive,
-    [switch]$SkipToolbar
+    [switch]$SkipToolbar,
+    [switch]$FetchDependencies,
+    [switch]$ElevatedChild
 )
 
 $script:ToolkitActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
@@ -405,6 +407,59 @@ function Invoke-ToolkitTarget {
     return (Close-ToolkitActionJournal -Journal $journal -Result $result)
 }
 
+# The mutating dispatch is where administrator rights become reachable. The action is attempted in
+# process first, so a host that does not need rights is never pushed through a UAC prompt, and only a
+# permission failure asks for them, exactly once. A declined or failed elevation fails closed: the
+# in-process result is replaced by the elevation outcome and nothing is retried here.
+function Invoke-ToolkitActionWithElevation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Action,
+        [string]$InstallRoot = '',
+        [int]$InstanceIndex = -1,
+        [int]$SourceIndex = -1,
+        [string]$StateRoot = '',
+        [string[]]$Packages = @(),
+        [string]$Mode = '',
+        [object]$StartIndex = $null,
+        [switch]$Confirmed,
+        [switch]$FetchDependencies,
+        [switch]$ElevatedChild,
+        [scriptblock]$Prompt = $null,
+        [scriptblock]$Runner = $null,
+        [scriptblock]$ElevationRunner = $null
+    )
+
+    $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -Runner $Runner
+    # An elevated child is the one process that must never ask for rights again, and an unarmed seam
+    # has no UAC prompt to raise, so both return the in-process outcome unchanged.
+    if ($ElevatedChild -or $null -eq $ElevationRunner) {
+        return $result
+    }
+    if (-not (Test-ToolkitPermissionFailure -Result $result)) {
+        return $result
+    }
+    if ($script:ToolkitElevatableActions -cnotcontains $Action) {
+        return $result
+    }
+    # A process that already holds rights gains nothing from a second prompt.
+    if (Test-ToolkitAdministrator) {
+        return $result
+    }
+    try {
+        $childArguments = @(New-ToolkitElevatedChildArguments -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed)
+    }
+    catch {
+        return Get-ToolkitResult -Status 'CriticalError' -Message ("The $Action action failed for a permission reason and cannot be relaunched with administrator rights. " + (Protect-ToolkitText ([string]$_.Exception.Message))) -Data (@{ Code = 'ELEVATION_REQUEST_INVALID'; Action = Protect-ToolkitText $Action })
+    }
+    $controllerPath = ConvertTo-ToolkitFullPath -Path (Join-Path $PSScriptRoot 'Invoke-MumuToolkit.ps1')
+    $elevated = & $ElevationRunner $controllerPath $childArguments
+    if ($null -eq $elevated -or $elevated -isnot [pscustomobject] -or $null -eq $elevated.PSObject.Properties['Status']) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The $Action action was relaunched with administrator rights and reported no outcome, so its result is unknown and nothing is retried here." -Data (@{ Code = 'ELEVATION_OUTCOME_INVALID'; Action = Protect-ToolkitText $Action })
+    }
+    return Get-ToolkitResult -Status ([string]$elevated.Status) -Message ("The $Action action failed without the rights it needs, so it was relaunched once with administrator rights. " + [string]$elevated.Message) -Data $elevated.Data
+}
+
 function Invoke-ToolkitAction {
     param(
         [Parameter(Mandatory = $true)]
@@ -417,11 +472,14 @@ function Invoke-ToolkitAction {
         [string]$Mode = '',
         [object]$StartIndex = $null,
         [switch]$Confirmed,
+        [switch]$FetchDependencies,
+        [switch]$ElevatedChild,
         [scriptblock]$Prompt = $null,
         [scriptblock]$Runner = $null
     )
 
     $refusal = Get-ToolkitActionRefusal -Action $Action
+
     if ($null -ne $refusal) {
         return $refusal
     }
@@ -474,7 +532,13 @@ function Invoke-ToolkitAction {
     if ($Action -ceq 'Verify') {
         $report = Get-ToolkitReport -Install $install.Data -Instance $selected -Journal $null -StateRoot $statePath -Runner $Runner
         $status = if (@($report.Failures).Count -eq 0) { 'Success' } else { 'Warning' }
-        return Get-ToolkitResult -Status $status -Message "The read-only report for the instance at index $selectedIndex is collected. Root state: $($report.Guest.Root). $($report.Install.Edition) installation $($report.Install.InstallRoot)." -Data ([pscustomobject]@{ Report = $report })
+        # The concealment result is named in the headline so the summary line is never quieter than
+        # the block it introduces.
+        $concealmentCode = [string](Get-ToolkitRecordValue -Record (Get-ToolkitRecordValue -Record $report -PropertyNames @('Concealment')) -PropertyNames @('Code'))
+        if ([string]::IsNullOrWhiteSpace($concealmentCode)) {
+            $concealmentCode = 'CLONE_UNVERIFIED'
+        }
+        return Get-ToolkitResult -Status $status -Message "The read-only report for the instance at index $selectedIndex is collected. Root state: $($report.Guest.Root). Concealment: $concealmentCode. $($report.Install.Edition) installation $($report.Install.InstallRoot)." -Data ([pscustomobject]@{ Report = $report })
     }
 
     if ($Action -ceq 'Root12') {
@@ -505,6 +569,29 @@ function Invoke-ToolkitAction {
         $clone = Get-ToolkitVerifiedClone -StateRoot $statePath -Install $install.Data -Index $selectedIndex
         if ($clone.Status -ne 'Success') {
             return $clone
+        }
+        try {
+            $manifest = Get-ToolkitManifest -Path (Join-Path $PSScriptRoot 'Manifest.json')
+        }
+        catch {
+            return Get-ToolkitResult -Status 'CriticalError' -Message ('The dependency manifest could not be loaded, so nothing was installed and no app scope changed. ' + [string]$_.Exception.Message) -Data (@{ Code = 'MANIFEST_INVALID' })
+        }
+        # The HMA scope this action writes is unreadable without the HMA package and the Vector module,
+        # so both are installed or verified first. Acquisition and mutation stay separate phases: the
+        # pinned assets are fetched and verified here, and the install itself is cached-only, so no
+        # download can happen after rights are raised.
+        if ($FetchDependencies -and -not $ElevatedChild) {
+            foreach ($assetId in @($script:ConcealmentDependencyAssetIds)) {
+                $fetched = Save-ToolkitManifestAsset -Manifest $manifest -Id $assetId
+                if ($fetched.Status -ne 'Success') {
+                    return Get-ToolkitResult -Status 'CriticalError' -Message ("The pinned concealment dependency was not acquired, so nothing was installed and no app scope changed. " + [string]$fetched.Message) -Data $fetched.Data
+                }
+            }
+        }
+        $dependencyJournal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'ConcealDependencies' -Instance $selected
+        $dependencies = Install-ConcealmentDependencies -Instance $selected -VerifiedClone $clone.Data -Manifest $manifest -Journal $dependencyJournal
+        if ($dependencies.Status -notin @('Success', 'AlreadyApplied')) {
+            return $dependencies
         }
         $journal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'Conceal' -Instance $selected
         $result = Set-AppConcealment -Instance $selected -VerifiedClone $clone.Data -Packages $Packages -Journal $journal
@@ -539,6 +626,28 @@ function Format-ToolkitInstanceChoices {
         $lines += ('  ' + ($records.Count - $listed) + ' more instance(s) were not listed. Run the read-only report for the full list.')
     }
     return $lines
+}
+
+# PowerShell -File hands a comma separated list over as one string, so the documented -Packages a,b
+# form is split once here. The elevated child repeats the same argument, so it normalizes it the
+# same way, and the selection that was verified in the parent is the selection the child applies.
+function ConvertTo-ToolkitPackageSelection {
+    param([string[]]$Packages = @())
+
+    $selected = @()
+    foreach ($entry in @($Packages)) {
+        if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace($entry)) {
+            continue
+        }
+        foreach ($name in ($entry -split ',')) {
+            $trimmed = $name.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+                $selected += $trimmed
+            }
+        }
+    }
+    # The unary comma keeps an empty selection an empty array instead of nothing at all.
+    return , $selected
 }
 
 # A report field that carries no value is named with one of these two markers, so a rendered report is a fixed record instead of a varying one.
@@ -621,6 +730,12 @@ function Format-ToolkitReport {
     $backups = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Backups')
     $lines += ('  Backups.CloneIndex = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $backups -PropertyNames @('CloneIndex'))))
     $lines += ('  Backups.CloneName = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $backups -PropertyNames @('CloneName'))))
+    # Concealment is a per-app claim, so the report carries the packages it observed in scope rather
+    # than a single yes or no.
+    $concealment = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Concealment')
+    foreach ($fieldName in @('Target', 'Status', 'Code', 'Packages', 'InScope', 'OutOfScope', 'TemplateFound', 'IsWhitelist', 'HmaConfigVersion', 'KernelSUInstalled', 'AllowlistPresent')) {
+        $lines += ('  Concealment.' + $fieldName + ' = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $concealment -PropertyNames @($fieldName))))
+    }
     foreach ($fieldName in @('JournalState', 'JournalOperation', 'JournalId')) {
         $lines += ('  ' + $fieldName + ' = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $Report -PropertyNames @($fieldName))))
     }
@@ -687,8 +802,11 @@ function Invoke-MenuAction {
         [string]$Mode = '',
         [object]$StartIndex = $null,
         [switch]$Confirmed,
+        [switch]$FetchDependencies,
+        [switch]$ElevatedChild,
         [scriptblock]$Prompt = $null,
         [scriptblock]$Runner = $null,
+        [scriptblock]$ElevationRunner = $null,
         [string]$LogPath = ''
     )
 
@@ -703,10 +821,11 @@ function Invoke-MenuAction {
                 $result = & $Runner $Action
             }
             else {
-                $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt
+                $result = Invoke-ToolkitActionWithElevation -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -ElevationRunner $ElevationRunner
             }
         }
         catch {
+
             $message = Protect-ToolkitText ([string]$_.Exception.Message)
             if ([string]::IsNullOrWhiteSpace($message)) {
                 $message = 'The action failed without a reported reason.'
@@ -830,13 +949,17 @@ function Start-ToolkitController {
         [switch]$Confirmed,
         [switch]$NonInteractive,
         [switch]$SkipToolbar,
+        [switch]$FetchDependencies,
+        [switch]$ElevatedChild,
         [scriptblock]$Reader = $null,
         [scriptblock]$Writer = $null,
         [scriptblock]$Prompt = $null,
-        [scriptblock]$ActionRunner = $null
+        [scriptblock]$ActionRunner = $null,
+        [scriptblock]$ElevationRunner = $null
     )
 
     $statePath = $null
+
     try {
         $statePath = Get-ToolkitStatePath -Requested $StateRoot -Create
     }
@@ -848,6 +971,7 @@ function Start-ToolkitController {
         return 1
     }
     $logPath = [IO.Path]::Combine($statePath, 'logs', 'mumu-root-hide-toolkit.log')
+    $Packages = ConvertTo-ToolkitPackageSelection -Packages $Packages
     $write = $Writer
     if ($null -eq $write) {
         $write = { param($Line) Write-Host $Line }
@@ -861,7 +985,7 @@ function Start-ToolkitController {
             }
             return (Get-ToolkitExitCode $result)
         }
-        $result = Invoke-MenuAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $statePath -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -LogPath $logPath
+        $result = Invoke-MenuAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $statePath -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -LogPath $logPath -ElevationRunner $ElevationRunner
         foreach ($line in @(Format-ToolkitResult -Result $result)) {
             & $write $line
         }
@@ -897,7 +1021,7 @@ function Start-ToolkitController {
                 $targetMode = $Mode
                 $targetStartIndex = $StartIndex
             }
-            return (Invoke-ToolkitAction -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -Prompt $ask)
+            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
         }.GetNewClosure()
     }
 
@@ -907,6 +1031,7 @@ function Start-ToolkitController {
         & $write 'Target identifies the instance to work on, or creates or clones one. Identify changes nothing; Create and Clone ask for CONFIRM first and are the only ways this toolkit adds an instance.'
         & $write 'Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone. Conceal changes only the verified clone.'
         & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
+        & $write 'A mutating action that is denied the rights it needs asks for administrator rights once, in its own window, and fails closed if that is declined. Detect and Verify never ask.'
         foreach ($entry in @(Get-ToolkitActionCatalog)) {
             & $write ('  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)
         }
@@ -915,5 +1040,12 @@ function Start-ToolkitController {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar)
+    # UAC is a process-level concern, so only the entry point arms the elevation seam and only the
+    # entry point that is not already the elevated child carries it. An elevated child therefore has
+    # no seam at all and cannot ask for rights a second time, whatever the dispatcher decides.
+    $elevationRunner = $null
+    if (-not $ElevatedChild) {
+        $elevationRunner = $script:ToolkitProductionElevationRunner
+    }
+    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -ElevationRunner $elevationRunner)
 }

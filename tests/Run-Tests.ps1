@@ -2396,7 +2396,19 @@ function Invoke-SafetyTests {
         Assert-True ($backupSource -notmatch [regex]::Escape($forbidden)) "Backup source uses a forbidden construct: $forbidden"
     }
 
-    $fakeScript = Join-Path $testRoot 'elevated child action.ps1'
+    # The elevated child may only run a script this toolkit ships, so the boundary is the directory
+    # that holds the elevation module. The suite points that boundary at a fixture source root, and a
+    # junction under it proves a reparse-point escape is refused rather than followed.
+    $elevationSourceRoot = Join-Path $testRoot 'elevation source'
+    New-Item -ItemType Directory -Path $elevationSourceRoot -Force | Out-Null
+    $elevationEscapeRoot = Join-Path $testRoot 'elevation escape'
+    New-Item -ItemType Directory -Path $elevationEscapeRoot -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $elevationEscapeRoot 'escaped action.ps1'), 'exit 0')
+    New-Item -ItemType Junction -Path (Join-Path $elevationSourceRoot 'linked') -Target $elevationEscapeRoot | Out-Null
+    $realSourceRoot = $script:ToolkitSourceRoot
+    $script:ToolkitSourceRoot = [IO.Path]::GetFullPath($elevationSourceRoot)
+
+    $fakeScript = Join-Path $elevationSourceRoot 'elevated child action.ps1'
     [IO.File]::WriteAllText($fakeScript, 'exit 0')
     $elevationState = @{ Calls = @() }
     $fakeDeniedRunner = {
@@ -2494,40 +2506,110 @@ function Invoke-SafetyTests {
     }.GetNewClosure()
     $blankScript = Invoke-ElevatedToolkitAction -ScriptPath '   ' -Arguments @() -Runner $unreachableRunner
     Assert-Equal 'CriticalError' $blankScript.Status 'A blank elevated action path was accepted.'
-    $missingScript = Invoke-ElevatedToolkitAction -ScriptPath (Join-Path $testRoot 'missing action.ps1') -Arguments @() -Runner $unreachableRunner
+    $missingScript = Invoke-ElevatedToolkitAction -ScriptPath (Join-Path $elevationSourceRoot 'missing action.ps1') -Arguments @() -Runner $unreachableRunner
     Assert-Equal 'CriticalError' $missingScript.Status 'A missing elevated action path was accepted.'
-    $nonScriptAction = Join-Path $testRoot 'not-a-script.txt'
+    $nonScriptAction = Join-Path $elevationSourceRoot 'not-a-script.txt'
     [IO.File]::WriteAllText($nonScriptAction, 'fixture')
     $wrongTypeScript = Invoke-ElevatedToolkitAction -ScriptPath $nonScriptAction -Arguments @() -Runner $unreachableRunner
     Assert-Equal 'CriticalError' $wrongTypeScript.Status 'A non-PowerShell elevated action was accepted.'
-    $actionDirectory = Join-Path $testRoot 'action directory.ps1'
+    $actionDirectory = Join-Path $elevationSourceRoot 'action directory.ps1'
     New-Item -ItemType Directory -Path $actionDirectory -Force | Out-Null
     $directoryScript = Invoke-ElevatedToolkitAction -ScriptPath $actionDirectory -Arguments @() -Runner $unreachableRunner
     Assert-Equal 'CriticalError' $directoryScript.Status 'An elevated action directory was accepted.'
-    Assert-Equal 0 $emptyRunnerState.Count 'An invalid elevated action request reached the process runner.'
 
-    $childActionScript = Join-Path $testRoot 'child gate action.ps1'
-    $childMarkerPath = Join-Path $testRoot 'child gate marker.txt'
-    [IO.File]::WriteAllText($childActionScript, ("[IO.File]::WriteAllText('" + $childMarkerPath.Replace("'", "''") + "', 'ran')"))
+    # An elevated child runs one script from a Base64 payload, so the payload must not be able to name
+    # a script outside this toolkit's own source directory, directly or through a reparse point.
+    $outsideScript = Join-Path $testRoot 'outside action.ps1'
+    [IO.File]::WriteAllText($outsideScript, 'exit 0')
+    $outsideRefused = Invoke-ElevatedToolkitAction -ScriptPath $outsideScript -Arguments @() -Runner $unreachableRunner
+    Assert-Equal 'CriticalError' $outsideRefused.Status 'An elevated action outside the toolkit source directory was accepted.'
+    $escapedScript = Join-Path $elevationSourceRoot 'linked\escaped action.ps1'
+    $escapedRefused = Invoke-ElevatedToolkitAction -ScriptPath $escapedScript -Arguments @() -Runner $unreachableRunner
+    Assert-Equal 'CriticalError' $escapedRefused.Status 'An elevated action reached through a reparse point outside the source directory was accepted.'
+    $siblingScript = Join-Path (Split-Path -Parent $elevationSourceRoot) 'sibling action.ps1'
+    [IO.File]::WriteAllText($siblingScript, 'exit 0')
+    $siblingRefused = Invoke-ElevatedToolkitAction -ScriptPath $siblingScript -Arguments @() -Runner $unreachableRunner
+    Assert-Equal 'CriticalError' $siblingRefused.Status 'An elevated action beside the source directory was accepted.'
+    Assert-Throws { New-ToolkitElevatedArgumentList -ScriptPath $outsideScript -Arguments @() } 'An elevated child payload was built for a script outside the source directory.'
+    Assert-Throws { New-ToolkitElevatedArgumentList -ScriptPath $escapedScript -Arguments @() } 'An elevated child payload was built for a reparse-point escape.'
+    Assert-Equal 0 $emptyRunnerState.Count 'A refused elevated action request reached the process runner.'
+
+    # A permission failure is the only outcome that may ask for rights, so it is recognized by an
+    # explicit code or an access-denied message and by nothing else.
+    Assert-True ($null -ne (Get-Command Test-ToolkitPermissionFailure -CommandType Function -ErrorAction SilentlyContinue)) 'Test-ToolkitPermissionFailure is unavailable.'
+    $accessDeniedMessage = 'Campaign replacement failed: Access to the path ''D:\MuMu Global\shell\ad\campaign.json'' is denied.'
+    Assert-Equal $true (Test-ToolkitPermissionFailure -Result (Get-ToolkitResult -Status 'CriticalError' -Message $accessDeniedMessage -Data (@{ Code = 'CAMPAIGN_REPLACE_FAILED' }))) 'An access-denied campaign write was not recognized as a permission failure.'
+    Assert-Equal $true (Test-ToolkitPermissionFailure -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'UnauthorizedAccessException: the file is locked by another process.')) 'An UnauthorizedAccessException was not recognized as a permission failure.'
+    Assert-Equal $false (Test-ToolkitPermissionFailure -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'The campaign backup root already contains a restore point. An existing backup is never overwritten.')) 'A semantic refusal was treated as a permission failure.'
+    Assert-Equal $false (Test-ToolkitPermissionFailure -Result (Get-ToolkitResult -Status 'Success' -Message 'Suppressed 1 campaign file(s) and skipped 0.')) 'A success was treated as a permission failure.'
+    Assert-Equal $false (Test-ToolkitPermissionFailure -Result $null) 'A missing result was treated as a permission failure.'
+
+    # The elevated child repeats the caller's own request, so consent and every bound parameter
+    # survive the relaunch and the child is told it must not ask for rights again.
+    Assert-True ($null -ne (Get-Command New-ToolkitElevatedChildArguments -CommandType Function -ErrorAction SilentlyContinue)) 'New-ToolkitElevatedChildArguments is unavailable.'
+    $boundChild = @(New-ToolkitElevatedChildArguments -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -InstanceIndex 3 -StateRoot 'C:\toolkit state' -Confirmed)
+    Assert-True ($boundChild -ccontains '-NonInteractive') 'The elevated child was not launched as a single noninteractive run.'
+    Assert-True ($boundChild -ccontains '-ElevatedChild') 'The elevated child was not told that it is already the elevated run.'
+    Assert-Equal 'RemoveAds' $boundChild[[array]::IndexOf($boundChild, '-Action') + 1] 'The elevated child lost the allowlisted action.'
+    Assert-Equal 'C:\MuMu Global' $boundChild[[array]::IndexOf($boundChild, '-InstallRoot') + 1] 'The elevated child lost the bound installation.'
+    Assert-Equal '3' $boundChild[[array]::IndexOf($boundChild, '-InstanceIndex') + 1] 'The elevated child lost the bound instance index.'
+    Assert-Equal 'C:\toolkit state' $boundChild[[array]::IndexOf($boundChild, '-StateRoot') + 1] 'The elevated child lost the bound state root.'
+    Assert-True ($boundChild -ccontains '-Confirmed') 'The elevated child lost the operator consent token.'
+    Assert-True ($boundChild -cnotcontains '-FetchDependencies') 'The elevated child may fetch a dependency after rights were raised.'
+    Assert-True ($boundChild -cnotcontains '-Packages') 'An action that takes no package selection bound one for the elevated child.'
+    Assert-Equal 0 @($boundChild | Where-Object { [string]$_ -ceq '-Mode' -or [string]$_ -ceq '-StartIndex' -or [string]$_ -ceq '-SourceIndex' -or [string]$_ -ceq '-Packages' }).Count 'An action with no target parameters bound one for the elevated child.'
+    $boundConceal = @(New-ToolkitElevatedChildArguments -Action 'Conceal' -Packages @('com.example.app') -StateRoot 'C:\toolkit state')
+    Assert-Equal 'com.example.app' $boundConceal[[array]::IndexOf($boundConceal, '-Packages') + 1] 'The elevated child lost the bound package selection.'
+    Assert-True ($boundConceal -cnotcontains '-Confirmed') 'The elevated child invented an operator confirmation that was never given.'
+    foreach ($unelevatableAction in @('Detect', 'Verify', 'Q', 'Bogus', '   ')) {
+        Assert-Throws { New-ToolkitElevatedChildArguments -Action $unelevatableAction -StateRoot 'C:\toolkit state' } "A read-only or unknown action was bound for an elevated relaunch: $unelevatableAction"
+    }
+    $script:ToolkitSourceRoot = $realSourceRoot
+
+    # The child gate is proven in a fresh process, so the action it may run is a real toolkit script.
+    $childActionScript = $commonPath
     $childArgumentList = @(New-ToolkitElevatedArgumentList -ScriptPath $childActionScript -Arguments @('-Fixture', 'Child'))
     $childResult = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $childArgumentList
     if ($preflight) {
         Assert-Equal 0 $childResult.ExitCode 'The elevated child gate rejected an elevated parent.'
-        Assert-True ([IO.File]::Exists($childMarkerPath)) 'The elevated child did not run the action script.'
     }
     else {
         Assert-Equal 1223 $childResult.ExitCode 'The non-elevated child gate did not return the elevation failure code.'
-        Assert-True (-not [IO.File]::Exists($childMarkerPath)) 'The non-elevated child gate ran the action script.'
-    }
-    if ([IO.File]::Exists($childMarkerPath)) {
-        [IO.File]::Delete($childMarkerPath)
     }
     $childArgumentList = @(New-ToolkitElevatedArgumentList -ScriptPath $childActionScript -Arguments @('-Fixture', 'Child'))
     $childTextArgumentList = [string[]]@($childArgumentList)
     $childTextArgumentList[$childTextArgumentList.Length - 1] = 'not-base64'
     $childCorrupt = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $childTextArgumentList
     Assert-True ($childCorrupt.ExitCode -ne 0) 'A corrupt child payload returned success.'
-    Assert-True (-not [IO.File]::Exists($childMarkerPath)) 'A corrupt child payload ran the action script.'
+    $childOutsideArgumentList = [string[]]@(New-ToolkitElevatedArgumentList -ScriptPath $commonPath -Arguments @())
+    $childOutsideArgumentList[$childOutsideArgumentList.Length - 1] = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((@{ Action = $outsideScript; Arguments = @() } | ConvertTo-Json -Compress)))
+    $childOutside = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $childOutsideArgumentList
+    Assert-True ($childOutside.ExitCode -ne 0) 'An elevated child ran a payload that named a script outside the source directory.'
+
+    # The elevated child is launched with -File, so the elevation module has to stand up on its own.
+    # This runs the same three-file composition the entry point builds, in a process that has loaded
+    # nothing else, and proves the source-directory bound is available before the child gate is passed.
+    $standaloneElevationScript = @'
+$ErrorActionPreference = 'Stop'
+. '__COMMON__'
+. '__DISCOVERY__'
+. '__ELEVATION__'
+$refused = $false
+try {
+    Assert-ToolkitPowerShellAction -Path (Join-Path $env:SystemRoot 'System32\drivers\etc\hosts') -Label 'outside' | Out-Null
+}
+catch {
+    $refused = $true
+}
+if (-not $refused) { throw 'A script outside the source directory was accepted without the controller.' }
+$inside = Assert-ToolkitPowerShellAction -Path (Join-Path $script:ToolkitSourceRoot 'Common.ps1') -Label 'inside'
+if ($inside -cne (Join-Path $script:ToolkitSourceRoot 'Common.ps1')) { throw 'A script inside the source directory was refused without the controller.' }
+Write-Output 'STANDALONE_ELEVATION_OK'
+'@
+    $standaloneElevationScript = $standaloneElevationScript.Replace('__COMMON__', $commonPath).Replace('__DISCOVERY__', $discoveryScriptPath).Replace('__ELEVATION__', $elevationScriptPath)
+    $standaloneElevation = Invoke-CheckedProcess -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-Command', $standaloneElevationScript)
+    Assert-Equal 0 $standaloneElevation.ExitCode "The standalone elevation module could not hold the source-directory bound: $($standaloneElevation.Text)"
+    Assert-True ($standaloneElevation.Text -match 'STANDALONE_ELEVATION_OK') "The standalone elevation module did not finish: $($standaloneElevation.Text)"
 
     $cloneRoot = Join-Path $testRoot 'clone fixtures'
     $cloneFixture = New-SafetyInstallFixture -InstallRoot (Join-Path $cloneRoot 'MuMu Global') -InstanceIndexes @(0, 2, 3)
@@ -8559,7 +8641,7 @@ function Invoke-MenuTests {
             )) {
             Assert-True ($verifyWarningText.Contains($expectedLine)) "The rendered Verify report does not carry the documented line: $expectedLine"
         }
-        foreach ($fieldLine in @('Virtualization', 'Guest.Code', 'Guest.DaemonCount', 'JournalId')) {
+        foreach ($fieldLine in @('Virtualization', 'Guest.Code', 'Guest.DaemonCount', 'JournalId', 'Concealment.Target', 'Concealment.Status', 'Concealment.Code', 'Concealment.InScope', 'Concealment.KernelSUInstalled')) {
             Assert-True ($verifyWarningText -match ('(?m)^  ' + [regex]::Escape($fieldLine) + ' = \S')) "The rendered Verify report does not carry the reported field: $fieldLine"
         }
 
@@ -8769,7 +8851,7 @@ function Invoke-MenuTests {
         Assert-Equal 1 $childStateFiles.Count "A refused noninteractive action wrote state other than its log: $($childStateFiles -join '|')"
         Assert-True ($childStateFiles[0] -match '\.log$') "A refused noninteractive action wrote state other than its log: $($childStateFiles[0])"
 
-        $flowState = @{ Calls = @(); Confirmed = $null; Packages = @() }
+        $flowState = @{ Calls = @(); Confirmed = $null; Packages = @(); CloneIndex = -1; Fetches = @() }
         function Install-Android12Root {
             param([object]$Instance, [object]$Manifest, [object]$Journal, [bool]$Interactive = $false, [string]$Confirmation = '', [string]$CacheRoot = '', [scriptblock]$Runner = $null, [scriptblock]$Prompt = $null, [object]$ResumeClone = $null, [switch]$RequireCachedAsset)
             $flowState.Calls += 'Root12'
@@ -8781,11 +8863,17 @@ function Invoke-MenuTests {
             $flowState.Confirmed = [bool]$Confirmed
             return (Get-ToolkitResult -Status 'Success' -Message 'shadowed Android 15 flow.')
         }
+        function Install-ConcealmentDependencies {
+            param([object]$Instance, [object]$VerifiedClone, [object]$Manifest, [object]$Journal, [string]$CacheRoot = '', [scriptblock]$Runner = $null)
+            $flowState.Calls += 'ConcealDependencies'
+            $flowState.CloneIndex = [int]$VerifiedClone.CloneIndex
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed dependency install.' -Data ([pscustomobject]@{ Code = 'OK' }))
+        }
         function Set-AppConcealment {
             param([object]$Instance, [object]$VerifiedClone, [string[]]$Packages, [object]$Journal, [scriptblock]$Runner = $null)
             $flowState.Calls += 'Conceal'
             $flowState.Packages = @($Packages)
-            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed concealment flow.')
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed concealment flow.' -Data ([pscustomobject]@{ Code = 'OK' }))
         }
         function Suppress-MuMuAds {
             param([string[]]$Paths, [string]$BackupRoot, [object]$Journal)
@@ -8844,6 +8932,8 @@ function Invoke-MenuTests {
         Assert-True ($toolbarText -match '(?i)keeps an exact backup') 'The toolbar does not state the advertisement backup boundary.'
         Assert-True ($toolbarText -match '(?i)Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone') 'The toolbar does not describe what Root12 and Root15 do to the selected instance.'
         Assert-True ($toolbarText -match '(?i)Conceal changes only the verified clone') 'The toolbar does not describe what Conceal changes.'
+        Assert-True ($toolbarText -match '(?i)asks for administrator rights once') 'The toolbar does not state that a denied action asks for rights once.'
+        Assert-True ($toolbarText -match '(?i)Detect and Verify never ask') 'The toolbar does not state that the read-only actions never ask for rights.'
         Assert-True ($toolbarText -match '(?i)Target identifies the instance to work on, or creates or clones one\. Identify changes nothing; Create and Clone ask for CONFIRM first') 'The toolbar does not describe the target selection modes.'
         Assert-True ($toolbarText -notmatch '(?i)change only a verified clone of the selected instance') 'The toolbar hides that Root12 and Root15 also stop the selected instance.'
 
@@ -8943,6 +9033,80 @@ function Invoke-MenuTests {
         Assert-True ((@($packageState.Questions) -join '|') -match '(?i)package') 'The interactive concealment action did not ask for the selected applications.'
         Assert-Equal (@('jp.pokemon.pokemontcgp', 'com.example.other') -join '|') ($flowState.Packages -join '|') 'The interactive concealment action did not pass the trimmed package selection.'
 
+        # Conceal must install or verify its declared dependencies before the scope write, because the
+        # HMA scope it writes is unreadable without the HMA package and the Vector module.
+        $flowState.Calls = @()
+        $flowState.CloneIndex = -1
+        $flowState.Fetches = @()
+        function Save-ToolkitManifestAsset {
+            param([object]$Manifest, [string]$Id, [string]$CacheRoot = '', [scriptblock]$Fetch = $null, [switch]$RequireCached)
+            $flowState.Fetches += $Id
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed asset acquisition.' -Data ([pscustomobject]@{ Code = 'OK'; Asset = 'C:\assets\fixture' }))
+        }
+        $concealOrdered = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot $menuStateRoot
+        Assert-Equal 'Success' $concealOrdered.Status "The concealment dispatch failed. $($concealOrdered.Message)"
+        Assert-Equal 'ConcealDependencies|Conceal' ($flowState.Calls -join '|') 'Concealment did not install its declared dependencies before the scope write.'
+        Assert-Equal 7 $flowState.CloneIndex 'The concealment dependency step was not given the verified clone record.'
+        Assert-Equal 0 $flowState.Fetches.Count 'A concealment run without the explicit opt-in reached the network for a dependency.'
+
+        $flowState.Calls = @()
+        $flowState.Fetches = @()
+        $concealFetching = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot $menuStateRoot -FetchDependencies
+        Assert-Equal 'Success' $concealFetching.Status "The fetching concealment dispatch failed. $($concealFetching.Message)"
+        Assert-Equal 'ConcealDependencies|Conceal' ($flowState.Calls -join '|') 'The opt-in concealment run did not install its dependencies before the scope write.'
+        Assert-Equal 'hma|vector' ($flowState.Fetches -join '|') 'The opt-in concealment run did not ask for both pinned dependencies first.'
+
+        $flowState.Calls = @()
+        $flowState.Fetches = @()
+        $concealElevated = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot $menuStateRoot -FetchDependencies -ElevatedChild
+        Assert-Equal 'Success' $concealElevated.Status "The elevated concealment dispatch failed. $($concealElevated.Message)"
+        Assert-Equal 0 $flowState.Fetches.Count 'An elevated child reached the network for a dependency after rights were raised.'
+
+        # A run with no verified clone record changes nothing at all, so no dependency is installed.
+        $flowState.Calls = @()
+        $concealWithoutCloneFlow = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $concealInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot (Join-Path $testRoot 'menu conceal unverified state')
+        Assert-Equal 'CriticalError' $concealWithoutCloneFlow.Status 'Concealment was accepted without a verified clone record.'
+        Assert-Equal 0 $flowState.Calls.Count "Concealment without a verified clone record ran a mutating flow: $($flowState.Calls -join '|')"
+
+        # The read-only report carries concealment evidence for the verified clone, and a clone whose
+        # root is Kitsune rather than KernelSU stays an honest Warning instead of a claimed success.
+        $evidenceConfigText = '{"configVersion":93,"templates":{"Root":{"isWhitelist":false,"appList":["org.frknkrc44.hma_oss","me.weishu.kernelsu"]}},"settingsTemplates":{},"scope":{"jp.pokemon.pokemontcgp":"Root"}}'
+        $evidenceResponses = Get-MenuGuestResponses
+        $evidenceResponses['config.json'] = @(0, $evidenceConfigText)
+        $evidenceReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $evidenceResponses)
+        Assert-Equal 7 $evidenceReport.Concealment.Target 'The report did not report the verified clone as the concealment target.'
+        Assert-Equal 'jp.pokemon.pokemontcgp' (@($evidenceReport.Concealment.Packages) -join '|') 'The report did not report the packages the blacklist Root template is assigned to.'
+        Assert-Equal 1 @($evidenceReport.Concealment.InScope).Count 'The report did not report the concealment scope it observed.'
+        Assert-Equal 'OK' $evidenceReport.Concealment.Code 'The report did not report concealment evidence for an applied scope.'
+        Assert-Equal 'Success' $evidenceReport.Concealment.Status 'The report did not report a verified concealment scope.'
+        Assert-Equal $true $evidenceReport.Concealment.TemplateFound 'The report did not report the stored Root template.'
+        Assert-Equal $false $evidenceReport.Concealment.IsWhitelist 'The report reported the stored Root template as a whitelist.'
+        Assert-Equal 93 $evidenceReport.Concealment.HmaConfigVersion 'The report did not report the observed HMA configuration version.'
+
+        $kitsuneEvidenceResponses = Get-MenuGuestResponses
+        # An Android 12 Kitsune clone carries the Kitsune packages and no KernelSU package at all.
+        $kitsuneEvidenceResponses.Remove('dumpsys package me.weishu.kernelsu')
+        $kitsuneEvidenceResponses['pm list packages'] = @(0, ('package:org.frknkrc44.hma_oss' + [Environment]::NewLine + 'package:io.github.huskydg.magisk' + [Environment]::NewLine + 'package:jp.pokemon.pokemontcgp'))
+        $kitsuneEvidenceResponses['config.json'] = @(0, $evidenceConfigText)
+        $kitsuneEvidenceReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $kitsuneEvidenceResponses)
+        Assert-Equal 'Warning' $kitsuneEvidenceReport.Concealment.Status 'The report reported concealment as verified on a Kitsune clone that has no KernelSU package.'
+        Assert-Equal 'KERNELSU_ABSENT' $kitsuneEvidenceReport.Concealment.Code 'The report did not report the absent KernelSU package on a Kitsune clone.'
+        Assert-Equal $false $kitsuneEvidenceReport.Concealment.KernelSUInstalled 'The report reported a KernelSU package on a Kitsune clone that has none.'
+        Assert-Equal 1 @($kitsuneEvidenceReport.Concealment.InScope).Count 'The report did not observe the concealment scope on a Kitsune clone.'
+
+        $noCloneEvidenceReport = Get-ToolkitReport -Install $concealInstall.Install -Instance ([pscustomobject]@{ Index = 2; Name = 'Android 12'; AndroidVersion = '12.0'; Install = $concealInstall.Install }) -StateRoot (Join-Path $testRoot 'menu no clone evidence state') -Runner (New-MenuGuestRunner -Responses $evidenceResponses)
+        Assert-Equal 'CLONE_UNVERIFIED' $noCloneEvidenceReport.Concealment.Code 'The report collected concealment evidence without a verified clone record.'
+        Assert-Equal '' $noCloneEvidenceReport.Concealment.Target 'The report named a concealment target without a verified clone record.'
+        Assert-Equal 0 @($noCloneEvidenceReport.Concealment.Packages).Count 'The report reported concealment packages without a verified clone record.'
+        # A guest whose HMA scope map assigns the template to no app has nothing to claim, so the
+        # evidence is an explicit empty scope rather than a reported success.
+        $unscopedEvidenceResponses = Get-MenuGuestResponses
+        $unscopedEvidenceResponses['config.json'] = @(0, (New-ConcealmentConfigText))
+        $unscopedEvidenceReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $unscopedEvidenceResponses)
+        Assert-Equal 'SCOPE_EMPTY' $unscopedEvidenceReport.Concealment.Code 'The report claimed an applied concealment scope on a guest that assigns the template to no app.'
+        Assert-Equal 0 @($unscopedEvidenceReport.Concealment.InScope).Count 'The report reported an in-scope app for an unapplied concealment scope.'
+        Assert-Equal 0 @($unscopedEvidenceReport.Concealment.Packages).Count 'The report reported concealment packages for an unapplied concealment scope.'
+
         $standaloneRoot = Join-Path $testRoot 'standalone verification'
         $standaloneShell = Join-Path $standaloneRoot 'shell'
         [void][IO.Directory]::CreateDirectory($standaloneShell)
@@ -8996,6 +9160,133 @@ Write-Output 'STANDALONE_OK'
         Assert-Equal 1 $launcherScripted.ExitCode "A scripted launcher invocation did not propagate the controller exit code: $($launcherScripted.Text)"
         $launcherInteractive = Invoke-CheckedProcess -FilePath $cmdPath -ArgumentList @('/c', $launcherInteractiveFixture)
         Assert-True ($launcherInteractive.Text -match 'Press any key') "An interactive launcher failure did not pause for a key press: $($launcherInteractive.Text)"
+
+        # The mutating dispatch must reach the elevation mechanism: one in-process attempt, then at
+        # most one elevated relaunch that repeats the caller's own allowlisted request. The seam is
+        # injected here, so no test can ever raise a real UAC prompt.
+        Assert-True ($null -ne (Get-Command Invoke-ToolkitActionWithElevation -CommandType Function -ErrorAction SilentlyContinue)) 'Invoke-ToolkitActionWithElevation is unavailable.'
+        Assert-True ($null -ne (Get-Command ConvertTo-ToolkitPackageSelection -CommandType Function -ErrorAction SilentlyContinue)) 'ConvertTo-ToolkitPackageSelection is unavailable.'
+        # PowerShell -File hands "-Packages a,b" over as one string, so the documented form is split once.
+        Assert-Equal 'a|b' ((ConvertTo-ToolkitPackageSelection -Packages @('a,b')) -join '|') 'A comma separated package selection was not split.'
+        Assert-Equal 'a|b|jp.pokemon.pokemontcgp' ((ConvertTo-ToolkitPackageSelection -Packages @('a, b', ' jp.pokemon.pokemontcgp ')) -join '|') 'A comma separated package selection was not trimmed or joined.'
+        Assert-Equal 0 (ConvertTo-ToolkitPackageSelection -Packages @('   ', ',', '')).Count 'A blank package selection produced a package name.'
+        Assert-Equal 'a|b' ((ConvertTo-ToolkitPackageSelection -Packages @('a', 'b')) -join '|') 'A separate package list was not preserved.'
+        Assert-Equal 0 (ConvertTo-ToolkitPackageSelection -Packages @()).Count 'An absent package selection did not stay empty.'
+        Assert-True ($controllerSource -match 'ConvertTo-ToolkitPackageSelection -Packages \$Packages') 'The controller does not normalize the command-line package selection.'
+        Assert-True ($controllerSource -match 'ToolkitProductionElevationRunner') 'The controller process entry point does not arm the elevation seam.'
+        $controllerParameters = @((Get-Command Invoke-ToolkitAction -CommandType Function).Parameters.Keys)
+        Assert-True ($controllerParameters -ccontains 'ElevatedChild') 'The dispatcher does not accept the internal elevated-child switch.'
+        $controllerErrors = $null
+        $controllerBlock = @([System.Management.Automation.Language.Parser]::ParseFile($controllerScriptPath, [ref]$null, [ref]$controllerErrors).ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        Assert-Equal 0 @($controllerErrors).Count 'The controller script does not parse.'
+        foreach ($controllerSwitch in @('ElevatedChild', 'FetchDependencies', 'Confirmed', 'Packages')) {
+            Assert-True ($controllerBlock -ccontains $controllerSwitch) "The controller does not declare the parameter: $controllerSwitch"
+        }
+        $administratorPreflight = Test-ToolkitAdministrator
+        $permissionFailureMessage = 'Campaign replacement failed: Access to the path ''C:\MuMu Global\shell\ad\campaign.json'' is denied.'
+        $elevationAttempts = @{
+            Attempts = 0
+            Launches = @()
+            Message  = $permissionFailureMessage
+            Code     = 'CAMPAIGN_REPLACE_FAILED'
+        }
+        function Invoke-ToolkitAction {
+            param([string]$Action, [string]$InstallRoot = '', [int]$InstanceIndex = -1, [int]$SourceIndex = -1, [string]$StateRoot = '', [string[]]$Packages = @(), [string]$Mode = '', [object]$StartIndex = $null, [switch]$Confirmed, [scriptblock]$Prompt = $null, [scriptblock]$Runner = $null, [switch]$ElevatedChild)
+            $elevationAttempts.Attempts++
+            return (Get-ToolkitResult -Status 'CriticalError' -Message $elevationAttempts.Message -Data (@{ Code = $elevationAttempts.Code }))
+        }
+        $grantedElevationRunner = {
+            param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+            $elevationAttempts.Launches += ,@($ActualFilePath, $ActualArgumentList, $ActualVerb)
+            return (Get-ToolkitResult -Status 'Success' -Message 'The elevated child action completed.' -Data (@{ ExitCode = 0; Elevated = $true }))
+        }.GetNewClosure()
+        $declinedElevationRunner = {
+            param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+            $elevationAttempts.Launches += ,@($ActualFilePath, $ActualArgumentList, $ActualVerb)
+            return (Get-ToolkitResult -Status 'CriticalError' -Message 'Elevation was denied or cancelled by Windows.' -Data (@{ ExitCode = 1; Elevated = $false }))
+        }.GetNewClosure()
+        $silentElevationRunner = {
+            param($ActualFilePath, $ActualArgumentList, $ActualVerb)
+            $elevationAttempts.Launches += ,@($ActualFilePath, $ActualArgumentList, $ActualVerb)
+            return $null
+        }.GetNewClosure()
+
+        $elevatedOnce = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $grantedElevationRunner
+        Assert-Equal 1 $elevationAttempts.Attempts 'The mutating action was not attempted exactly once before the elevated relaunch.'
+        Assert-Equal 1 $elevationAttempts.Launches.Count 'A non-elevated permission failure did not trigger exactly one elevated relaunch.'
+        Assert-Equal 'Success' $elevatedOnce.Status "The elevated relaunch did not report its outcome. $($elevatedOnce.Message)"
+        Assert-Equal $true $elevatedOnce.Data.Elevated 'The elevated relaunch did not report the verified elevation state.'
+        $launch = @($elevationAttempts.Launches)[0]
+        Assert-Equal ([IO.Path]::GetFullPath($controllerScriptPath)) $launch[0] 'The elevated relaunch did not run the toolkit controller that owns the dispatcher.'
+        $boundPayload = [string[]]@($launch[1])
+        Assert-True ($boundPayload -ccontains '-NonInteractive') 'The elevated child was not launched as a single noninteractive run.'
+        Assert-Equal 'RemoveAds' $boundPayload[[array]::IndexOf($boundPayload, '-Action') + 1] 'The elevated relaunch did not carry the allowlisted action.'
+        Assert-Equal 'C:\MuMu Global' $boundPayload[[array]::IndexOf($boundPayload, '-InstallRoot') + 1] 'The elevated relaunch did not carry the bound installation path.'
+        Assert-Equal 'C:\toolkit state' $boundPayload[[array]::IndexOf($boundPayload, '-StateRoot') + 1] 'The elevated relaunch did not carry the bound state path.'
+        Assert-True ($boundPayload -ccontains '-ElevatedChild') 'The elevated relaunch did not mark the child as the already elevated run.'
+
+        $elevationAttempts.Attempts = 0
+        $elevationAttempts.Launches = @()
+        $childRun = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevatedChild -ElevationRunner $grantedElevationRunner
+        Assert-Equal 1 $elevationAttempts.Attempts 'The elevated child did not attempt the action exactly once.'
+        Assert-Equal 0 $elevationAttempts.Launches.Count 'The elevated child asked for rights a second time.'
+        Assert-Equal 'CriticalError' $childRun.Status 'The elevated child hid a permission failure instead of reporting it.'
+        Assert-Equal 'CAMPAIGN_REPLACE_FAILED' $childRun.Data.Code 'The elevated child changed the reported failure code.'
+
+        $elevationAttempts.Attempts = 0
+        $elevationAttempts.Launches = @()
+        $declined = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $declinedElevationRunner
+        Assert-Equal 'CriticalError' $declined.Status 'A declined elevation was treated as success.'
+        Assert-True ($declined.Message -match '(?i)denied|cancelled') "A declined elevation did not report a permission error. $($declined.Message)"
+        Assert-Equal 1 $elevationAttempts.Attempts 'A declined elevation repeated the in-process attempt instead of failing closed.'
+        Assert-Equal 1 $elevationAttempts.Launches.Count 'A declined elevation asked for rights more than once.'
+
+        $elevationAttempts.Attempts = 0
+        $elevationAttempts.Launches = @()
+        $silentElevation = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $silentElevationRunner
+        Assert-Equal 'CriticalError' $silentElevation.Status 'An elevated relaunch that reported no outcome was treated as success.'
+        Assert-Equal 'ELEVATION_OUTCOME_INVALID' $silentElevation.Data.Code 'An elevated relaunch without an outcome reported the wrong code.'
+        Assert-Equal 1 $elevationAttempts.Attempts 'An elevated relaunch without an outcome repeated the in-process attempt.'
+
+        $elevationAttempts.Attempts = 0
+        $elevationAttempts.Launches = @()
+        $elevationAttempts.Message = 'The campaign backup root already contains a restore point. An existing backup is never overwritten.'
+        $elevationAttempts.Code = 'CAMPAIGN_RESTORE_POINT_MISSING'
+        $semantic = Invoke-ToolkitActionWithElevation -Action 'Root12' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $grantedElevationRunner
+        Assert-Equal 1 $elevationAttempts.Attempts 'A semantic refusal was not reported from the in-process attempt.'
+        Assert-Equal 0 $elevationAttempts.Launches.Count 'A semantic refusal forced a host that does not need rights through a UAC prompt.'
+        Assert-Equal 'CAMPAIGN_RESTORE_POINT_MISSING' $semantic.Data.Code 'A semantic refusal was replaced by an elevation outcome.'
+
+        $elevationAttempts.Message = $permissionFailureMessage
+        $elevationAttempts.Code = 'ACCESS_DENIED'
+        foreach ($readOnlyAction in @('Detect', 'Verify')) {
+            $elevationAttempts.Attempts = 0
+            $elevationAttempts.Launches = @()
+            $readOnlyResult = Invoke-ToolkitActionWithElevation -Action $readOnlyAction -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $grantedElevationRunner
+            Assert-Equal 1 $elevationAttempts.Attempts "A read-only action was not attempted in process: $readOnlyAction"
+            Assert-Equal 0 $elevationAttempts.Launches.Count "A read-only action was relaunched elevated: $readOnlyAction"
+            Assert-Equal 'CriticalError' $readOnlyResult.Status "A read-only action hid its own failure: $readOnlyAction"
+        }
+
+        $elevationAttempts.Attempts = 0
+        $elevationAttempts.Launches = @()
+        $unarmed = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state'
+        Assert-Equal 1 $elevationAttempts.Attempts 'An unarmed process did not attempt the action in process.'
+        Assert-Equal 'CriticalError' $unarmed.Status 'An unarmed process reported a permission failure as anything but a failure.'
+        Assert-Equal 'ACCESS_DENIED' $unarmed.Data.Code 'An unarmed process changed the reported failure code.'
+
+        $elevationAttempts.Attempts = 0
+        $elevationAttempts.Launches = @()
+        $alreadyElevated = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $grantedElevationRunner
+        Assert-Equal 1 $elevationAttempts.Attempts 'The mutating action was not attempted exactly once.'
+        if ($administratorPreflight) {
+            Assert-Equal 0 $elevationAttempts.Launches.Count 'A process that already holds rights asked Windows for them again.'
+            Assert-Equal 'CriticalError' $alreadyElevated.Status 'A process that already holds rights hid the permission failure.'
+        }
+        else {
+            Assert-Equal 1 $elevationAttempts.Launches.Count 'A non-elevated permission failure did not reach the elevation seam.'
+        }
+        Remove-Item -LiteralPath 'function:Invoke-ToolkitAction' -ErrorAction SilentlyContinue
     }
     finally {
         $script:MenuFallbackRoots = @()
@@ -9784,14 +10075,23 @@ function Invoke-DocsTests {
             @{ Pattern = 'Android 15'; Message = 'README does not state the Android 15 behavior.' }
             @{ Pattern = '(?i)Setup order'; Message = 'README does not state the setup order.' }
             @{ Pattern = '(?i)Run as administrator'; Message = 'README does not state how the operator supplies administrator rights.' }
-            @{ Pattern = '(?i)never relaunches itself'; Message = 'README does not state the UAC direct-relaunch limitation.' }
-            @{ Pattern = '(?i)fail(s)? closed'; Message = 'README does not state the current fail-closed behavior.' }
+            @{ Pattern = '(?i)asks for administrator rights'; Message = 'README does not state that only a permission failure asks for administrator rights.' }
+            @{ Pattern = '(?i)and only once'; Message = 'README does not state that elevation is asked for at most once.' }
+            @{ Pattern = '-ElevatedChild'; Message = 'README does not state the internal switch that stops the elevated child from asking again.' }
+            @{ Pattern = '(?i)inside this toolkit''s own `src` directory'; Message = 'README does not state the source-directory boundary the elevated child is held to.' }
+            @{ Pattern = '(?i)never creates a scheduled task'; Message = 'README does not state that no scheduled task is created.' }
+            @{ Pattern = '(?i)fails closed'; Message = 'README does not state the current fail-closed behavior.' }
             @{ Pattern = '(?i)creates and verifies a clone'; Message = 'README does not state the clone-first behavior.' }
             @{ Pattern = '(?i)Recovery'; Message = 'README does not state how to recover from an interrupted operation.' }
             @{ Pattern = '-Confirmed'; Message = 'README does not document the explicit Android 15 confirmation switch.' }
             @{ Pattern = 'CONFIRM'; Message = 'README does not document the interactive Android 15 confirmation word.' }
             @{ Pattern = '(?i)verified clone'; Message = 'README does not state that concealment requires a verified clone.' }
             @{ Pattern = '(?i)explicitly selected'; Message = 'README does not state the selected-app-only concealment scope.' }
+            @{ Pattern = '(?i)-FetchDependencies'; Message = 'README does not document the explicit concealment dependency opt-in.' }
+            @{ Pattern = '(?i)HMA and Vector'; Message = 'README does not state that concealment installs its declared dependencies.' }
+            @{ Pattern = 'Concealment\.Code'; Message = 'The Verify report section does not name the concealment evidence code.' }
+            @{ Pattern = 'Concealment\.InScope'; Message = 'The Verify report section does not name the concealment scope evidence.' }
+            @{ Pattern = '(?i)KERNELSU_ABSENT'; Message = 'README does not state the honest concealment result on a Kitsune clone.' }
             @{ Pattern = '-Packages'; Message = 'README does not document the package selection parameter.' }
             @{ Pattern = 'campaign\.json'; Message = 'README does not state the advertisement scope.' }
             @{ Pattern = '(?i)AllowedRoot'; Message = 'README does not state the advertisement restore boundary.' }

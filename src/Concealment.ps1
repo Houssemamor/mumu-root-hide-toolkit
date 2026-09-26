@@ -1,6 +1,9 @@
 $script:ConcealmentHmaPackage = 'org.frknkrc44.hma_oss'
 $script:ConcealmentHmaAssetId = 'hma'
 $script:ConcealmentVectorAssetId = 'vector'
+# Concealment declares exactly these two dependencies. NeoZygisk is a root-side module, not a
+# concealment dependency, so it is not acquired or installed by this workflow.
+$script:ConcealmentDependencyAssetIds = @($script:ConcealmentHmaAssetId, $script:ConcealmentVectorAssetId)
 $script:ConcealmentKitsunePackage = 'io.github.huskydg.magisk'
 $script:ConcealmentToolkitPackage = 'com.coderstory.toolkit'
 $script:ConcealmentKernelSUPackage = 'me.weishu.kernelsu'
@@ -1233,4 +1236,80 @@ function Test-Concealment {
         return Get-ToolkitResult -Status 'Warning' -Message "The HMA scope on the instance at index $InstanceIndex carries the blacklist Root template for every requested app, but the KernelSU package is not installed there, so this workflow claims no KernelSU profile state on this instance. On an Android 12 Kitsune clone the root comes from Kitsune, not KernelSU, so the manual handoff is the only remaining step. $evidenceMessage" -Data (New-ConcealmentState -Code 'KERNELSU_ABSENT' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
     }
     return Get-ToolkitResult -Status 'Success' -Message $evidenceMessage -Data (New-ConcealmentState -Code 'OK' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
+}
+
+# The apps the toolkit itself assigned to the blacklist Root template, read from the installed HMA
+# configuration. The verifier needs a package selection, and this is the one the toolkit can observe
+# without asking the operator to name apps again.
+function Get-ConcealmentScopePackages {
+    param([object]$Document)
+
+    $packages = @()
+    $scopeProperty = $Document.PSObject.Properties['scope']
+    if ($null -eq $scopeProperty -or $scopeProperty.Value -isnot [pscustomobject]) {
+        return $packages
+    }
+    foreach ($entry in @($scopeProperty.Value.PSObject.Properties)) {
+        if (Test-ConcealmentPackageName -Name $entry.Name) {
+            $packages += $entry.Name
+        }
+    }
+    return @($packages | Sort-Object -Unique)
+}
+
+# The read-only report calls the verifier here, so concealment is never a claim without evidence. The
+# block is a fixed record: every field is present whether or not anything could be observed.
+function Get-ConcealmentEvidence {
+    param(
+        [string]$ManagerPath,
+        [int]$CloneIndex,
+        [scriptblock]$Runner = $null
+    )
+
+    $evidence = [ordered]@{
+        Target            = ''
+        Status            = 'NotVerified'
+        Code              = 'CLONE_UNVERIFIED'
+        Packages          = @()
+        InScope           = @()
+        OutOfScope        = @()
+        TemplateFound     = $false
+        IsWhitelist       = $false
+        HmaConfigVersion  = -1
+        KernelSUInstalled = $false
+        AllowlistPresent  = $false
+        Message           = 'No concealment evidence was collected for the verified clone.'
+    }
+    $manager = ConvertTo-ToolkitFullPath -Path $ManagerPath
+    if ($null -eq $manager -or $CloneIndex -lt 0) {
+        return $evidence
+    }
+    $evidence['Target'] = [string]$CloneIndex
+    $config = Read-ConcealmentHmaConfig -ManagerPath $manager -InstanceIndex $CloneIndex -Runner $Runner
+    if ($config.Status -ne 'Success') {
+        $evidence['Status'] = [string]$config.Status
+        $evidence['Code'] = [string]$config.Data.Code
+        $evidence['Message'] = [string]$config.Message
+        return $evidence
+    }
+    $evidence['HmaConfigVersion'] = [int]$config.Data.HmaConfigVersion
+    $stored = Get-ConcealmentStoredRootTemplate -Document $config.Data.Document -InstanceIndex $CloneIndex
+    $evidence['TemplateFound'] = [bool]$stored.Found
+    $evidence['IsWhitelist'] = [bool]$stored.IsWhitelist
+    $scoped = @(Get-ConcealmentScopePackages -Document $config.Data.Document)
+    if ($scoped.Count -eq 0) {
+        $evidence['Code'] = 'SCOPE_EMPTY'
+        $evidence['Message'] = "The installed HMA configuration on the verified clone at index $CloneIndex assigns the blacklist $($script:ConcealmentTemplateName) template to no app, so no concealment is claimed."
+        return $evidence
+    }
+    $verification = Test-Concealment -ManagerPath $manager -InstanceIndex $CloneIndex -Packages $scoped -Runner $Runner
+    $evidence['Status'] = [string]$verification.Status
+    $evidence['Code'] = [string]$verification.Data.Code
+    $evidence['Packages'] = @($scoped)
+    $evidence['InScope'] = @($verification.Data.InScope)
+    $evidence['OutOfScope'] = @($verification.Data.OutOfScope)
+    $evidence['KernelSUInstalled'] = [bool]$verification.Data.KernelSUInstalled
+    $evidence['AllowlistPresent'] = [bool]$verification.Data.AllowlistPresent
+    $evidence['Message'] = [string]$verification.Message
+    return $evidence
 }

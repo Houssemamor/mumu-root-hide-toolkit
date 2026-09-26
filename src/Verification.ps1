@@ -635,6 +635,20 @@ function Get-ToolkitReport {
             CloneIndex = -1
             CloneName = ''
         }
+        Concealment = [ordered]@{
+            Target = ''
+            Status = 'NotVerified'
+            Code = 'CLONE_UNVERIFIED'
+            Packages = @()
+            InScope = @()
+            OutOfScope = @()
+            TemplateFound = $false
+            IsWhitelist = $false
+            HmaConfigVersion = -1
+            KernelSUInstalled = $false
+            AllowlistPresent = $false
+            Message = 'No verified clone record is available for this instance, so no concealment evidence was collected.'
+        }
         JournalState = 'None'
         JournalOperation = ''
         JournalId = ''
@@ -740,6 +754,13 @@ function Get-ToolkitReport {
             if ([string]$clone.Status -ceq 'Success') {
                 $report['Backups']['CloneIndex'] = [int]$clone.Data.CloneIndex
                 $report['Backups']['CloneName'] = [string]$clone.Data.CloneName
+                # Concealment only ever changes the verified clone, so its evidence is read there.
+                if (Test-ToolkitCommandAvailable -Name 'Get-ConcealmentEvidence') {
+                    $report['Concealment'] = Get-ConcealmentEvidence -ManagerPath $managerPath -CloneIndex ([int]$clone.Data.CloneIndex) -Runner $Runner
+                }
+                else {
+                    $failures += 'The concealment verification command is not loaded, so no concealment evidence was read.'
+                }
             }
         }
     }

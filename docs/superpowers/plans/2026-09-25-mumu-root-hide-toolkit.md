@@ -1027,3 +1027,29 @@ Do not create an empty commit when no file changed.
 - **Scope check:** The plan is one cohesive toolkit with shared discovery, backup, journal, and verification primitives. It does not split into unrelated projects.
 - **Security check:** Hash verification, no post-UAC downloads, structured process arguments, fail-closed clone/root states, no UAC bypass, no ACL weakening, no network blocking, and no secret logging are explicit tasks and tests.
 - **Clean-room check:** No task copies original source or assets. Runtime downloads use official GitHub release assets, and NOTICE credits upstream projects.
+
+---
+
+## Post-Review Reachability Corrections
+
+Two final-review defects were about reachability rather than behavior, so the affected sections above
+are now correct in the product and are corrected here for the record.
+
+- **UAC (Task 4, and the UAC and permissions section of the design).** `src/Elevation.ps1` shipped
+  with all four elevation functions implemented and no caller, so a mutating action that writes
+  inside the MuMu install failed closed on a non-elevated console. The dispatcher now attempts the
+  action in process first and relaunches elevated exactly once, and only on a reported permission
+  failure. Up-front elevation was rejected because `.superpowers/sdd/task-11-live-root12-report.md`
+  records a real unelevated mutating manager write (call 7, a `setting -val` write, `exit=0` while
+  `Test-ToolkitAdministrator` is `False`), so elevating first would push a UAC prompt onto a host
+  that does not need it. An elevated child runs with the internal `-ElevatedChild` switch and the
+  entry point does not arm the elevation seam for it, and the child script is bound to this
+  toolkit's own `src` directory on resolved paths.
+- **Concealment dependencies and verification (Task 8).** `Install-ConcealmentDependencies` shipped
+  with no caller and `Test-Concealment` was test-only, so HMA and Vector were never installed by the
+  product and no concealment claim could be checked by an operator. `Conceal` now installs or
+  verifies its declared dependencies before it writes any app scope, behind the same journal and
+  clone-revalidation gates, and the read-only `Verify` report carries the concealment evidence read
+  from the verified clone. The explicit `-FetchDependencies` opt-in is the non-mutating acquisition
+  phase; the install stays cached-only and an elevated child never fetches. NeoZygisk stays out: the
+  design names HMA and Vector as the only concealment dependencies.

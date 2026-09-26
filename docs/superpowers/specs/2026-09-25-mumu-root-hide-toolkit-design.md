@@ -141,9 +141,11 @@ Every changed configuration file receives an exact byte backup and metadata need
 
 ## UAC and permissions
 
-`Detect` and `DryRun` do not require elevation. Mutating actions first inspect the current Windows token. If elevation is required, the launcher starts PowerShell directly with `Start-Process -Verb RunAs` and the child verifies that it is actually elevated before touching MuMu.
+`Detect` and `DryRun` do not require elevation. A mutating action is attempted in the current process first, so a host whose manager calls and file writes already succeed unelevated is never prompted. Only a reported permission failure asks for rights, and it asks once: the dispatcher starts PowerShell directly with `Start-Process -Verb RunAs`, repeats the caller's own allowlisted action with its bound paths and its operator confirmation, and the child verifies that it is actually elevated before touching MuMu. A process that already holds rights is not asked for them again, and the elevated child runs with an internal flag that makes a second request impossible.
 
-If the user's UAC policy suppresses the prompt or denies elevation, the action returns a clear permission error and the interactive menu remains open. The tool does not bypass UAC, create scheduled tasks, alter execution policy permanently, take ownership of files, or weaken ACLs.
+The child may run only a script inside this toolkit's own `src` directory, checked on resolved paths so a reparse point cannot carry it out of the boundary.
+
+If the user's UAC policy suppresses the prompt or denies elevation, the action returns a clear permission error, nothing is retried in the unelevated process, and the interactive menu remains open. The tool does not bypass UAC, create scheduled tasks, alter execution policy permanently, take ownership of files, or weaken ACLs.
 
 Dependency downloads and SHA-256 verification happen before elevation. No replacement code or dependency is downloaded after the elevated phase begins.
 
@@ -192,9 +194,11 @@ The Android 15 path never installs Kitsune or Magisk. It:
 
 ## Root concealment
 
-Root concealment is per selected application. The tool will install only pinned, hash-verified upstream HMA and Vector artifacts when needed. It will create one reusable Root template containing the installed root-related packages, including KernelSU where present.
+Root concealment is per selected application. The tool will install only pinned, hash-verified upstream HMA and Vector artifacts when needed, before it writes any app scope, and only on a verified clone. It will create one reusable Root template containing the installed root-related packages, including KernelSU where present.
 
 For each selected app, the tool enables HMA concealment, denies app root, and enables KernelSU `Unmount modules`. If the installed HMA configuration schema is unknown or unsupported, the tool stops safely and explains how to configure the supported UI manually. It will not corrupt an unknown private configuration format.
+
+The read-only verification report carries concealment evidence read from the installed HMA configuration on the verified clone, so a concealment claim is never made without an observation behind it. A clone whose root comes from Kitsune rather than KernelSU reports the absent KernelSU package honestly instead of claiming a profile state it cannot read.
 
 Root concealment reduces package and module visibility. It does not guarantee bypass of hardware-backed attestation.
 
