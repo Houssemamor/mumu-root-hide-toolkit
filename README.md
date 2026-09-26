@@ -242,9 +242,38 @@ The KernelSU Superuser profile is not machine readable, so the action prints the
 steps to confirm in the app. If the configuration schema is unknown or unsupported, the action
 writes nothing and hands off the supported UI steps instead.
 
+Three contracts come from what the live guest actually accepts:
+
+- **Guest commands.** The MuMu manager strips double quotes from a request, so every `su -c`
+  command is sent as one single-quoted guest command built by `New-ConcealmentGuestCommand`. It
+  accepts only the command words, options, and operators concealment needs, every path must be a
+  plain absolute guest path, and a quote, a substitution, a newline, or a space inside a path is
+  refused instead of escaped.
+- **The HMA scope map.** HMA configuration version 93 stores the per-app assignment in `scope`,
+  keyed by package name with the template name as the value. That is the only key the toolkit
+  writes; it never creates an `apps` key, and it preserves every other field of the configuration
+  as it found them. A `scope` that is not a map of package to template name is refused as an
+  unsupported schema.
+- **The Vector archive.** The pinned Vector v2.0 asset is a flat Magisk module archive, so the
+  staging directory itself is moved into `/data/adb/modules/vector` after its root `module.prop`
+  is validated, including the declared module id. A single top-level `vector/` directory is also
+  accepted. An archive that is both, neither, carries another module root, or declares another
+  module id is refused and its staged archive and staging directory are removed.
+
+`Test-Concealment` reports `Warning` with `KERNELSU_ABSENT` on a clone where the KernelSU package
+is not installed, such as an Android 12 Kitsune clone, and claims no KernelSU profile state there;
+the manual handoff stays. On that clone the root comes from Kitsune, and the HMA scope and Vector
+module are the parts this toolkit can verify from observation.
+
 Hide My Applist OSS must already be installed on the clone. The manifest pins the HMA OSS and
 Vector artifacts and `src/Concealment.ps1` can install them from the verified cache, but the
 menu does not run that step yet.
+
+**Concealment is not qualified on this host yet.** The selected app
+`jp.pokemon.pokemontcgp` is not installed on the live clone, so the action refuses it with
+`PACKAGE_NOT_INSTALLED` and no concealment scope is applied. No APK is invented for a package
+that is absent; install the app on the clone yourself, or select apps that are installed, before
+concealment can be called qualified.
 
 ## Advertisement scope and restore
 
@@ -333,6 +362,9 @@ These are the honest limits of the current state of the code.
   inherited `io.github.huskydg.magisk` and had no usable `su` and no built-in KernelSU daemon, so
   that clone is not a valid built-in-KernelSU target. `Root15` reports `KITSUNE_PRESENT` for it and
   a source instance that already carries Kitsune cannot be qualified.
+- Concealment is not qualified. The selected app `jp.pokemon.pokemontcgp` is not installed on the
+  live clone, so the action refuses it and no scope is applied. No APK is invented for an absent
+  package.
 - no binaries are bundled: no APK, archive, installer, or image is committed here, and the
   repository ignores those file types on purpose.
 - The Chinese edition is fixture-tested only. The live setup verification behind the tested

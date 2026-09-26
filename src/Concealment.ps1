@@ -23,12 +23,16 @@ $script:ConcealmentPackagePattern = '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0
 $script:ConcealmentMaximumPackageLength = 255
 $script:ConcealmentMaximumGuestPathLength = 255
 $script:ConcealmentJsonDepth = 12
+# The only command words, options, and operators a concealment guest command may use.
+$script:ConcealmentGuestCommandVerbs = @('base64', 'cat', 'echo', 'ls', 'mkdir', 'mv', 'rm', 'rmdir', 'unzip')
+$script:ConcealmentGuestCommandOptions = @('-d', '-f', '-l', '-o', '-p', '-rf')
+$script:ConcealmentGuestCommandOperators = @('|', '>', '&&')
 $script:ConcealmentStateFields = @(
     'Code', 'Step', 'InstanceIndex', 'CloneIndex', 'CloneName', 'Packages', 'OutOfScope',
     'TemplateName', 'TemplatePackages', 'TemplateFound', 'IsWhitelist', 'HmaConfigVersion',
     'InScope', 'Installed', 'AlreadyPresent', 'InstalledCount', 'KernelSUInstalled',
     'AllowlistPresent', 'AllowlistLength', 'ProfileStateObserved', 'BackupPath',
-    'BackupVerified', 'ConfigPath', 'Handoff'
+    'BackupVerified', 'ConfigPath', 'Handoff', 'Command'
 )
 $script:ConcealmentUiHandoffSteps = @(
     'Open the Hide My Applist OSS app on the selected instance.',
@@ -190,6 +194,49 @@ function Test-ConcealmentGuestPath {
         return $false
     }
     return $true
+}
+
+function New-ConcealmentGuestCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
+        [int]$InstanceIndex = -1
+    )
+
+    $invalid = {
+        param([string]$Reason)
+
+        return Get-ToolkitResult -Status 'CriticalError' -Message ("The guest command is not sent: $Reason") -Data (New-ConcealmentState -Code 'GUEST_COMMAND_INVALID' -Step 'guest-command' -InstanceIndex $InstanceIndex)
+    }
+
+    if ($Command -isnot [string] -or [string]::IsNullOrWhiteSpace($Command)) {
+        return (& $invalid 'it is empty')
+    }
+    if ($Command -match '[\x00-\x1f\x7f]') {
+        return (& $invalid 'it carries a control character or a newline')
+    }
+    $tokens = @($Command -split ' ')
+    if ($script:ConcealmentGuestCommandVerbs -cnotcontains $tokens[0]) {
+        return (& $invalid "it does not start with a supported command word: $($tokens[0])")
+    }
+    # The MuMu manager strips double quotes from the request, so the guest command is single quoted and nothing that could end that quoting is accepted.
+    foreach ($token in $tokens) {
+        if ($script:ConcealmentGuestCommandVerbs -ccontains $token -or
+            $script:ConcealmentGuestCommandOptions -ccontains $token -or
+            $script:ConcealmentGuestCommandOperators -ccontains $token) {
+            continue
+        }
+        if ($token.StartsWith('/')) {
+            if (-not (Test-ConcealmentGuestPath -Path $token)) {
+                return (& $invalid "the path is not a plain absolute guest path: $token")
+            }
+            continue
+        }
+        if ($token -notmatch '^[A-Za-z0-9+/=]+$') {
+            return (& $invalid "the argument is neither a known command word nor a base64 payload: $token")
+        }
+    }
+    return Get-ToolkitResult -Status 'Success' -Message 'The guest command is safely quoted.' -Data (New-ConcealmentState -Code 'OK' -Step 'guest-command' -InstanceIndex $InstanceIndex -Fields @{ Command = ('shell su -c ' + [char]39 + $Command + [char]39) })
 }
 
 function Get-ConcealmentRecordField {
@@ -420,8 +467,11 @@ function Read-ConcealmentHmaConfig {
         [scriptblock]$Runner = $null
     )
 
-    $readCommand = 'shell su -c "cat ' + $script:ConcealmentConfigPath + '"'
-    $call = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command $readCommand -Runner $Runner
+    $readCommand = New-ConcealmentGuestCommand -Command ('cat ' + $script:ConcealmentConfigPath) -InstanceIndex $InstanceIndex
+    if ($readCommand.Status -ne 'Success') {
+        return $readCommand
+    }
+    $call = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command $readCommand.Data.Command -Runner $Runner
     if ($null -eq $call -or $call.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'Warning' -Message ("The HMA configuration could not be read from $script:ConcealmentConfigPath.") -Data (New-ConcealmentState -Code 'HMA_CONFIG_UNREADABLE' -Step 'config-read' -InstanceIndex $InstanceIndex)
     }
@@ -487,15 +537,16 @@ function Read-ConcealmentHmaConfig {
         }
     }
 
-    $appsProperty = $document.PSObject.Properties['apps']
-    if ($null -ne $appsProperty) {
-        if ($null -eq $appsProperty.Value -or $appsProperty.Value -is [Array] -or $appsProperty.Value -isnot [pscustomobject]) {
-            return (& $unsupported "The HMA configuration has no usable app scope map, so it was not modified. Version: $configVersion." $configVersion)
+    $scopeProperty = $document.PSObject.Properties['scope']
+    if ($null -ne $scopeProperty) {
+        if ($null -eq $scopeProperty.Value -or $scopeProperty.Value -is [Array] -or $scopeProperty.Value -isnot [pscustomobject]) {
+            return (& $unsupported "The HMA configuration scope is not a per-app scope map, so it was not modified. Version: $configVersion." $configVersion)
         }
-        foreach ($appProperty in @($appsProperty.Value.PSObject.Properties)) {
-            if ([string]::IsNullOrWhiteSpace($appProperty.Name) -or
-                $appProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($appProperty.Value)) {
-                return (& $unsupported "The HMA configuration app scope map is unusable, so it was not modified. Version: $configVersion." $configVersion)
+        $scopeValue = $scopeProperty.Value
+        foreach ($scopeEntry in @($scopeValue.PSObject.Properties)) {
+            if ([string]::IsNullOrWhiteSpace($scopeEntry.Name) -or
+                $scopeEntry.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$scopeEntry.Value)) {
+                return (& $unsupported "The HMA configuration scope map is unusable, so it was not modified. Version: $configVersion." $configVersion)
             }
         }
     }
@@ -682,8 +733,11 @@ function Set-ConcealmentGuestText {
 
     $payload = [Convert]::ToBase64String((New-Object Text.UTF8Encoding($false)).GetBytes($Text))
     $temporaryPath = $Path + '.toolkit.tmp'
-    $writeCommand = 'shell su -c "echo ' + $payload + ' | base64 -d > ' + $temporaryPath + ' && mv ' + $temporaryPath + ' ' + $Path + '"'
-    $call = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command $writeCommand -Runner $Runner
+    $writeCommand = New-ConcealmentGuestCommand -Command ('echo ' + $payload + ' | base64 -d > ' + $temporaryPath + ' && mv ' + $temporaryPath + ' ' + $Path) -InstanceIndex $InstanceIndex
+    if ($writeCommand.Status -ne 'Success') {
+        return $writeCommand
+    }
+    $call = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command $writeCommand.Data.Command -Runner $Runner
     if ($null -eq $call -or $call.ExitCode -ne 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message "The guest file was not replaced: $Path" -Data (New-ConcealmentState -Code 'GUEST_WRITE_FAILED' -Step 'guest-write' -InstanceIndex $InstanceIndex)
     }
@@ -711,7 +765,11 @@ function Get-ConcealmentGuestFile {
     if ($null -eq $manager -or $InstanceIndex -lt 0 -or -not (Test-ConcealmentGuestPath -Path $Path)) {
         return $null
     }
-    $call = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command ('shell su -c "cat ' + $Path + '"') -Runner $Runner
+    $readCommand = New-ConcealmentGuestCommand -Command ('cat ' + $Path) -InstanceIndex $InstanceIndex
+    if ($readCommand.Status -ne 'Success') {
+        return $null
+    }
+    $call = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command $readCommand.Data.Command -Runner $Runner
     if ($null -eq $call -or $call.ExitCode -ne 0) {
         return $null
     }
@@ -796,7 +854,11 @@ function Install-ConcealmentDependencies {
         $alreadyPresent += $script:ConcealmentHmaAssetId
     }
 
-    $moduleList = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "ls ' + $script:ConcealmentVectorModulePath + '"') -Runner $Runner
+    $moduleListCommand = New-ConcealmentGuestCommand -Command ('ls ' + $script:ConcealmentVectorModulePath) -InstanceIndex $instanceIndex
+    if ($moduleListCommand.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message $moduleListCommand.Message -Data (New-ConcealmentState -Code ([string]$moduleListCommand.Data.Code) -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+    }
+    $moduleList = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $moduleListCommand.Data.Command -Runner $Runner
     if ($null -ne $moduleList -and $moduleList.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$moduleList.Text)) {
         $alreadyPresent += $script:ConcealmentVectorAssetId
     }
@@ -810,23 +872,83 @@ function Install-ConcealmentDependencies {
         if ($null -eq $push -or $push.ExitCode -ne 0) {
             return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module was not staged on the clone.' -Data (New-ConcealmentState -Code 'MODULE_PUSH_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
-        $extract = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "mkdir -p ' + $extractPath + ' && unzip -o ' + $stagedPath + ' -d ' + $extractPath + '"') -Runner $Runner
+        # Every failure after the push removes the pushed archive and the staging directory, so a rejected archive is not left in the guest.
+        $cleanupStaging = {
+            $cleanupCommand = New-ConcealmentGuestCommand -Command ('rm -rf ' + $extractPath + ' ' + $stagedPath) -InstanceIndex $instanceIndex
+            if ($cleanupCommand.Status -ne 'Success') {
+                return
+            }
+            [void](Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $cleanupCommand.Data.Command -Runner $Runner)
+        }
+        $extractCommand = New-ConcealmentGuestCommand -Command ('mkdir -p ' + $extractPath + ' && unzip -o ' + $stagedPath + ' -d ' + $extractPath) -InstanceIndex $instanceIndex
+        if ($extractCommand.Status -ne 'Success') {
+            (& $cleanupStaging)
+            return New-ToolkitRootFailure -Journal $Journal -Message $extractCommand.Message -Data (New-ConcealmentState -Code ([string]$extractCommand.Data.Code) -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        }
+        $extract = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $extractCommand.Data.Command -Runner $Runner
         if ($null -eq $extract -or $extract.ExitCode -ne 0) {
+            (& $cleanupStaging)
             return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Vector module was not extracted on the clone.' -Data (New-ConcealmentState -Code 'MODULE_EXTRACT_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
-        $listing = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "ls ' + $extractPath + '"') -Runner $Runner
+        $listingCommand = New-ConcealmentGuestCommand -Command ('ls ' + $extractPath) -InstanceIndex $instanceIndex
+        if ($listingCommand.Status -ne 'Success') {
+            (& $cleanupStaging)
+            return New-ToolkitRootFailure -Journal $Journal -Message $listingCommand.Message -Data (New-ConcealmentState -Code ([string]$listingCommand.Data.Code) -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        }
+        $listing = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $listingCommand.Data.Command -Runner $Runner
         $entries = @()
         if ($null -ne $listing -and $listing.ExitCode -eq 0) {
             $entries = @(([string]$listing.Text) -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
         }
-        if ($entries.Count -ne 1 -or $entries[0] -cne $script:ConcealmentVectorModuleName) {
-            return New-ToolkitRootFailure -Journal $Journal -Message "The verified Vector archive does not contain exactly the $($script:ConcealmentVectorModuleName) module directory and was not installed." -Data (New-ConcealmentState -Code 'MODULE_LAYOUT_UNSUPPORTED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        $hasModuleDirectory = $entries -ccontains $script:ConcealmentVectorModuleName
+        $hasRootModuleProp = $entries -ccontains 'module.prop'
+        if ($hasModuleDirectory -and $hasRootModuleProp) {
+            (& $cleanupStaging)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The verified Vector archive is both a $($script:ConcealmentVectorModuleName) module directory and a flat module archive, so the module root is ambiguous and nothing was installed." -Data (New-ConcealmentState -Code 'MODULE_LAYOUT_UNSUPPORTED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
-        $move = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "mv ' + $extractPath + '/' + $script:ConcealmentVectorModuleName + ' ' + $script:ConcealmentVectorModulePath + ' && rmdir ' + $extractPath + '"') -Runner $Runner
+        if ($hasModuleDirectory) {
+            $moveCommand = New-ConcealmentGuestCommand -Command ('mv ' + $extractPath + '/' + $script:ConcealmentVectorModuleName + ' ' + $script:ConcealmentVectorModulePath + ' && rmdir ' + $extractPath) -InstanceIndex $instanceIndex
+        }
+        elseif ($hasRootModuleProp) {
+            $moduleProp = Get-ConcealmentGuestFile -ManagerPath $manager -InstanceIndex $instanceIndex -Path ($extractPath + '/module.prop') -Runner $Runner
+            $moduleId = ''
+            if ($null -ne $moduleProp -and $moduleProp -match '(?m)^id=(.+)$') {
+                $moduleId = $Matches[1].Trim()
+            }
+            $moduleFiles = @($entries | Where-Object { $_ -like '*.sh' -or $_ -ceq 'bin' })
+            $nestedModuleRoots = @()
+            foreach ($entry in @($entries | Where-Object { $_ -cne 'module.prop' -and $_ -notlike '*.sh' })) {
+                if ($null -ne (Get-ConcealmentGuestFile -ManagerPath $manager -InstanceIndex $instanceIndex -Path ($extractPath + '/' + $entry + '/module.prop') -Runner $Runner)) {
+                    $nestedModuleRoots += $entry
+                }
+            }
+            if ($moduleId -cne $script:ConcealmentVectorModuleName -or $moduleFiles.Count -eq 0 -or $nestedModuleRoots.Count -gt 0) {
+                (& $cleanupStaging)
+                $reason = "the root module.prop declares id='$moduleId' instead of $($script:ConcealmentVectorModuleName)"
+                if ($moduleFiles.Count -eq 0) {
+                    $reason = 'the flat archive has no module script and no bin directory'
+                }
+                if ($nestedModuleRoots.Count -gt 0) {
+                    $reason = "the flat archive carries another module root: $($nestedModuleRoots -join ', ')"
+                }
+                return New-ToolkitRootFailure -Journal $Journal -Message "The verified Vector archive is a flat module archive that is not the pinned module, because $reason. Nothing was installed." -Data (New-ConcealmentState -Code 'MODULE_LAYOUT_UNSUPPORTED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+            }
+            $moveCommand = New-ConcealmentGuestCommand -Command ('mv ' + $extractPath + ' ' + $script:ConcealmentVectorModulePath) -InstanceIndex $instanceIndex
+        }
+        else {
+            (& $cleanupStaging)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The verified Vector archive is neither a single $($script:ConcealmentVectorModuleName) module directory nor a flat module archive with a root module.prop, and was not installed. Extracted entries: $($entries -join ', ')" -Data (New-ConcealmentState -Code 'MODULE_LAYOUT_UNSUPPORTED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        }
+        if ($moveCommand.Status -ne 'Success') {
+            (& $cleanupStaging)
+            return New-ToolkitRootFailure -Journal $Journal -Message $moveCommand.Message -Data (New-ConcealmentState -Code ([string]$moveCommand.Data.Code) -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        }
+        $move = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $moveCommand.Data.Command -Runner $Runner
         if ($null -eq $move -or $move.ExitCode -ne 0) {
+            (& $cleanupStaging)
             return New-ToolkitRootFailure -Journal $Journal -Message "The extracted Vector module was not moved into $($script:ConcealmentVectorModulePath)." -Data (New-ConcealmentState -Code 'MODULE_INSTALL_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
-        $moduleList = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "ls ' + $script:ConcealmentVectorModulePath + '"') -Runner $Runner
+        $moduleList = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $moduleListCommand.Data.Command -Runner $Runner
         if ($null -eq $moduleList -or $moduleList.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$moduleList.Text)) {
             return New-ToolkitRootFailure -Journal $Journal -Message "The Vector module directory $($script:ConcealmentVectorModulePath) is not present after the install." -Data (New-ConcealmentState -Code 'MODULE_INSTALL_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
@@ -933,20 +1055,22 @@ function Set-AppConcealment {
     }
     $document['templates'] = $templates
 
-    $applications = [ordered]@{}
-    $appsProperty = $config.Data.Document.PSObject.Properties['apps']
-    if ($null -ne $appsProperty) {
-        foreach ($property in @($appsProperty.Value.PSObject.Properties)) {
+    # HMA 93 reads the per-app assignment from the scope map; the toolkit never writes an apps key.
+    $assignments = [ordered]@{}
+    $scopeProperty = $config.Data.Document.PSObject.Properties['scope']
+    if ($null -ne $scopeProperty) {
+        $existingScope = $scopeProperty.Value
+        foreach ($property in @($existingScope.PSObject.Properties)) {
             if (-not (Test-ConcealmentPackageName -Name $property.Name)) {
-                return New-ToolkitRootFailure -Journal $Journal -Message "The existing HMA app scope holds a key that is not a package name, so it is never rewritten: $($property.Name)" -Data (New-ConcealmentState -Code 'HMA_TEMPLATE_INVALID' -Step 'config-write' -InstanceIndex $instanceIndex -Fields $cloneFields)
+                return New-ToolkitRootFailure -Journal $Journal -Message "The existing HMA scope holds a key that is not a package name, so it is never rewritten: $($property.Name)" -Data (New-ConcealmentState -Code 'HMA_TEMPLATE_INVALID' -Step 'config-write' -InstanceIndex $instanceIndex -Fields $cloneFields)
             }
-            $applications[[string]$property.Name] = [string]$property.Value
+            $assignments[[string]$property.Name] = [string]$property.Value
         }
     }
     foreach ($packageName in $selected) {
-        $applications[[string]$packageName] = [string]$script:ConcealmentTemplateName
+        $assignments[[string]$packageName] = [string]$script:ConcealmentTemplateName
     }
-    $document['apps'] = $applications
+    $document['scope'] = $assignments
 
     if ((Get-ConcealmentJsonDepth -Value $document) -gt $script:ConcealmentJsonDepth) {
         return New-ToolkitRootFailure -Journal $Journal -Message "The HMA configuration is nested deeper than $($script:ConcealmentJsonDepth) levels, so writing it would truncate the operator's own settings. Nothing was written and no backup was taken." -Data (New-ConcealmentState -Code 'HMA_WRITE_FAILED' -Step 'config-write' -InstanceIndex $instanceIndex -Fields $cloneFields)
@@ -971,7 +1095,11 @@ function Set-AppConcealment {
     $originalText = [string]$config.Data.Text
     $originalSha = [string]$config.Data.Sha256
     $backupPath = [string]$config.Data.ConfigPath + '.backup-' + $originalSha.Substring(0, 12)
-    $existingBackup = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('shell su -c "ls ' + $backupPath + '"') -Runner $Runner
+    $existingBackupCommand = New-ConcealmentGuestCommand -Command ('ls ' + $backupPath) -InstanceIndex $instanceIndex
+    if ($existingBackupCommand.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message $existingBackupCommand.Message -Data (New-ConcealmentState -Code ([string]$existingBackupCommand.Data.Code) -Step 'config-backup' -InstanceIndex $instanceIndex -Fields ($cloneFields + @{ BackupPath = $backupPath }))
+    }
+    $existingBackup = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $existingBackupCommand.Data.Command -Runner $Runner
     if ($null -eq $existingBackup -or $existingBackup.ExitCode -ne 0) {
         $backup = Set-ConcealmentGuestText -ManagerPath $manager -InstanceIndex $instanceIndex -Path $backupPath -Text $originalText -Journal $Journal -Runner $Runner
         if ($backup.Status -ne 'Success') {
@@ -1074,10 +1202,13 @@ function Test-Concealment {
     $outOfScope = @()
     foreach ($packageName in $selected) {
         $assigned = $false
-        $appsProperty = $document.PSObject.Properties['apps']
-        if ($null -ne $appsProperty -and $null -ne $appsProperty.Value.PSObject.Properties[$packageName]) {
-            if ([string]$appsProperty.Value.PSObject.Properties[$packageName].Value -ceq [string]$script:ConcealmentTemplateName) {
-                $assigned = $true
+        $scopeProperty = $document.PSObject.Properties['scope']
+        if ($null -ne $scopeProperty) {
+            $storedScope = $scopeProperty.Value
+            if ($null -ne $storedScope.PSObject.Properties[$packageName]) {
+                if ([string]$storedScope.PSObject.Properties[$packageName].Value -ceq [string]$script:ConcealmentTemplateName) {
+                    $assigned = $true
+                }
             }
         }
         if ($assigned) {
@@ -1091,7 +1222,11 @@ function Test-Concealment {
     $kernelSuInstalled = Test-ConcealmentPackageInstalled -ManagerPath $manager -InstanceIndex $InstanceIndex -PackageName $script:ConcealmentKernelSUPackage -Runner $Runner
     $allowlistPresent = $false
     $allowlistLength = -1
-    $allowlistCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command ('shell su -c "ls -l ' + $script:ConcealmentKernelSUAllowlistPath + '"') -Runner $Runner
+    $allowlistCommand = New-ConcealmentGuestCommand -Command ('ls -l ' + $script:ConcealmentKernelSUAllowlistPath) -InstanceIndex $InstanceIndex
+    if ($allowlistCommand.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $null -Message $allowlistCommand.Message -Data (New-ConcealmentState -Code ([string]$allowlistCommand.Data.Code) -Step 'verify' -InstanceIndex $InstanceIndex)
+    }
+    $allowlistCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command $allowlistCommand.Data.Command -Runner $Runner
     if ($null -ne $allowlistCall -and $allowlistCall.ExitCode -eq 0) {
         $allowlistPresent = $true
         $lengthMatch = [regex]::Match([string]$allowlistCall.Text, '(?m)^\S+\s+\d+\s+\S+\s+\S+\s+(\d+)\s')
@@ -1137,6 +1272,9 @@ function Test-Concealment {
     }
     if ($inScope.Count -ne $selected.Count) {
         return Get-ToolkitResult -Status 'Warning' -Message "Concealment is not fully applied: $($inScope.Count) of $($selected.Count) requested app(s) carry the blacklist Root template. Out of scope: $($outOfScope -join ', '). $evidenceMessage" -Data (New-ConcealmentState -Code 'SCOPE_INCOMPLETE' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
+    }
+    if (-not $kernelSuInstalled) {
+        return Get-ToolkitResult -Status 'Warning' -Message "The HMA scope on the instance at index $InstanceIndex carries the blacklist Root template for every requested app, but the KernelSU package is not installed there, so this workflow claims no KernelSU profile state on this instance. On an Android 12 Kitsune clone the root comes from Kitsune, not KernelSU, so the manual handoff is the only remaining step. $evidenceMessage" -Data (New-ConcealmentState -Code 'KERNELSU_ABSENT' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
     }
     return Get-ToolkitResult -Status 'Success' -Message $evidenceMessage -Data (New-ConcealmentState -Code 'OK' -Step 'verify' -InstanceIndex $InstanceIndex -Fields $observed)
 }
