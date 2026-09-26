@@ -358,3 +358,41 @@ function Save-ToolkitAsset {
     }
     return $verified
 }
+
+function Save-ToolkitManifestAsset {
+    param(
+        [object]$Manifest,
+        [string]$Id,
+        [string]$CacheRoot = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Id) -or $Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The pinned asset id is invalid.' -Data ([pscustomobject]@{ Code = 'ASSET_ID_INVALID'; Asset = '' })
+    }
+
+    $assetCacheRoot = $CacheRoot
+    if ([string]::IsNullOrWhiteSpace($assetCacheRoot)) {
+        try {
+            $assetCacheRoot = Get-ToolkitAssetCacheRoot
+        }
+        catch {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The dependency cache root is unavailable.' -Data ([pscustomobject]@{ Code = 'CACHE_UNAVAILABLE'; Asset = '' })
+        }
+    }
+    try {
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($assetCacheRoot))
+    }
+    catch {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The dependency cache directory is unavailable.' -Data ([pscustomobject]@{ Code = 'CACHE_UNAVAILABLE'; Asset = '' })
+    }
+
+    $asset = Save-ToolkitAsset -Manifest $Manifest -Id $Id -CacheRoot $assetCacheRoot
+    if ($asset.Status -ne 'Success') {
+        return Get-ToolkitResult -Status 'CriticalError' -Message ('The pinned asset was not verified. ' + $asset.Message) -Data ([pscustomobject]@{ Code = 'ASSET_VERIFICATION_FAILED'; Asset = '' })
+    }
+    $path = [string]$asset.Data
+    if ([string]::IsNullOrWhiteSpace($path) -or -not [IO.File]::Exists($path)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The pinned asset was not verified.' -Data ([pscustomobject]@{ Code = 'ASSET_VERIFICATION_FAILED'; Asset = '' })
+    }
+    return Get-ToolkitResult -Status 'Success' -Message 'The pinned asset is verified in the dependency cache.' -Data ([pscustomobject]@{ Code = 'OK'; Asset = $path })
+}
