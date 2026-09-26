@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Ads', 'Root12', 'Root15', 'Verification', 'Concealment', 'Target', 'Menu', 'Docs', 'All')]
+    [ValidateSet('Manifest', 'Process', 'Result', 'Journal', 'Discovery', 'Safety', 'Transport', 'Ads', 'Root12', 'Root15', 'Verification', 'Concealment', 'Target', 'Menu', 'Docs', 'All')]
     [string]$Suite = 'All'
 )
 
@@ -62,6 +62,10 @@ if (Test-Path -LiteralPath $targetScriptPath -PathType Leaf) {
 if (Test-Path -LiteralPath $controllerScriptPath -PathType Leaf) {
     . $controllerScriptPath
 }
+
+# A read-only retry pauses between attempts in production, so the suite overrides that pause the
+# same way it overrides the boot poll pause. The bound itself is asserted in the transport suite.
+$script:ToolkitReadOnlyDelaySeconds = 0
 
 function Assert-True {
     param(
@@ -281,6 +285,111 @@ function Invoke-ProcessTests {
     }
     Assert-True ($missingExecutable.ExitCode -ne 0) 'Missing executable launch returned success.'
     Assert-True ($missingExecutable.Text -match 'Process launch failed') 'Missing executable launch did not report a launch failure.'
+}
+
+function Invoke-TransportTests {
+    $timeoutConstant = Get-Variable -Name 'ToolkitProcessTimeoutSeconds' -Scope Script -ErrorAction SilentlyContinue
+    Assert-True ($null -ne $timeoutConstant) 'The external process timeout constant is missing.'
+    Assert-True ([int]$timeoutConstant.Value -ge 30 -and [int]$timeoutConstant.Value -le 600) "The external process timeout is not a defensible bound: $($timeoutConstant.Value)"
+    Assert-True ([int]$script:ToolkitReadOnlyAttempts -ge 2) 'The read-only retry is not bounded above one attempt.'
+    Assert-True ([int]$script:ToolkitReadOnlyAttempts -le 10) 'The read-only retry bound is not bounded.'
+    # The suite overrides the pause to keep the run short, so the shipped default is asserted on
+    # the source rather than on the overridden value.
+    Assert-True ([IO.File]::ReadAllText($commonPath) -match 'ToolkitReadOnlyDelaySeconds\s*=\s*([1-9][0-9]*)\b') 'The read-only retry has no pause between attempts.'
+
+    $powershellPath = Join-Path $PSHOME 'powershell.exe'
+    $normalChild = Invoke-CheckedProcess -FilePath $powershellPath -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', "[Console]::Out.WriteLine('fixture stdout'); [Console]::Error.WriteLine('fixture stderr'); exit 3")
+    Assert-Equal 3 $normalChild.ExitCode 'A child that exited on its own did not report its real exit code.'
+    Assert-True ($normalChild.Text -match 'fixture stdout') 'The success path lost the captured standard output.'
+    Assert-True ($normalChild.Text -match 'fixture stderr') 'The success path lost the captured standard error.'
+
+    # A payload far larger than any pipe buffer completes only when both streams are drained while
+    # the child is still running, so this is the case that would hang on a naive bounded wait.
+    $largeChild = Invoke-CheckedProcess -FilePath $powershellPath -TimeoutSeconds 120 -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', "1..48 | ForEach-Object { [Console]::Out.Write('x' * 65536) }; 1..16 | ForEach-Object { [Console]::Error.Write('y' * 65536) }; exit 0")
+    Assert-Equal 0 $largeChild.ExitCode 'A child with a large output did not exit instead of deadlocking.'
+    Assert-True ($largeChild.Text.Length -ge (64 * 65536)) "A large output payload was truncated: $($largeChild.Text.Length)"
+
+    $childPidPath = Join-Path $testRoot 'timeout child pid.txt'
+    $childPidArgument = $childPidPath.Replace("'", "''")
+    $wedgedChild = Invoke-CheckedProcess -FilePath $powershellPath -TimeoutSeconds 2 -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', "[IO.File]::WriteAllText('$childPidArgument', [string]`$PID); Start-Sleep -Seconds 300; [IO.File]::WriteAllText('$childPidArgument', 'survived')")
+    Assert-Equal -1 $wedgedChild.ExitCode 'A child that outlived the timeout was not reported as a transport failure.'
+    Assert-True ($wedgedChild.Text -match 'timeout') "The timeout failure does not name the timeout: $($wedgedChild.Text)"
+    Assert-True ($wedgedChild.Text -match '2 second') "The timeout failure does not name the timeout value: $($wedgedChild.Text)"
+    $wedgedChildId = 0
+    Assert-True ([int]::TryParse([IO.File]::ReadAllText($childPidPath), [ref]$wedgedChildId)) 'The timed-out child did not report its own process id.'
+    $wedgedChildAlive = $true
+    for ($poll = 0; $poll -lt 20 -and $wedgedChildAlive; $poll++) {
+        $wedgedChildAlive = ($null -ne (Get-Process -Id $wedgedChildId -ErrorAction SilentlyContinue))
+        if ($wedgedChildAlive) {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    Assert-True (-not $wedgedChildAlive) 'A child that outlived the timeout was not terminated.'
+
+    $transientState = @{ Count = 0 }
+    $transientRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+        $transientState.Count++
+        if ($transientState.Count -lt 3) {
+            return [pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: the manager is busy' }
+        }
+        return [pscustomobject]@{ ExitCode = 0; Text = '1' }
+    }.GetNewClosure()
+    $retriedProbe = Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Command 'shell getprop sys.boot_completed' -Runner $transientRunner
+    Assert-Equal 0 $retriedProbe.ExitCode 'A read-only guest command that failed transiently did not succeed on a later attempt.'
+    Assert-Equal 3 $transientState.Count 'A read-only guest command was not retried to its bound.'
+
+    $stoppedState = @{ Count = 0 }
+    $stoppedRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+        $stoppedState.Count++
+        if ($stoppedState.Count -lt 2) {
+            return [pscustomobject]@{ ExitCode = 201; Text = 'adb: no running instance' }
+        }
+        return [pscustomobject]@{ ExitCode = 0; Text = 'module' }
+    }.GetNewClosure()
+    $stoppedProbe = Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Command 'shell ls /data/adb/modules' -Runner $stoppedRunner
+    Assert-Equal 0 $stoppedProbe.ExitCode 'A read-only guest command against a stopped instance did not succeed on a later attempt.'
+    Assert-Equal 2 $stoppedState.Count 'A not-started transient was not retried.'
+
+    $exhaustedState = @{ Count = 0 }
+    $exhaustedRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+        $exhaustedState.Count++
+        [pscustomobject]@{ ExitCode = -1; Text = 'The process did not exit within the 120 second timeout and was terminated.' }
+    }.GetNewClosure()
+    $exhausted = Get-ToolkitRootSetting -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -Index 0 -Runner $exhaustedRunner
+    Assert-Equal 3 $exhaustedState.Count 'An exhausted read-only manager query did not stop at its bound.'
+    Assert-Equal 'RecoverableError' $exhausted.Status 'An exhausted read-only query did not report the recoverable path.'
+    Assert-True ($exhausted.Message -match '120 second timeout') "The exhausted retry lost the underlying error: $($exhausted.Message)"
+    Assert-Equal 2 (Get-ToolkitExitCode $exhausted) 'An exhausted read-only query did not map to the recoverable exit code.'
+
+    $semanticState = @{ Count = 0 }
+    $semanticRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+        $semanticState.Count++
+        [pscustomobject]@{ ExitCode = 1; Text = '{"error_code":1}' }
+    }.GetNewClosure()
+    $semantic = Get-ToolkitRootSetting -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -Index 0 -Runner $semanticRunner
+    Assert-Equal 'CriticalError' $semantic.Status 'A semantic refusal was reported as a recoverable error.'
+    Assert-Equal 1 $semanticState.Count 'A semantic refusal was retried.'
+
+    foreach ($mutationCommand in @(
+            'install -r /data/local/tmp/app.apk'
+            'push /data/local/tmp/vector.zip /data/local/tmp/staged.zip'
+            "su -c rm -rf /data/adb/modules/zygisk_vector"
+            'shell monkey -p io.github.huskydg.magisk -c android.intent.category.LAUNCHER 1'
+        )) {
+        $mutationState = @{ Count = 0 }
+        $mutationRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            $mutationState.Count++
+            [pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: the manager is busy' }
+        }.GetNewClosure()
+        $mutation = Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Command $mutationCommand -Runner $mutationRunner
+        Assert-Equal 1 $mutationState.Count "A mutation was retried: $mutationCommand"
+        Assert-Equal -1 $mutation.ExitCode "A failed mutation did not report its own transport failure: $mutationCommand"
+    }
 }
 
 function Invoke-AssetTests {
@@ -8393,6 +8502,8 @@ function Invoke-MenuTests {
         $recoverableLoopCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Verify', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $recoverableState.Calls += $Action; Get-ToolkitResult -Status 'RecoverableError' -Message 'injected recoverable failure' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 2 $recoverableLoopCode 'A recoverable error did not return exit code 2.'
         Assert-Equal 1 $recoverableState.Calls.Count 'A recoverable error did not return to the menu.'
+        $recoverableLogText = [IO.File]::ReadAllText($menuLogPath)
+        Assert-True ($recoverableLogText -match '\[Warning\] Action Verify returned RecoverableError') 'A recoverable error was not logged on the Warning branch.'
 
         $quitState = @{ Calls = @() }
         $quitCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $quitState.Calls += $Action }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
@@ -9889,6 +10000,9 @@ try {
         'Safety' {
             Invoke-SafetyTests
         }
+        'Transport' {
+            Invoke-TransportTests
+        }
         'Ads' {
             Invoke-AdsTests
         }
@@ -9921,6 +10035,7 @@ try {
             Invoke-JournalTests
             Invoke-DiscoveryTests
             Invoke-SafetyTests
+            Invoke-TransportTests
             Invoke-AdsTests
             Invoke-VerificationTests
             Invoke-ConcealmentTests

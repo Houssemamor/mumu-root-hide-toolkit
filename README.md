@@ -371,12 +371,28 @@ script and a child that verifies its own administrator token before it runs, but
 dispatcher does not call it yet.
 
 Current behavior: if an action needs rights the current process does not have, it fails closed.
-The action stops, the operation journal records the failure, nothing is retried automatically,
+The action stops, the operation journal records the failure, nothing that changes MuMu is retried,
 and no configuration is left half-written on purpose. Start `Run-MumuToolkit.bat` from an
 elevated console (Run as administrator) for the actions that write into the MuMu installation.
 `Detect` and `Verify` never change MuMu and do not need elevation; they still
 create the toolkit state directory, and a non-success result appends a redacted line to the
 toolkit log.
+
+## Transport bounds
+
+Every external process is started through one funnel, so a wedged `MuMuManager.exe` or a blocked
+ADB port cannot hang the menu. The wait is bounded at 120 seconds per call, the child is
+terminated when that bound expires, and the call is reported as a transport failure that names the
+timeout. Both redirected streams are drained while the child runs, so a large response cannot
+wedge it.
+
+A read-only transport call is retried up to 3 times with a 2 second pause, and only for a
+transport failure or an explicit not-started transient such as a stopped instance. A semantic
+refusal is answered once, and nothing that changes MuMu is ever retried: a clone, create, install,
+root change, advertisement change, or module install runs exactly once. When a read-only retry is
+exhausted the result is `RecoverableError` with the last underlying error in its message, so a
+noninteractive run exits `2`. A read-only call can therefore take up to about 6 minutes to report
+a wedged manager, and a mutation up to about 2 minutes.
 
 ## Noninteractive exit codes
 

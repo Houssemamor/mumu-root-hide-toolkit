@@ -988,7 +988,13 @@ function Get-MuMuRootSetting {
         return ConvertTo-ToolkitBoolean -Value $reportedValue
     }
 
-    $result = Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('setting', '-v', [string]$Index, '-k', 'root_permission') -Runner $Runner
+    $settingQuery = Invoke-ToolkitReadOnlyCall -Description 'The MuMu manager root setting query' -Call {
+        Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('setting', '-v', [string]$Index, '-k', 'root_permission') -Runner $Runner
+    }
+    if ([string]$settingQuery.Status -cne 'Success') {
+        return $null
+    }
+    $result = $settingQuery.Data
     if ($null -eq $result -or $result.ExitCode -ne 0) {
         return $null
     }
@@ -1083,7 +1089,13 @@ function Get-MuMuInstances {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'Manager paths conflict.'
     }
 
-    $managerResult = Invoke-CheckedProcess -FilePath $resolvedManagerPath -ArgumentList @('info', '-v', 'all') -Runner $Runner
+    $managerQuery = Invoke-ToolkitReadOnlyCall -Description 'The MuMu manager instance query' -Call {
+        Invoke-CheckedProcess -FilePath $resolvedManagerPath -ArgumentList @('info', '-v', 'all') -Runner $Runner
+    }
+    if ([string]$managerQuery.Status -cne 'Success') {
+        return $managerQuery
+    }
+    $managerResult = $managerQuery.Data
     if ($null -eq $managerResult -or $managerResult.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'MuMu manager query failed.'
     }

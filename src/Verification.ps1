@@ -17,7 +17,24 @@ function Invoke-ToolkitManagerAdb {
         [scriptblock]$Runner = $null
     )
 
-    return Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('adb', '-v', ([string]$InstanceIndex), '-c', $Command) -Runner $Runner
+    $invoke = {
+        Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('adb', '-v', ([string]$InstanceIndex), '-c', $Command) -Runner $Runner
+    }
+    # A guest command is retried only when the toolkit can see that it changes nothing, so a
+    # repeated install, push, move, or removal can never happen.
+    if ($Command -cnotmatch $script:ToolkitReadOnlyGuestPattern) {
+        return (& $invoke)
+    }
+    $retried = Invoke-ToolkitReadOnlyCall -Description ("The read-only guest command " + $Command) -Call $invoke
+    if ([string]$retried.Status -cne 'Success') {
+        # The transport contract of this helper is a call object, so an exhausted retry is still
+        # reported as the transport failure it is, with the recoverable reason in its text.
+        return [pscustomobject]@{
+            ExitCode = -1
+            Text = $retried.Message
+        }
+    }
+    return $retried.Data
 }
 
 function Get-ToolkitInstanceSettings {
@@ -47,7 +64,13 @@ function Get-ToolkitInstanceSettings {
     foreach ($key in $keyList) {
         $argumentList += @('-k', $key)
     }
-    $call = Invoke-CheckedProcess -FilePath $manager -ArgumentList $argumentList -Runner $Runner
+    $query = Invoke-ToolkitReadOnlyCall -Description 'The MuMu manager instance setting query' -Call {
+        Invoke-CheckedProcess -FilePath $manager -ArgumentList $argumentList -Runner $Runner
+    }
+    if ([string]$query.Status -cne 'Success') {
+        return $query
+    }
+    $call = $query.Data
     if ($null -eq $call -or $call.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The instance settings could not be read.' -Data (@{ Code = 'SETTING_QUERY_FAILED' })
     }
@@ -108,7 +131,13 @@ function Get-ToolkitRootSetting {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The vendor root setting manager is invalid.' -Data (@{ Code = 'MANAGER_UNAVAILABLE' })
     }
 
-    $result = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$Index), '-k', 'root_permission') -Runner $Runner
+    $query = Invoke-ToolkitReadOnlyCall -Description 'The MuMu manager root setting query' -Call {
+        Invoke-CheckedProcess -FilePath $manager -ArgumentList @('setting', '-v', ([string]$Index), '-k', 'root_permission') -Runner $Runner
+    }
+    if ([string]$query.Status -cne 'Success') {
+        return $query
+    }
+    $result = $query.Data
     if ($null -eq $result -or $result.ExitCode -ne 0) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The MuMu manager did not report the vendor root setting.' -Data (@{ Code = 'MANAGER_FAILED' })
     }

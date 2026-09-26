@@ -4,6 +4,32 @@ $script:ToolkitGuestCommandOptions = @('-d', '-f', '-l', '-o', '-p', '-rf')
 $script:ToolkitGuestCommandOperators = @('|', '>', '&&')
 $script:ToolkitMaximumGuestPathLength = 255
 
+# A wedged manager or a blocked ADB port must not hang the menu, so every external process is
+# given a bounded wait and the child is terminated when the bound expires. Two minutes sits above
+# the slowest legitimate child, a guest pm install of the pinned Kitsune APK on a cold instance,
+# and far below any operator's patience.
+if (-not (Test-Path variable:script:ToolkitProcessTimeoutSeconds)) {
+    $script:ToolkitProcessTimeoutSeconds = 120
+}
+# A surviving grandchild can hold a redirected pipe open after the child itself is gone, so the
+# captured streams are drained with a bounded wait too.
+$script:ToolkitProcessDrainMilliseconds = 5000
+
+# A read-only transport call is retried only for a transport failure or an explicit not-started
+# transient. The bound is the same one the retry helper already carries.
+if (-not (Test-Path variable:script:ToolkitReadOnlyAttempts)) {
+    $script:ToolkitReadOnlyAttempts = 3
+}
+if (-not (Test-Path variable:script:ToolkitReadOnlyDelaySeconds)) {
+    $script:ToolkitReadOnlyDelaySeconds = 2
+}
+# A semantic refusal is a decision, so it is never retried. Only a manager or guest that reports
+# the work is not under way yet counts as transient.
+$script:ToolkitTransientCallPattern = '(?i)\b(?:not\s+(?:started|running|ready|booted)|no\s+running\s+instance|device\s+offline)\b'
+# Only these guest command words read state and change nothing. Anything else, including a shell
+# su -c request whose payload the toolkit cannot inspect, is left unretried.
+$script:ToolkitReadOnlyGuestPattern = '^(?:shell\s+)?(?:getprop|dumpsys|pidof|cat|ls|base64)\b'
+
 function Test-ToolkitGuestPath {
     param([string]$Path)
 
@@ -245,7 +271,9 @@ function Invoke-CheckedProcess {
     param(
         [string]$FilePath,
         [string[]]$ArgumentList = @(),
-        [scriptblock]$Runner = $null
+        [scriptblock]$Runner = $null,
+        [ValidateRange(0, 3600)]
+        [int]$TimeoutSeconds = 0
     )
 
     if ($null -ne $Runner) {
@@ -258,6 +286,12 @@ function Invoke-CheckedProcess {
                 Text = "Process launch failed: $($_.Exception.Message)"
             }
         }
+    }
+
+    # Zero means the shared bound, so every call site inherits it without opting in.
+    $boundSeconds = $TimeoutSeconds
+    if ($boundSeconds -le 0) {
+        $boundSeconds = [int]$script:ToolkitProcessTimeoutSeconds
     }
 
     $encodedArguments = New-Object 'System.Collections.Generic.List[string]'
@@ -279,11 +313,29 @@ function Invoke-CheckedProcess {
         if (-not $process.Start()) {
             throw New-Object InvalidOperationException 'Process did not start.'
         }
+        # The redirected streams are drained while the child runs, so a large payload cannot fill a
+        # pipe buffer and wedge the child before the bounded wait expires.
         $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
         $standardErrorTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $text = $standardOutputTask.Result
-        $standardError = $standardErrorTask.Result
+        $timedOut = -not $process.WaitForExit($boundSeconds * 1000)
+        if ($timedOut) {
+            try {
+                $process.Kill()
+            }
+            catch {
+            }
+        }
+        [void][Threading.Tasks.Task]::WaitAll(
+            [Threading.Tasks.Task[]]@($standardOutputTask, $standardErrorTask),
+            $script:ToolkitProcessDrainMilliseconds)
+        $text = if ($standardOutputTask.IsCompleted -and -not $standardOutputTask.IsFaulted) { $standardOutputTask.Result } else { '' }
+        $standardError = if ($standardErrorTask.IsCompleted -and -not $standardErrorTask.IsFaulted) { $standardErrorTask.Result } else { '' }
+        if ($timedOut) {
+            return [pscustomobject]@{
+                ExitCode = -1
+                Text = "The process did not exit within the $boundSeconds second timeout and was terminated: $FilePath"
+            }
+        }
         if (-not [string]::IsNullOrEmpty($standardError)) {
             if (-not [string]::IsNullOrEmpty($text)) {
                 $text += [Environment]::NewLine
@@ -305,6 +357,55 @@ function Invoke-CheckedProcess {
     finally {
         $process.Dispose()
     }
+}
+
+# A retryable failure is a transport failure, which is the only kind a read-only query may repeat.
+# A call that reports nothing to retry on, or a semantic refusal, is answered once.
+function Test-ToolkitRetryableCall {
+    param([AllowNull()][object]$Call)
+
+    if ($null -eq $Call -or $null -eq $Call.PSObject) {
+        return $true
+    }
+    $exitCode = $Call.PSObject.Properties['ExitCode']
+    if ($null -eq $exitCode) {
+        return $true
+    }
+    if ($exitCode.Value -eq -1) {
+        return $true
+    }
+    if ($exitCode.Value -eq 0) {
+        return $false
+    }
+    $text = $Call.PSObject.Properties['Text']
+    if ($null -eq $text) {
+        return $false
+    }
+    return ([string]$text.Value -match $script:ToolkitTransientCallPattern)
+}
+
+# The bounded retry for a read-only transport call. A retryable failure is thrown so the bounded
+# retry loop counts the attempt, and every other outcome is returned once, so a semantic refusal is
+# never repeated. Exhaustion surfaces the recoverable result, which is what makes exit code 2 and
+# the menu's Warning branch reachable, and the last underlying error stays in its message.
+function Invoke-ToolkitReadOnlyCall {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Description,
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [scriptblock]$Call
+    )
+
+    $operation = {
+        $call = & $Call
+        if (Test-ToolkitRetryableCall -Call $call) {
+            throw ($Description + ' failed. ' + [string]$call.Text)
+        }
+        return (Get-ToolkitResult -Status 'Success' -Message ($Description + ' ran.') -Data $call)
+    }
+    return (Invoke-WithRetry -Operation $operation -Attempts $script:ToolkitReadOnlyAttempts -DelaySeconds $script:ToolkitReadOnlyDelaySeconds)
 }
 
 function Get-ToolkitLogPath {
