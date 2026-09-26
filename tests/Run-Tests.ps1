@@ -8421,6 +8421,119 @@ function Invoke-MenuTests {
         Assert-Equal 'Unverified' $verifyWarning.Data.Report.Guest.Root 'A warning report did not keep the guest root state.'
         Assert-True (@($verifyWarning.Data.Report.Failures).Count -ge 1) 'A warning report did not keep its failure list.'
 
+        # The read-only report is computed for the operator, so it must reach standard output, not only the result object.
+        $verifyWarningText = @(Format-ToolkitResult -Result $verifyWarning) -join "`n"
+        Assert-True ($verifyWarningText -match '(?m)^\[Warning\] ') 'The rendered Verify result does not lead with its status and message.'
+        foreach ($expectedLine in @(
+                '  Install.Edition = Global',
+                ('  Install.InstallRoot = ' + $reportInstall.Install.InstallRoot),
+                ('  Install.VmsPath = ' + $reportInstall.Install.VmsPath),
+                ('  Install.ManagerPath = ' + $reportInstall.Install.ManagerPath),
+                '  Install.Source = Fallback',
+                ('  ManagerVersion = ' + [string]$report.ManagerVersion),
+                '  Instances:',
+                '    Instance 0 | Base | Android 12.0 | Running False | RootSetting not-detected',
+                '    Instance 2 | Android 12 | Android 12.0 | Running True | RootSetting True',
+                '  Guest.Root = Unverified',
+                '  Guest.Kitsune = none',
+                '  Guest.HmaInstalled = True',
+                '  Guest.VectorModuleInstalled = True',
+                '  Ads.RestorePoint = Missing',
+                ('  Backups.CloneIndex = ' + [string]$verifyWarning.Data.Report.Backups.CloneIndex),
+                ('  Backups.CloneName = ' + [string]$verifyWarning.Data.Report.Backups.CloneName),
+                ('  JournalState = ' + [string]$verifyWarning.Data.Report.JournalState),
+                ('  JournalOperation = ' + [string]$verifyWarning.Data.Report.JournalOperation),
+                '  Failures:',
+                '    Failure 1 = '
+            )) {
+            Assert-True ($verifyWarningText.Contains($expectedLine)) "The rendered Verify report does not carry the documented line: $expectedLine"
+        }
+        foreach ($fieldLine in @('Virtualization', 'Guest.Code', 'Guest.DaemonCount', 'JournalId')) {
+            Assert-True ($verifyWarningText -match ('(?m)^  ' + [regex]::Escape($fieldLine) + ' = \S')) "The rendered Verify report does not carry the reported field: $fieldLine"
+        }
+
+        # Every required field is rendered even when the report has no value for it, so no field is silently omitted.
+        $syntheticReport = [pscustomobject]@{
+            Install          = [pscustomobject]@{ Edition = 'Chinese'; InstallRoot = 'C:\MuMu\MuMuPlayer'; VmsPath = 'C:\MuMu\MuMuPlayer\vms'; ManagerPath = 'C:\MuMu\MuMuPlayer\shell\MuMuManager.exe'; Source = 'Registry' }
+            ManagerVersion   = '6.8.0.0'
+            Instances        = @([pscustomobject]@{ Index = 5; Name = 'Android 15'; AndroidVersion = '15.0'; Running = $false; RootSetting = $null; Eligible = $true })
+            Instance         = $null
+            Virtualization   = 'Disabled'
+            Guest            = [pscustomobject]@{ Root = 'Unverified'; Code = 'ROOT_DENIED'; RootPermission = $null; Kitsune = ''; KernelSU = ''; DaemonCount = -1; HmaInstalled = $false; VectorModuleInstalled = $false; Failure = '' }
+            Ads              = [pscustomobject]@{ CampaignFiles = @(); RestorePoint = 'Present' }
+            Backups          = [pscustomobject]@{ CloneIndex = 6; CloneName = 'Clone of 5' }
+            JournalState     = 'Completed'
+            JournalOperation = 'Root15'
+            JournalId        = 'fixture-journal'
+            Failures         = @('the first failure', 'the second failure')
+            Mutated          = $false
+        }
+        $syntheticResult = Get-ToolkitResult -Status 'Warning' -Message 'synthetic verify fixture' -Data ([pscustomobject]@{ Report = $syntheticReport })
+        $syntheticText = @(Format-ToolkitResult -Result $syntheticResult) -join "`n"
+        foreach ($expectedLine in @(
+                '[Warning] synthetic verify fixture',
+                '  Install.Edition = Chinese',
+                '  Install.InstallRoot = C:\MuMu\MuMuPlayer',
+                '  Install.VmsPath = C:\MuMu\MuMuPlayer\vms',
+                '  Install.ManagerPath = C:\MuMu\MuMuPlayer\shell\MuMuManager.exe',
+                '  Install.Source = Registry',
+                '  ManagerVersion = 6.8.0.0',
+                '  Instances:',
+                '    Instance 5 | Android 15 | Android 15.0 | Running False | RootSetting not-detected',
+                '  Virtualization = Disabled',
+                '  Guest.Root = Unverified',
+                '  Guest.Code = ROOT_DENIED',
+                '  Guest.RootPermission = not-detected',
+                '  Guest.Kitsune = none',
+                '  Guest.KernelSU = none',
+                '  Guest.DaemonCount = not-detected',
+                '  Guest.HmaInstalled = False',
+                '  Guest.VectorModuleInstalled = False',
+                '  Ads.RestorePoint = Present',
+                '  Backups.CloneIndex = 6',
+                '  Backups.CloneName = Clone of 5',
+                '  JournalState = Completed',
+                '  JournalOperation = Root15',
+                '  JournalId = fixture-journal',
+                '  Failures:',
+                '    Failure 1 = the first failure',
+                '    Failure 2 = the second failure'
+            )) {
+            Assert-True ($syntheticText.Contains($expectedLine)) "The rendered Verify report does not carry the documented line: $expectedLine"
+        }
+
+        # A report with nothing to report still names every field instead of dropping the lines.
+        $emptyReportText = @(Format-ToolkitResult -Result (Get-ToolkitResult -Status 'Warning' -Message 'empty report fixture' -Data ([pscustomobject]@{ Report = [pscustomobject]@{ Install = $null; Instances = @(); Guest = $null; Ads = $null; Backups = $null; JournalState = 'None'; JournalOperation = ''; JournalId = ''; Failures = @(); Mutated = $false } }))) -join "`n"
+        foreach ($expectedLine in @('  Instances: none', '  Install.Edition = not-detected', '  Guest.Root = not-detected', '  Ads.RestorePoint = not-detected', '  Backups.CloneIndex = not-detected', '  JournalOperation = none', '  JournalId = none', '  Failures: none')) {
+            Assert-True ($emptyReportText.Contains($expectedLine)) "An empty Verify report does not name the absent field: $expectedLine"
+        }
+
+        # A result that carries no report is rendered exactly as before, and an unexpected data shape never throws.
+        $scalarResult = Get-ToolkitResult -Status 'Success' -Message 'scalar fixture' -Data (@{ Code = 'OK'; Index = 3 })
+        $scalarRendered = @(Format-ToolkitResult -Result $scalarResult)
+        Assert-Equal 3 $scalarRendered.Count 'A scalar result no longer renders exactly its status, message, and data lines.'
+        Assert-Equal '[Success] scalar fixture' $scalarRendered[0] 'A scalar result changed its status line.'
+        Assert-Equal '  Code = OK' $scalarRendered[1] 'A scalar result changed its first data line.'
+        Assert-Equal '  Index = 3' $scalarRendered[2] 'A scalar result changed its second data line.'
+        foreach ($unsafeResult in @(
+                (Get-ToolkitResult -Status 'Warning' -Message 'no data' -Data $null),
+                (Get-ToolkitResult -Status 'Warning' -Message 'text data' -Data 'not a report'),
+                (Get-ToolkitResult -Status 'Warning' -Message 'text report' -Data (@{ Report = 'not a report' })),
+                (Get-ToolkitResult -Status 'Warning' -Message 'absent report' -Data (@{ Report = $null }))
+            )) {
+            $unsafeRendered = @(Format-ToolkitResult -Result $unsafeResult)
+            Assert-True ($unsafeRendered.Count -ge 1) 'A result with no read-only report rendered no status line.'
+            Assert-Equal 0 @($unsafeRendered | Where-Object { $_ -match '(?i)^  (Guest|Install|Backups|Ads)\.|^  Instances|^  Failures' }).Count 'A result with no read-only report rendered report lines.'
+        }
+
+        # A menu or noninteractive run carries the report in a dictionary beside the log path, so both shapes must render it.
+        $wrappedResult = Get-ToolkitResult -Status 'Warning' -Message 'wrapped verify fixture' -Data ([ordered]@{ Report = $syntheticReport; Log = 'C:\toolkit state\logs\mumu-root-hide-toolkit.log' })
+        $wrappedText = @(Format-ToolkitResult -Result $wrappedResult) -join "`n"
+        foreach ($expectedLine in @('  Guest.Root = Unverified', '  Guest.Kitsune = none', '  Ads.RestorePoint = Present', '  Backups.CloneName = Clone of 5', '  Failures:', '    Failure 1 = the first failure')) {
+            Assert-True ($wrappedText.Contains($expectedLine)) "A dictionary-shaped Verify result did not carry the documented line: $expectedLine"
+        }
+        Assert-True ($wrappedText.Contains('  Log: C:\toolkit state\logs\mumu-root-hide-toolkit.log')) 'A dictionary-shaped Verify result lost its log line.'
+
         $root15Unconfirmed = Invoke-ToolkitAction -Action 'Root15' -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -StateRoot $menuStateRoot
         Assert-Equal 'CriticalError' $root15Unconfirmed.Status "An unconfirmed Android 15 action returned $($root15Unconfirmed.Status)."
         Assert-True ($root15Unconfirmed.Message -match '(?i)confirm') 'An unconfirmed Android 15 action did not ask for an explicit confirmation.'
@@ -9663,6 +9776,30 @@ function Invoke-DocsTests {
         Assert-True ($targetSection.Value -match $targetStatement.Pattern) $targetStatement.Message
     }
     Assert-True ($targetSection.Value -notmatch '(?i)(use|pass|run)[^.\n]*requested index (for|as) ') 'The target selection section tells the operator to use the requested index for a later action.'
+
+    # The Verify report section is bound to the fields the controller actually prints.
+    $verifySection = [regex]::Match($readme, '(?ms)^## Verify report$.*?(?=^## )')
+    Assert-True $verifySection.Success 'README has no Verify report section.'
+    foreach ($reportStatement in @(
+            @{ Pattern = '(?i)one field per line'; Message = 'The Verify report section does not state the shape of the printed report.' }
+            @{ Pattern = 'Install\.InstallRoot'; Message = 'The Verify report section does not name the installation identity.' }
+            @{ Pattern = 'Install\.ManagerPath'; Message = 'The Verify report section does not name the manager path.' }
+            @{ Pattern = 'RootSetting'; Message = 'The Verify report section does not name the per-instance vendor root setting.' }
+            @{ Pattern = 'Virtualization'; Message = 'The Verify report section does not name the virtualization state.' }
+            @{ Pattern = 'Guest\.Root'; Message = 'The Verify report section does not name the guest root state.' }
+            @{ Pattern = 'Guest\.DaemonCount'; Message = 'The Verify report section does not name the guest root daemon evidence.' }
+            @{ Pattern = 'Guest\.HmaInstalled'; Message = 'The Verify report section does not name the Hide My Applist module state.' }
+            @{ Pattern = 'Guest\.VectorModuleInstalled'; Message = 'The Verify report section does not name the Vector module state.' }
+            @{ Pattern = 'Ads\.RestorePoint'; Message = 'The Verify report section does not name the advertisement restore point.' }
+            @{ Pattern = 'Backups\.CloneIndex'; Message = 'The Verify report section does not name the verified clone backup.' }
+            @{ Pattern = 'JournalState'; Message = 'The Verify report section does not name the journal state.' }
+            @{ Pattern = 'Failures:'; Message = 'The Verify report section does not name the failure list.' }
+            @{ Pattern = '(?i)not-detected'; Message = 'The Verify report section does not state the marker for a value that was not reported.' }
+            @{ Pattern = '(?i)`none`'; Message = 'The Verify report section does not state the marker for a value that is empty.' }
+        )) {
+        Assert-True ($verifySection.Value -match $reportStatement.Pattern) $reportStatement.Message
+    }
+    Assert-True ($verifySection.Value -notmatch '(?i)no live (qualification|run|test)') 'The Verify report section reintroduces a negative live-status claim.'
 
     Assert-True ($license -match 'MIT License') 'LICENSE is not the MIT license.'
     Assert-True ($license -match 'Permission is hereby granted, free of charge') 'LICENSE does not contain the MIT grant.'

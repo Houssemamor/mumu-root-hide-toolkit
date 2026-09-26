@@ -541,6 +541,107 @@ function Format-ToolkitInstanceChoices {
     return $lines
 }
 
+# A report field that carries no value is named with one of these two markers, so a rendered report is a fixed record instead of a varying one.
+$script:ToolkitReportAbsentText = 'not-detected'
+$script:ToolkitReportEmptyText = 'none'
+
+function ConvertTo-ToolkitReportText {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $script:ToolkitReportAbsentText
+    }
+    # A negative count or index is the report's own unread marker, not a measured value.
+    if ($Value -is [int] -and [int]$Value -lt 0) {
+        return $script:ToolkitReportAbsentText
+    }
+    $text = [string]$Value
+    if ($text.Length -eq 0) {
+        return $script:ToolkitReportEmptyText
+    }
+    # The report carries manager and guest text, so it is redacted on the way out like every other toolkit output.
+    return (Protect-ToolkitText $text)
+}
+
+function Test-ToolkitReportShape {
+    param([AllowNull()][object]$Report)
+
+    if ($null -eq $Report -or $Report -is [string] -or $Report -is [ValueType] -or $Report -is [Array]) {
+        return $false
+    }
+    # A report is recognized by its own identifying fields, so a result that carries no report is left alone.
+    foreach ($fieldName in @('Install', 'Guest', 'Failures', 'Instances', 'Ads', 'Backups', 'Virtualization', 'JournalState', 'ManagerVersion', 'Mutated')) {
+        if ($null -ne (Get-ToolkitRecordValue -Record $Report -PropertyNames @($fieldName))) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Format-ToolkitReport {
+    param([AllowNull()][object]$Report)
+
+    $lines = @()
+    $install = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Install')
+    foreach ($fieldName in @('Edition', 'InstallRoot', 'VmsPath', 'ManagerPath', 'Source')) {
+        $lines += ('  Install.' + $fieldName + ' = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $install -PropertyNames @($fieldName))))
+    }
+    $lines += ('  ManagerVersion = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $Report -PropertyNames @('ManagerVersion'))))
+
+    # The instance rows carry the root setting the manager reports, because that is the only per-instance root evidence the manager holds.
+    # An absent list and an empty one both mean there is nothing to list, because the field reader returns no value for either.
+    $instanceValue = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Instances')
+    $instances = @()
+    if ($null -ne $instanceValue) {
+        $instances = @($instanceValue)
+    }
+    if ($instances.Count -eq 0) {
+        $lines += ('  Instances: ' + $script:ToolkitReportEmptyText)
+    }
+    else {
+        $lines += '  Instances:'
+        foreach ($instance in $instances) {
+            $lines += ('    Instance ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $instance -PropertyNames @('Index'))) +
+                ' | ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $instance -PropertyNames @('Name'))) +
+                ' | Android ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $instance -PropertyNames @('AndroidVersion'))) +
+                ' | Running ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $instance -PropertyNames @('Running'))) +
+                ' | RootSetting ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $instance -PropertyNames @('RootSetting'))))
+        }
+    }
+
+    $lines += ('  Virtualization = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $Report -PropertyNames @('Virtualization'))))
+
+    $guest = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Guest')
+    foreach ($fieldName in @('Root', 'Code', 'RootPermission', 'Kitsune', 'KernelSU', 'DaemonCount', 'HmaInstalled', 'VectorModuleInstalled')) {
+        $lines += ('  Guest.' + $fieldName + ' = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $guest -PropertyNames @($fieldName))))
+    }
+
+    $advertisements = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Ads')
+    $lines += ('  Ads.RestorePoint = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $advertisements -PropertyNames @('RestorePoint'))))
+    $backups = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Backups')
+    $lines += ('  Backups.CloneIndex = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $backups -PropertyNames @('CloneIndex'))))
+    $lines += ('  Backups.CloneName = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $backups -PropertyNames @('CloneName'))))
+    foreach ($fieldName in @('JournalState', 'JournalOperation', 'JournalId')) {
+        $lines += ('  ' + $fieldName + ' = ' + (ConvertTo-ToolkitReportText (Get-ToolkitRecordValue -Record $Report -PropertyNames @($fieldName))))
+    }
+
+    $failureValue = Get-ToolkitRecordValue -Record $Report -PropertyNames @('Failures')
+    $failures = @()
+    if ($null -ne $failureValue) {
+        $failures = @($failureValue)
+    }
+    if ($failures.Count -eq 0) {
+        $lines += ('  Failures: ' + $script:ToolkitReportEmptyText)
+    }
+    else {
+        $lines += '  Failures:'
+        for ($failureIndex = 0; $failureIndex -lt $failures.Count; $failureIndex++) {
+            $lines += ('    Failure ' + ($failureIndex + 1) + ' = ' + (ConvertTo-ToolkitReportText $failures[$failureIndex]))
+        }
+    }
+    return $lines
+}
+
 function Format-ToolkitResult {
     param([object]$Result)
 
@@ -562,6 +663,11 @@ function Format-ToolkitResult {
         if ($data.Contains('Log') -and -not [string]::IsNullOrWhiteSpace([string]$data['Log'])) {
             $lines += ('  Log: ' + [string]$data['Log'])
         }
+    }
+    # The read-only report is nested inside the data and is not a scalar, so the loop above cannot print it.
+    $report = Get-ToolkitRecordValue -Record $data -PropertyNames @('Report')
+    if (Test-ToolkitReportShape -Report $report) {
+        $lines += @(Format-ToolkitReport -Report $report)
     }
     if ([string]$Result.Status -in @('RecoverableError', 'CriticalError')) {
         $lines += ('  ' + $script:ToolkitRecoveryGuidance)

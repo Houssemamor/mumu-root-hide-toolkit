@@ -106,6 +106,50 @@ no one-command Android 12 root automation; use the menu for that action.
 instance, so a noninteractive `Conceal` follows either a menu `Root12` run or a noninteractive
 `Root15` run.
 
+## Verify report
+
+`Verify` changes nothing in MuMu and prints the whole read-only report, so nothing it found stays
+invisible to you. The report is plain text with one field per line, so it can be read directly or
+searched for a single field:
+
+```text
+[Warning] The read-only report for the instance at index 2 is collected. Root state: Unverified. Global installation C:\Program Files\Netease\MuMu Global.
+  Install.Edition = Global
+  Install.InstallRoot = C:\Program Files\Netease\MuMu Global
+  Install.VmsPath = C:\Program Files\Netease\MuMu Global\vms
+  Install.ManagerPath = C:\Program Files\Netease\MuMu Global\shell\MuMuManager.exe
+  Install.Source = Registry
+  ManagerVersion = 6.8.0.0
+  Instances:
+    Instance 0 | Base | Android 12.0 | Running False | RootSetting not-detected
+    Instance 2 | Android 12 | Android 12.0 | Running True | RootSetting True
+  Virtualization = Enabled
+  Guest.Root = Unverified
+  Guest.Code = ADB_FAILED
+  Guest.RootPermission = not-detected
+  Guest.Kitsune = none
+  Guest.KernelSU = none
+  Guest.DaemonCount = 0
+  Guest.HmaInstalled = True
+  Guest.VectorModuleInstalled = True
+  Ads.RestorePoint = Missing
+  Backups.CloneIndex = 7
+  Backups.CloneName = Android 12 clone
+  JournalState = Completed
+  JournalOperation = Root12
+  JournalId = 8fd6a6a800534e6c8b643490f7bb26df
+  Failures:
+    Failure 1 = The Kitsune package query failed.
+```
+
+The report names the installation identity, every discovered instance with its index, Android
+version, and vendor root setting, the virtualization state, the guest root and root daemon
+evidence, the Hide My Applist and Vector module state, the advertisement restore point, the
+verified clone backup, the last journal state, and every failure it collected. A value the manager
+or the guest did not report is printed as `not-detected`, and a value that is present but empty is
+printed as `none`, so a field is never silently dropped. A clean instance prints `Failures: none`
+after the same field list, so an empty failure list is stated rather than implied.
+
 ## Target selection
 
 `Target` is the prerequisite step. It reports which instance the later actions would work on and
@@ -342,7 +386,7 @@ With `-NonInteractive` the process runs one action and exits with:
 | --- | --- |
 | `Success` | `0` |
 | `AlreadyApplied` | `0` |
-| `Warning` | `0` with the report on standard output |
+| `Warning` | `0`; a `Verify` warning prints its whole report on standard output |
 | `RecoverableError` | `2` |
 | `CriticalError` | `1` |
 
