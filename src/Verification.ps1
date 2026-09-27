@@ -4,6 +4,12 @@ if (-not (Test-Path variable:script:ToolkitBootPollAttempts)) {
 if (-not (Test-Path variable:script:ToolkitBootPollDelaySeconds)) {
     $script:ToolkitBootPollDelaySeconds = 3
 }
+# A cold boot is bounded by wall clock, not by attempts multiplied by a retried probe. The poll is the
+# retry, so the probe itself is not retried, and the whole poll stops at this budget instead of running
+# 30 probes that each carry the full transport bound.
+if (-not (Test-Path variable:script:ToolkitBootPollBudgetSeconds)) {
+    $script:ToolkitBootPollBudgetSeconds = 600
+}
 if (-not (Test-Path variable:script:ToolkitCampaignRestorePointFile)) {
     $script:ToolkitCampaignRestorePointFile = 'restore-point.json'
 }
@@ -14,15 +20,16 @@ function Invoke-ToolkitManagerAdb {
         [int]$InstanceIndex,
         [Parameter(Mandatory = $true)]
         [string]$Command,
-        [scriptblock]$Runner = $null
+        [scriptblock]$Runner = $null,
+        [switch]$NoRetry
     )
 
     $invoke = {
         Invoke-CheckedProcess -FilePath $ManagerPath -ArgumentList @('adb', '-v', ([string]$InstanceIndex), '-c', $Command) -Runner $Runner
     }
-    # A guest command is retried only when the toolkit can see that it changes nothing, so a
-    # repeated install, push, move, or removal can never happen.
-    if ($Command -cnotmatch $script:ToolkitReadOnlyGuestPattern) {
+    # A guest command is retried only when the toolkit can see that the whole command changes nothing,
+    # so a repeated install, push, move, or removal can never happen.
+    if ($NoRetry -or -not (Test-ToolkitReadOnlyGuestCommand -Command $Command)) {
         return (& $invoke)
     }
     $retried = Invoke-ToolkitReadOnlyCall -Description ("The read-only guest command " + $Command) -Call $invoke
@@ -107,12 +114,18 @@ function Wait-ToolkitBootCompleted {
         [scriptblock]$Runner = $null
     )
 
+    $budgetDeadline = [DateTime]::UtcNow.AddSeconds($script:ToolkitBootPollBudgetSeconds)
     for ($attempt = 1; $attempt -le $script:ToolkitBootPollAttempts; $attempt++) {
-        $probe = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command 'shell getprop sys.boot_completed' -Runner $Runner
+        if ([DateTime]::UtcNow -ge $budgetDeadline) {
+            return $false
+        }
+        # This probe is the poll's own retry, so it is not retried inside one attempt: that would
+        # multiply the process bound by the attempt count instead of bounding the poll.
+        $probe = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command 'shell getprop sys.boot_completed' -Runner $Runner -NoRetry
         if ($null -ne $probe -and $probe.ExitCode -eq 0 -and ([string]$probe.Text).Trim() -ceq '1') {
             return $true
         }
-        if ($attempt -lt $script:ToolkitBootPollAttempts) {
+        if ($attempt -lt $script:ToolkitBootPollAttempts -and [DateTime]::UtcNow -lt $budgetDeadline) {
             Start-Sleep -Seconds $script:ToolkitBootPollDelaySeconds
         }
     }
@@ -285,7 +298,13 @@ function Get-ToolkitRecordValue {
     if ($Record -is [Collections.IDictionary]) {
         foreach ($propertyName in $PropertyNames) {
             if ($Record.Contains($propertyName)) {
-                return $Record[$propertyName]
+                # Returning a one-element collection unrolls it into the element, so an array is wrapped
+                # to keep a single package name distinguishable from a one-element package list.
+                $value = $Record[$propertyName]
+                if ($value -is [Array]) {
+                    return , $value
+                }
+                return $value
             }
         }
         return $null
@@ -293,7 +312,11 @@ function Get-ToolkitRecordValue {
     foreach ($propertyName in $PropertyNames) {
         $property = $Record.PSObject.Properties[$propertyName]
         if ($null -ne $property) {
-            return $property.Value
+            $value = $property.Value
+            if ($value -is [Array]) {
+                return , $value
+            }
+            return $value
         }
     }
     return $null
@@ -589,6 +612,12 @@ function Get-ToolkitGuestState {
         if ($null -ne $module -and $module.ExitCode -eq 0) {
             $guest['VectorModuleInstalled'] = $true
         }
+        elseif ($null -ne $module -and $module.ExitCode -eq -1) {
+            # An unread probe is not an absent module, so the field is left undetected and the reason is
+            # reported instead of claiming a false.
+            $guest['VectorModuleInstalled'] = $null
+            $guest['Failure'] = $guest['Failure'] + " The Vector module at $modulePath could not be read: $([string]$module.Text)"
+        }
     }
     return $guest
 }
@@ -756,7 +785,16 @@ function Get-ToolkitReport {
                 $report['Backups']['CloneName'] = [string]$clone.Data.CloneName
                 # Concealment only ever changes the verified clone, so its evidence is read there.
                 if (Test-ToolkitCommandAvailable -Name 'Get-ConcealmentEvidence') {
-                    $report['Concealment'] = Get-ConcealmentEvidence -ManagerPath $managerPath -CloneIndex ([int]$clone.Data.CloneIndex) -Runner $Runner
+                    $evidence = Get-ConcealmentEvidence -ManagerPath $managerPath -CloneIndex ([int]$clone.Data.CloneIndex) -Runner $Runner
+                    $report['Concealment'] = $evidence
+                    # A concealment evidence that is not verified is a failure of the report, so it is
+                    # recorded with its code instead of being printed beside a clean failure list.
+                    $evidenceStatus = [string](Get-ToolkitRecordValue -Record $evidence -PropertyNames @('Status'))
+                    $evidenceCode = [string](Get-ToolkitRecordValue -Record $evidence -PropertyNames @('Code'))
+                    $evidenceMessage = [string](Get-ToolkitRecordValue -Record $evidence -PropertyNames @('Message'))
+                    if ($evidenceStatus -cne 'Success') {
+                        $failures += "Concealment evidence on the verified clone is $evidenceCode, not a verified scope. $evidenceMessage"
+                    }
                 }
                 else {
                     $failures += 'The concealment verification command is not loaded, so no concealment evidence was read.'

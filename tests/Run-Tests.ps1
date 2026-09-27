@@ -326,6 +326,41 @@ function Invoke-TransportTests {
     }
     Assert-True (-not $wedgedChildAlive) 'A child that outlived the timeout was not terminated.'
 
+    # A surviving grandchild inherits the redirected handle, so the stream never reaches EOF after the
+    # child itself is gone. Reporting the child's real exit code with the buffered output thrown away
+    # is what makes an unread transport look like a clean negative, so the call must fail closed.
+    $grandChildPidPath = Join-Path $testRoot 'grandchild pid.txt'
+    $grandChildPidArgument = $grandChildPidPath.Replace("'", "''")
+    $holderCommand = "Start-Process -FilePath (Join-Path `$PSHOME 'powershell.exe') -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 12' -NoNewWindow; " +
+        "[IO.File]::WriteAllText('$grandChildPidArgument', [string]`$PID); " +
+        "[Console]::Out.WriteLine('parent payload before the orphan'); exit 0"
+    $orphanCall = Invoke-CheckedProcess -FilePath $powershellPath -TimeoutSeconds 60 -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $holderCommand)
+    Assert-True ($orphanCall.ExitCode -ne 0) "A child whose grandchild held the redirected stream reported a clean exit code: $($orphanCall.ExitCode)"
+    Assert-Equal -1 $orphanCall.ExitCode 'A child whose grandchild held the redirected stream was not reported as a transport failure.'
+    Assert-True ($orphanCall.Text -match '(?i)output|capture') "The transport failure does not say the captured output could not be collected: $($orphanCall.Text)"
+    Assert-True ($orphanCall.Text -notmatch 'parent payload before the orphan') 'A discarded capture was still reported as collected output.'
+    $grandChildId = 0
+    Assert-True ([int]::TryParse([IO.File]::ReadAllText($grandChildPidPath), [ref]$grandChildId)) 'The parent of the surviving grandchild did not report its process id.'
+    $grandChildAlive = $true
+    for ($poll = 0; $poll -lt 20 -and $grandChildAlive; $poll++) {
+        $grandChildAlive = ($null -ne (Get-Process -Id $grandChildId -ErrorAction SilentlyContinue))
+        if ($grandChildAlive) {
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if ($grandChildAlive) {
+        Stop-Process -Id $grandChildId -Force -ErrorAction SilentlyContinue
+    }
+
+    # The same shape with a grandchild that leaves promptly still closes the pipe, so the capture is
+    # complete and the real exit code stands: nothing is lost when the stream can be collected.
+    $briefHolderCommand = "Start-Process -FilePath (Join-Path `$PSHOME 'powershell.exe') -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Milliseconds 400' -NoNewWindow; " +
+        "[Console]::Out.WriteLine('parent payload with a brief grandchild'); [Console]::Error.WriteLine('brief stderr'); exit 4"
+    $briefCall = Invoke-CheckedProcess -FilePath $powershellPath -TimeoutSeconds 60 -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $briefHolderCommand)
+    Assert-Equal 4 $briefCall.ExitCode 'A child whose grandchild left promptly did not report its real exit code.'
+    Assert-True ($briefCall.Text -match 'parent payload with a brief grandchild') 'A collectable capture lost the child output.'
+    Assert-True ($briefCall.Text -match 'brief stderr') 'A collectable capture lost the child standard error.'
+
     $transientState = @{ Count = 0 }
     $transientRunner = {
         param($ActualFilePath, $ActualArgumentList)
@@ -335,9 +370,111 @@ function Invoke-TransportTests {
         }
         return [pscustomobject]@{ ExitCode = 0; Text = '1' }
     }.GetNewClosure()
-    $retriedProbe = Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Command 'shell getprop sys.boot_completed' -Runner $transientRunner
+    $retriedProbe = Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Command 'shell dumpsys package com.example.app' -Runner $transientRunner
     Assert-Equal 0 $retriedProbe.ExitCode 'A read-only guest command that failed transiently did not succeed on a later attempt.'
     Assert-Equal 3 $transientState.Count 'A read-only guest command was not retried to its bound.'
+
+    # The read-only retry must be a whole-command invariant, not a first-token match. The shared guest
+    # funnel allows && and the mutating verbs, so a command that starts read-only and then mutates must
+    # never be retried.
+    Assert-True ($null -ne (Get-Command Test-ToolkitReadOnlyGuestCommand -CommandType Function -ErrorAction SilentlyContinue)) 'Test-ToolkitReadOnlyGuestCommand is unavailable.'
+    foreach ($readOnlyCommand in @(
+            'getprop sys.boot_completed'
+            'shell getprop sys.boot_completed'
+            'shell dumpsys package com.example.app'
+            'shell pidof magiskd'
+            'shell cat /data/adb/ksu/.allowlist'
+            'shell ls /data/adb/modules'
+            'shell ls -l /data/adb/ksu/.allowlist'
+        )) {
+        Assert-Equal $true (Test-ToolkitReadOnlyGuestCommand -Command $readOnlyCommand) "A read-only guest command was not recognized: $readOnlyCommand"
+        $readOnlyState = @{ Count = 0 }
+        $readOnlyRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            $readOnlyState.Count++
+            [pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: the manager is busy' }
+        }.GetNewClosure()
+        [void](Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Command $readOnlyCommand -Runner $readOnlyRunner)
+        Assert-Equal 3 $readOnlyState.Count "A read-only guest command was not retried to its bound: $readOnlyCommand"
+    }
+    foreach ($mutatingCommand in @(
+            'ls /data/adb/modules && rm -rf /data/adb/modules/zygisk_vector'
+            'shell ls /data/adb/modules && mv /data/local/tmp/a /data/local/tmp/b'
+            'shell cat /data/adb/x | base64 -d'
+            'shell ls /data/adb/modules > /data/local/tmp/out'
+            'rm -rf /data/adb/modules/zygisk_vector'
+            'shell mkdir -p /data/local/tmp/x'
+            'shell unzip -o /data/local/tmp/x.zip -d /data/local/tmp/x'
+            'shell su -c "ls /data/adb/modules"'
+            'install -r /data/local/tmp/app.apk'
+            'push /data/local/tmp/x.zip /data/local/tmp/y.zip'
+            'shell rm /data/adb/ksu/.allowlist'
+        )) {
+        Assert-Equal $false (Test-ToolkitReadOnlyGuestCommand -Command $mutatingCommand) "A mutating guest command was classified as read-only: $mutatingCommand"
+        $mutatingState = @{ Count = 0 }
+        $mutatingClassifierRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            $mutatingState.Count++
+            [pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: the manager is busy' }
+        }.GetNewClosure()
+        [void](Invoke-ToolkitManagerAdb -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Command $mutatingCommand -Runner $mutatingClassifierRunner)
+        Assert-Equal 1 $mutatingState.Count "A mutating guest command was retried: $mutatingCommand"
+    }
+
+    # The boot poll is bounded by wall clock, not by attempts multiplied by a retried probe, so a cold
+    # boot cannot take hours. A transient first attempt inside the poll is still recovered by the next.
+    $bootBudgetVariable = Get-Variable -Name 'ToolkitBootPollBudgetSeconds' -Scope Script -ErrorAction SilentlyContinue
+    Assert-True ($null -ne $bootBudgetVariable) 'The boot poll has no wall-clock budget.'
+    Assert-True ([int]$bootBudgetVariable.Value -ge 60 -and [int]$bootBudgetVariable.Value -le 1800) "The boot poll budget is not a defensible bound: $($bootBudgetVariable.Value)"
+    $savedAttempts = $script:ToolkitBootPollAttempts
+    $savedDelay = $script:ToolkitBootPollDelaySeconds
+    $savedBudget = $script:ToolkitBootPollBudgetSeconds
+    $script:ToolkitBootPollAttempts = 30
+    $script:ToolkitBootPollDelaySeconds = 1
+    $script:ToolkitBootPollBudgetSeconds = 2
+    try {
+        $budgetStopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $budgetRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            Start-Sleep -Milliseconds 400
+            [pscustomobject]@{ ExitCode = 0; Text = '0' }
+        }.GetNewClosure()
+        $budgetPoll = Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $budgetRunner
+        $budgetStopwatch.Stop()
+        Assert-True (-not $budgetPoll) 'The boot poll reported a ready instance that never booted.'
+        Assert-True ($budgetStopwatch.Elapsed.TotalSeconds -le ($script:ToolkitBootPollBudgetSeconds + 5)) "The boot poll ran past its wall-clock budget: $($budgetStopwatch.Elapsed.TotalSeconds) seconds."
+
+        $script:ToolkitBootPollDelaySeconds = 0
+        $pollTransportState = @{ Count = 0 }
+        $pollTransportRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            $pollTransportState.Count++
+            if ($pollTransportState.Count -eq 1) {
+                return [pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: the manager is busy' }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Text = '1' }
+        }.GetNewClosure()
+        Assert-True (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $pollTransportRunner) 'The boot poll did not recover from a transient first attempt.'
+        Assert-Equal 2 $pollTransportState.Count 'The boot poll retried inside a single attempt instead of moving to the next attempt.'
+
+        # The poll probe is excluded from the transport retry, so its own worst case is one process bound
+        # inside the wall-clock budget rather than three. Two attempts that both fail must therefore cost
+        # exactly two calls, not two retried calls each.
+        $alwaysPollState = @{ Count = 0 }
+        $alwaysPollRunner = {
+            param($ActualFilePath, $ActualArgumentList)
+            $alwaysPollState.Count++
+            [pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: the manager is busy' }
+        }.GetNewClosure()
+        $script:ToolkitBootPollAttempts = 2
+        Assert-True (-not (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $alwaysPollRunner)) 'The boot poll reported a ready instance whose transport always failed.'
+        Assert-Equal 2 $alwaysPollState.Count 'The boot poll probe was retried inside one poll attempt.'
+    }
+    finally {
+        $script:ToolkitBootPollAttempts = $savedAttempts
+        $script:ToolkitBootPollDelaySeconds = $savedDelay
+        $script:ToolkitBootPollBudgetSeconds = $savedBudget
+    }
 
     $stoppedState = @{ Count = 0 }
     $stoppedRunner = {
@@ -2533,6 +2670,53 @@ function Invoke-SafetyTests {
     Assert-Throws { New-ToolkitElevatedArgumentList -ScriptPath $outsideScript -Arguments @() } 'An elevated child payload was built for a script outside the source directory.'
     Assert-Throws { New-ToolkitElevatedArgumentList -ScriptPath $escapedScript -Arguments @() } 'An elevated child payload was built for a reparse-point escape.'
     Assert-Equal 0 $emptyRunnerState.Count 'A refused elevated action request reached the process runner.'
+
+    # The elevated relaunch is the one external process a person can hold open, because the UAC consent
+    # dialog waits for a human, so both the prompt and the child carry their own documented bound and an
+    # unanswered prompt fails closed instead of hanging the menu forever. The launch is faked here, so
+    # no test can ever raise a real UAC prompt.
+    $promptBound = Get-Variable -Name 'ToolkitElevatedPromptSeconds' -Scope Script -ErrorAction SilentlyContinue
+    $actionBound = Get-Variable -Name 'ToolkitElevatedActionSeconds' -Scope Script -ErrorAction SilentlyContinue
+    Assert-True ($null -ne $promptBound) 'The elevated relaunch has no bound for the UAC prompt.'
+    Assert-True ($null -ne $actionBound) 'The elevated relaunch has no bound for the elevated child.'
+    Assert-True ([int]$promptBound.Value -ge 30 -and [int]$promptBound.Value -le 600) "The UAC prompt bound is not a defensible bound: $($promptBound.Value)"
+    Assert-True ([int]$actionBound.Value -ge 600 -and [int]$actionBound.Value -le 14400) "The elevated child bound is not a defensible bound: $($actionBound.Value)"
+    Assert-True ([int]$actionBound.Value -gt [int]$promptBound.Value) 'The elevated child bound is not above the UAC prompt bound.'
+    Assert-True ($elevationSource -notmatch '(?i)Start-Process[^;\r\n]*-Wait') 'The elevated relaunch still waits on the child without a bound.'
+    $elevationParameters = @((Get-Command Invoke-ElevatedToolkitAction -CommandType Function).Parameters.Keys)
+    Assert-True ($elevationParameters -ccontains 'Launch') 'The elevated relaunch has no bounded launch seam for a test.'
+
+    $savedPromptBound = $script:ToolkitElevatedPromptSeconds
+    $script:ToolkitElevatedPromptSeconds = 1
+    try {
+        $unansweredRunner = {
+            param($ActualFilePath, $ActualQuotedArguments)
+            Start-Sleep -Seconds 5
+        }.GetNewClosure()
+        $unanswered = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'Unanswered') -Launch $unansweredRunner
+        Assert-Equal 'CriticalError' $unanswered.Status 'An unanswered UAC prompt did not fail closed.'
+        Assert-True ($unanswered.Message -match '(?i)prompt|not answered|bound') "An unanswered UAC prompt did not name the prompt bound: $($unanswered.Message)"
+        Assert-Equal 1 (Get-ToolkitExitCode $unanswered) 'An unanswered UAC prompt did not map to the critical exit code.'
+
+        $script:ToolkitElevatedPromptSeconds = 30
+        $script:ToolkitElevatedActionSeconds = 1
+        $wedgedRunner = {
+            param($ActualFilePath, $ActualQuotedArguments)
+            Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru
+        }.GetNewClosure()
+        $wedgedElevation = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'Wedged') -Launch $wedgedRunner
+        Assert-Equal 'CriticalError' $wedgedElevation.Status 'An elevated child that outlived its bound did not fail closed.'
+        Assert-True ($wedgedElevation.Message -match '(?i)bound|complete') "An elevated child that outlived its bound did not name the bound: $($wedgedElevation.Message)"
+    }
+    finally {
+        $script:ToolkitElevatedPromptSeconds = $savedPromptBound
+        $script:ToolkitElevatedActionSeconds = $actionBound.Value
+    }
+
+    # A guest shell that refuses a su request is a guest answer, not a host access denial, so it must
+    # never reach the UAC prompt.
+    Assert-Equal $false (Test-ToolkitPermissionFailure -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'The root shell was denied: su: permission denied')) 'A guest su denial was treated as a host permission failure.'
+    Assert-Equal $false (Test-ToolkitPermissionFailure -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'The guest refused the module install: /system/bin/sh: permission denied')) 'A guest module install refusal was treated as a host permission failure.'
 
     # A permission failure is the only outcome that may ask for rights, so it is recognized by an
     # explicit code or an access-denied message and by nothing else.
@@ -5183,6 +5367,21 @@ function Invoke-Root12Tests {
             Assert-Equal -1 (Get-Root12CallIndex -Calls $adbState.Calls -Pattern '*root_permission*-val*false*') "A failed $($adbCase.Label) disabled the temporary vendor root."
         }
 
+        # A transport failure is not an answer, so a daemon query that could not be read must fail
+        # closed instead of being reported as an absent daemon.
+        foreach ($transportCase in @(
+                [pscustomobject]@{ Pattern = '*dumpsys*'; Label = 'package query' },
+                [pscustomobject]@{ Pattern = '*pidof*'; Label = 'daemon query' }
+            )) {
+            $transportState = New-Root12ManagerState -Install $install
+            $transportState.AdbFailPattern = $transportCase.Pattern
+            $transportState.AdbFailExitCode = -1
+            $transportFailure = Invoke-Root12Case -State $transportState -Instance $android12 -Manifest $manifest `
+                -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            Assert-Root12Failure -Result $transportFailure.Result -Journal $transportFailure.Journal -Code 'ADB_FAILED' -Message "An unreadable $($transportCase.Label) was accepted."
+            Assert-Equal -1 (Get-Root12CallIndex -Calls $transportState.Calls -Pattern '*root_permission*-val*false*') "An unreadable $($transportCase.Label) disabled the temporary vendor root."
+        }
+
         $bootAdbState = New-Root12ManagerState -Install $install
         $bootAdbState.AdbFailPattern = '*getprop*'
         $bootAdbCase = Invoke-Root12Case -State $bootAdbState -Instance $android12 -Manifest $manifest `
@@ -6817,6 +7016,7 @@ function New-ConcealmentGuestState {
         Modules = @()
         HmaPackage = [string]$script:ConcealmentRootPackages[0]
         AdbFailPattern = ''
+        AdbFailExitCode = 1
         CatFailPattern = ''
         CatCorruptPattern = ''
         ExtractEntries = @('zygisk_vector')
@@ -7021,7 +7221,7 @@ function New-ConcealmentManagerRunner {
         }
         $request = [string]$arguments[4]
         if (-not [string]::IsNullOrWhiteSpace([string]$State.AdbFailPattern) -and $request -like $State.AdbFailPattern) {
-            return [pscustomobject]@{ ExitCode = 1; Text = 'adb: fixture failure' }
+            return [pscustomobject]@{ ExitCode = [int]$State.AdbFailExitCode; Text = 'adb: fixture failure' }
         }
         if ($request -ceq 'shell pm list packages') {
             return [pscustomobject]@{ ExitCode = 0; Text = (@($State.Packages | ForEach-Object { 'package:' + [string]$_ }) -join [Environment]::NewLine) }
@@ -7381,6 +7581,10 @@ function Invoke-ConcealmentTests {
     $cachedOnly = Save-ToolkitManifestAsset -Manifest $assets.Manifest -Id 'hma' -CacheRoot $cachedOnlyRoot -Fetch $forbiddenFetcher -RequireCached
     Assert-Equal 'CriticalError' $cachedOnly.Status 'The cached-only contract accepted an absent asset.'
     Assert-Equal 'ASSET_VERIFICATION_FAILED' $cachedOnly.Data.Code 'The cached-only contract reported the wrong code for an absent asset.'
+    # A cold cache fails closed, so the failure itself has to name the in-session remedy.
+    Assert-True ($cachedOnly.Message -match '-FetchDependencies') "A cold cache failure does not name the command-line remedy: $($cachedOnly.Message)"
+    Assert-True ($cachedOnly.Message -match 'FETCH') "A cold cache failure does not name the menu remedy: $($cachedOnly.Message)"
+    Assert-True ($cachedOnly.Message -notmatch '(?i)download') "A cold cache failure invents a silent download: $($cachedOnly.Message)"
 
     $installState = New-ConcealmentGuestState -Install $install
     $installState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
@@ -7967,6 +8171,26 @@ function Invoke-ConcealmentTests {
     Assert-True ($kitsuneVerifyResult.Message -match '(?i)no KernelSU profile state') "A Kitsune clone without KernelSU still claims a KernelSU profile state: $($kitsuneVerifyResult.Message)"
     Assert-True ($kitsuneVerifyResult.Message -match 'Umount modules') 'A Kitsune clone without KernelSU dropped the manual handoff.'
 
+    # A transport failure is not an answer. An unreadable KernelSU query must fail closed instead of
+    # being reported as an absent package, which is what an empty capture used to look like.
+    $unreadableKernelSUState = New-ConcealmentGuestState -Install $install
+    $unreadableKernelSUState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[2], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
+    $unreadableKernelSUState.Files[$unreadableKernelSUState.ConfigPath] = (New-ConcealmentConfigText -Scope @{$script:ConcealmentSelectedPackage = 'Root'})
+    $unreadableKernelSUState.AdbFailPattern = '*dumpsys package*'
+    $unreadableKernelSUState.AdbFailExitCode = -1
+    $unreadableKernelSUResult = Test-Concealment -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Packages @($script:ConcealmentSelectedPackage) -Runner (New-ConcealmentManagerRunner -State $unreadableKernelSUState)
+    Assert-Equal 'CriticalError' $unreadableKernelSUResult.Status 'An unreadable KernelSU query was reported as a verified or warned concealment scope.'
+    Assert-True ([string]$unreadableKernelSUResult.Data.Code -cne 'KERNELSU_ABSENT') "An unreadable KernelSU query was reported as an absent package: $($unreadableKernelSUResult.Data.Code)"
+    Assert-Equal 'ADB_FAILED' $unreadableKernelSUResult.Data.Code 'An unreadable KernelSU query reported the wrong code.'
+
+    $unreadablePackageListState = New-ConcealmentGuestState -Install $install
+    $unreadablePackageListState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentSelectedPackage)
+    $unreadablePackageListState.AdbFailPattern = '*pm list packages*'
+    $unreadablePackageListState.AdbFailExitCode = -1
+    $unreadablePackageListResult = Get-ConcealmentPackageList -ManagerPath $install.ManagerPath -InstanceIndex $cloneIndex -Runner (New-ConcealmentManagerRunner -State $unreadablePackageListState)
+    Assert-Equal 'CriticalError' $unreadablePackageListResult.Status 'An unreadable package list was reported as a readable empty list.'
+    Assert-Equal 'PACKAGE_LIST_UNREADABLE' $unreadablePackageListResult.Data.Code 'An unreadable package list reported the wrong code.'
+
     $flatLayoutState = New-ConcealmentGuestState -Install $install
     $flatLayoutState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
     $flatLayoutState.ExtractEntries = @('module.prop', 'service.sh', 'bin')
@@ -8462,6 +8686,17 @@ function Invoke-MenuTests {
         $legacyModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -LegacyVectorModule))
         Assert-Equal $false $legacyModuleReport.Guest.VectorModuleInstalled 'A guest with only a legacy vector module directory was read as the pinned Vector module.'
 
+        # A transport failure is not an answer. An unreadable module probe must print not-detected and
+        # record the reason, because a false here is a claim that the module is absent.
+        $unreadableModuleResponses = Get-MenuGuestResponses
+        $unreadableModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(-1, 'Process launch failed: the manager is busy')
+        $unreadableModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $unreadableModuleResponses)
+        Assert-Equal $null $unreadableModuleReport.Guest.VectorModuleInstalled 'An unreadable Vector module probe was reported as an absent module.'
+        Assert-True ((@($unreadableModuleReport.Failures) -join '|') -match '(?i)vector|module') "An unreadable Vector module probe recorded no reason: $(@($unreadableModuleReport.Failures) -join '|')"
+        $unreadableModuleLines = @(Format-ToolkitReport -Report $unreadableModuleReport)
+        Assert-True ((@($unreadableModuleLines) -join "`n") -match 'Guest\.VectorModuleInstalled = not-detected') "An unreadable Vector module probe did not print not-detected: $(@($unreadableModuleLines) -join ' ')"
+        Assert-True (@($unreadableModuleReport.Failures).Count -ge 1) 'An unreadable Vector module probe did not record a failure.'
+
         $unsupportedReport = Get-ToolkitReport -Install $unsupportedInstall.Install -Instance ([pscustomobject]@{ Index = 2; Install = $unsupportedInstall.Install }) -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
         Assert-Equal 'Unsupported' $unsupportedReport.Guest.Root 'The report probed an unsupported Android version.'
         Assert-True (@($unsupportedReport.Failures).Count -ge 1) 'The report did not record the unsupported Android version.'
@@ -8603,11 +8838,21 @@ function Invoke-MenuTests {
         Assert-Equal 1 $readerFailureCode 'A menu read failure did not return a nonzero exit code.'
         Assert-True ((@($readerState.Lines) -join "`n") -match '\[CriticalError\]') 'A menu read failure was not displayed as a critical error.'
 
+        # A Verify run whose concealment evidence is not verified is a Warning, not a Success, so the
+        # status can never be quieter than the concealment code the headline names.
         $verifyResult = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
-        Assert-Equal 'Success' $verifyResult.Status "Verify action failed: $($verifyResult.Message)"
+        Assert-Equal 'Warning' $verifyResult.Status "A Verify run with an unread concealment configuration reported Success: $($verifyResult.Message)"
+        Assert-True ($verifyResult.Message -match 'HMA_CONFIG_UNREADABLE') "A Verify run did not name the concealment code in its headline: $($verifyResult.Message)"
         Assert-Equal $false $verifyResult.Data.Report.Mutated 'The Verify action did not report a read-only report.'
         Assert-Equal 'Verified' $verifyResult.Data.Report.Guest.Root 'The Verify action did not report the guest root state.'
+        Assert-True ((@($verifyResult.Data.Report.Failures) -join '|') -match 'HMA_CONFIG_UNREADABLE') "A concealment failure did not reach the Verify failure list: $(@($verifyResult.Data.Report.Failures) -join '|')"
         Assert-Equal 0 @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot | Where-Object { [string]$_.Operation -ceq 'Verify' }).Count 'The Verify action created a journal.'
+
+        $verifyEvidenceResponses = Get-MenuGuestResponses
+        $verifyEvidenceResponses['config.json'] = @(0, ('{"configVersion":93,"templates":{"Root":{"isWhitelist":false,"appList":["org.frknkrc44.hma_oss","me.weishu.kernelsu"]}},"settingsTemplates":{},"scope":{"jp.pokemon.pokemontcgp":"Root"}}'))
+        $verifyClean = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $verifyEvidenceResponses)
+        Assert-Equal 'Success' $verifyClean.Status "A Verify run with a verified concealment scope was not reported as success: $($verifyClean.Message)"
+        Assert-Equal 0 @($verifyClean.Data.Report.Failures).Count "A verified concealment scope recorded a Verify failure: $(@($verifyClean.Data.Report.Failures) -join '|')"
 
         $verifyWarning = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -NoKitsune -NoRootShell))
         Assert-Equal 'Warning' $verifyWarning.Status "A report with unreadable sections was not reported as a warning: $($verifyWarning.Message)"
@@ -9062,6 +9307,37 @@ function Invoke-MenuTests {
         Assert-Equal 'Success' $concealElevated.Status "The elevated concealment dispatch failed. $($concealElevated.Message)"
         Assert-Equal 0 $flowState.Fetches.Count 'An elevated child reached the network for a dependency after rights were raised.'
 
+        # The dependency fetch used to be reachable only through the CLI switch, so a menu run on a cold
+        # cache could never succeed and offered no in-session remedy. The menu now asks for the same
+        # explicit consent, and anything but the consent word still fetches nothing.
+        $consentState = @{ Questions = @(); Answers = @() }
+        $consentPrompt = {
+            param($Question)
+            $consentState.Questions += [string]$Question
+            if ($consentState.Answers.Count -eq 0) { return '' }
+            $answer = $consentState.Answers[0]
+            $consentState.Answers = @(@($consentState.Answers) | Select-Object -Skip 1)
+            return $answer
+        }.GetNewClosure()
+        $consentState.Answers = @('jp.pokemon.pokemontcgp', 'FETCH')
+        $flowState.Calls = @()
+        $flowState.Fetches = @()
+        $consentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        Assert-Equal 0 $consentCode 'The menu did not exit normally after the dependency consent question.'
+        Assert-True ((@($consentState.Questions) -join '|') -match 'FETCH') 'The interactive concealment action did not ask for the pinned dependency consent.'
+        Assert-Equal 'hma|vector' ($flowState.Fetches -join '|') 'The menu consent did not reach the pinned dependency acquisition.'
+
+        $consentState.Answers = @('jp.pokemon.pokemontcgp', 'no')
+        $flowState.Calls = @()
+        $flowState.Fetches = @()
+        $declinedConsentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        Assert-Equal 0 $declinedConsentCode 'The menu did not exit normally after a declined dependency consent.'
+        Assert-Equal 0 $flowState.Fetches.Count 'A declined menu consent still reached the network for a dependency.'
+
+        Assert-True ($controllerSource -match "'FETCH'") 'The menu does not carry the explicit dependency consent word.'
+        Assert-True ($controllerSource -match 'Type FETCH') 'The menu does not ask the operator for the dependency consent.'
+        Assert-True (([IO.File]::ReadAllText($commonPath)) -notmatch 'Type FETCH') 'The transport module carries the menu prompt text.'
+
         # A run with no verified clone record changes nothing at all, so no dependency is installed.
         $flowState.Calls = @()
         $concealWithoutCloneFlow = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $concealInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot (Join-Path $testRoot 'menu conceal unverified state')
@@ -9106,6 +9382,49 @@ function Invoke-MenuTests {
         Assert-Equal 'SCOPE_EMPTY' $unscopedEvidenceReport.Concealment.Code 'The report claimed an applied concealment scope on a guest that assigns the template to no app.'
         Assert-Equal 0 @($unscopedEvidenceReport.Concealment.InScope).Count 'The report reported an in-scope app for an unapplied concealment scope.'
         Assert-Equal 0 @($unscopedEvidenceReport.Concealment.Packages).Count 'The report reported concealment packages for an unapplied concealment scope.'
+
+        # A concealment evidence failure must reach the report failures, and its severity must reach the
+        # action status, so Verify cannot print a concealment failure code and still report Success.
+        $kitsuneEvidenceFailures = @($kitsuneEvidenceReport.Failures | Where-Object { [string]$_ -match 'KERNELSU_ABSENT' })
+        Assert-Equal 1 $kitsuneEvidenceFailures.Count "A concealment warning did not reach the report failures: $(@($kitsuneEvidenceReport.Failures) -join '|')"
+        $evidenceReportFailures = @($evidenceReport.Failures)
+        Assert-Equal 0 $evidenceReportFailures.Count "A verified concealment scope recorded a report failure: $(@($evidenceReportFailures) -join '|')"
+        $unreadableEvidenceResponses = Get-MenuGuestResponses
+        $unreadableEvidenceResponses['config.json'] = @(-1, 'Process launch failed: the manager is busy')
+        $unreadableEvidenceReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $unreadableEvidenceResponses)
+        Assert-Equal 'Warning' $unreadableEvidenceReport.Concealment.Status 'An unreadable HMA configuration was reported as verified concealment evidence.'
+        Assert-True ((@($unreadableEvidenceReport.Failures) -join '|') -match 'HMA_CONFIG_UNREADABLE') "An unreadable HMA configuration did not reach the report failures: $(@($unreadableEvidenceReport.Failures) -join '|')"
+        $unreadableVerify = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $unreadableEvidenceResponses)
+        Assert-True ([string]$unreadableVerify.Status -cne 'Success') "A Verify run with a concealment warning reported Success: $($unreadableVerify.Status)"
+        Assert-True ([string]$unreadableVerify.Message -match 'HMA_CONFIG_UNREADABLE') "A Verify run did not name the concealment code in its headline: $($unreadableVerify.Message)"
+
+        $criticalEvidenceResponses = Get-MenuGuestResponses
+        $criticalEvidenceResponses['config.json'] = @(0, $evidenceConfigText)
+        $criticalEvidenceResponses['pm list packages'] = @(1, 'adb: the guest refused the package list')
+        $criticalEvidenceReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $criticalEvidenceResponses)
+        Assert-Equal 'CriticalError' $criticalEvidenceReport.Concealment.Status 'An unreadable concealment package list was reported as verified evidence.'
+        Assert-True ((@($criticalEvidenceReport.Failures) -join '|') -match 'PACKAGE_LIST_UNREADABLE') "An unreadable concealment package list did not reach the report failures: $(@($criticalEvidenceReport.Failures) -join '|')"
+        $criticalVerify = Invoke-ToolkitAction -Action 'Verify' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $criticalEvidenceResponses)
+        Assert-Equal 'CriticalError' $criticalVerify.Status "A Verify run with a critical concealment failure reported success: $($criticalVerify.Message)"
+        Assert-Equal 1 (Get-ToolkitExitCode $criticalVerify) 'A Verify run with a critical concealment failure did not map to the critical exit code.'
+
+        # A report field that carries a collection is rendered with its count and each element quoted,
+        # so two package names can never be read as one odd package name.
+        $collectionLines = @(Format-ToolkitReport -Report $evidenceReport)
+        $packagesLine = @($collectionLines | Where-Object { [string]$_ -like '  Concealment.Packages =*' })
+        Assert-Equal 1 $packagesLine.Count 'The report did not print exactly one concealment package line.'
+        Assert-True ([string]$packagesLine[0] -match '^  Concealment\.Packages = 1: "jp\.pokemon\.pokemontcgp"$') "A single collected package was not rendered unambiguously: $($packagesLine[0])"
+        $multiScopeResponses = Get-MenuGuestResponses
+        $multiScopeConfig = '{"configVersion":93,"templates":{"Root":{"isWhitelist":false,"appList":["org.frknkrc44.hma_oss"]}},"settingsTemplates":{},"scope":{"jp.pokemon.pokemontcgp":"Root","com.example.other":"Root"}}'
+        $multiScopeResponses['config.json'] = @(0, $multiScopeConfig)
+        $multiScopeReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $multiScopeResponses)
+        $multiScopeLines = @(Format-ToolkitReport -Report $multiScopeReport)
+        $multiPackagesLine = @($multiScopeLines | Where-Object { [string]$_ -like '  Concealment.Packages =*' })
+        Assert-Equal 1 $multiPackagesLine.Count 'The report did not print exactly one multi-package concealment line.'
+        Assert-True ([string]$multiPackagesLine[0] -match '^  Concealment\.Packages = 2: "com\.example\.other", "jp\.pokemon\.pokemontcgp"$') "Two collected packages were rendered as one name: $($multiPackagesLine[0])"
+        $campaignLine = @($multiScopeLines | Where-Object { [string]$_ -like '  Ads.RestorePoint =*' })
+        Assert-Equal 1 $campaignLine.Count 'The report did not print the advertisement restore point.'
+        Assert-Equal $script:ToolkitReportEmptyText (ConvertTo-ToolkitReportText -Value @()) 'An empty collection was not rendered as the empty marker.'
 
         $standaloneRoot = Join-Path $testRoot 'standalone verification'
         $standaloneShell = Join-Path $standaloneRoot 'shell'
@@ -10211,6 +10530,36 @@ function Invoke-DocsTests {
         Assert-True ($verifySection.Value -match $reportStatement.Pattern) $reportStatement.Message
     }
     Assert-True ($verifySection.Value -notmatch '(?i)no live (qualification|run|test)') 'The Verify report section reintroduces a negative live-status claim.'
+
+    # The Verify sample must be labelled illustrative unless it is a real capture, and it must not be
+    # dressed up with an edition and a clone index no live run produced.
+    $verifySectionText = $verifySection.Value
+    Assert-True ($verifySectionText -match '(?i)illustrative') 'The Verify sample is not labelled as illustrative, so it reads as a captured run.'
+    Assert-True ($verifySectionText -notmatch 'C:\\Program Files\\Netease\\MuMu Global') 'The Verify sample is presented as captured output but names the Global edition, which is fixture tested only.'
+    Assert-True ($verifySectionText -notmatch '(?m)^\s*Backups\.CloneIndex = 7\s*$') 'The Verify sample claims a captured clone 7 that no live run produced.'
+    Assert-True ($verifySectionText -match '(?i)Chinese') 'The Verify sample does not name the edition the live run actually used.'
+
+
+    $concealmentSection = [regex]::Match($readme, '(?ms)^## Concealment scope$.*?(?=^## )')
+    Assert-True $concealmentSection.Success 'README has no Concealment scope section.'
+    Assert-True ($concealmentSection.Value -match 'MODULE_LAYOUT_UNSUPPORTED') 'The concealment section does not report the Vector install failure the live run recorded.'
+    Assert-True ($concealmentSection.Value -match 'PACKAGE_NOT_INSTALLED') 'The concealment section does not report the absent target package.'
+    Assert-True ($concealmentSection.Value -notmatch 'the pinned Vector artifact is installed as the') 'The concealment section still claims the Vector artifact was installed.'
+    Assert-True ($readme -notmatch 'installs as the `zygisk_vector` module') 'The version table still claims the toolkit installs the Vector module.'
+    Assert-True ($concealmentSection.Value -match '(?i)not installed|was not installed') 'The concealment section does not say the Vector module was not installed.'
+
+    $boundsSection = [regex]::Match($readme, '(?ms)^## Transport bounds$.*?(?=^## )')
+    Assert-True $boundsSection.Success 'README has no Transport bounds section.'
+    Assert-True ($boundsSection.Value -match '(?i)boot poll') 'The transport bounds section does not state the boot poll bound.'
+    Assert-True ($boundsSection.Value -match '\b12 minutes\b') 'The transport bounds section does not state the real boot poll worst case.'
+    Assert-True ($boundsSection.Value -notmatch 'about 6 minutes\b.*\bboot') 'The transport bounds section still multiplies the retry and the poll.'
+    Assert-True ($boundsSection.Value -match '(?i)UAC') 'The transport bounds section does not state the elevation bounds.'
+    Assert-True ($boundsSection.Value -match '(?i)fail[s]? closed') 'The transport bounds section does not state that an unanswered prompt fails closed.'
+    Assert-True ($boundsSection.Value -match '(?i)uncollected|discarded') 'The transport bounds section does not state what happens when captured output cannot be collected.'
+
+    Assert-True ($readme -match '(?i)Type FETCH|FETCH') 'README does not document the menu dependency consent word.'
+    Assert-True ($readme -match '(?is)collection.{0,300}?not-detected') 'README does not document that an unread collection is printed as not-detected.'
+    Assert-True ($readme -match '(?is)collection.{0,200}?count.{0,120}?quoted\s+elements') 'README does not document how a collected report field is rendered.'
 
     Assert-True ($license -match 'MIT License') 'LICENSE is not the MIT license.'
     Assert-True ($license -match 'Permission is hereby granted, free of charge') 'LICENSE does not contain the MIT grant.'

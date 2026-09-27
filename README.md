@@ -33,7 +33,7 @@ not treated as compatible until it has been tested and pinned again.
 | MuMu Android version selection | Android 12.0 and Android 15.0 | choosing the instance image | [Android version documentation](https://www.mumuplayer.com/help/win/how-to-upgrade-mumuplayer.html) |
 | Kitsune Magisk | v31.0-25fa2159 | Android 12 root | [Kitsune release](https://github.com/Jordan231111/KitsuneMagisk/releases/tag/v31.0-25fa2159) |
 | Hide My Applist OSS | oss-161 | app and module concealment | [HMA-OSS release](https://github.com/frknkrc44/HMA-OSS/releases/tag/oss-161) |
-| Vector | v2.2 | LSPosed module runtime used by HMA OSS; installs as the `zygisk_vector` module | [Vector release](https://github.com/JingMatrix/Vector/releases/tag/v2.2) |
+| Vector | v2.2 | LSPosed module runtime used by HMA OSS; the toolkit installs it at the module id `zygisk_vector` | [Vector release](https://github.com/JingMatrix/Vector/releases/tag/v2.2) |
 | NeoZygisk | v2.4 | pinned for future use; no action installs it yet | [NeoZygisk release](https://github.com/JingMatrix/NeoZygisk/releases/tag/v2.4) |
 | CorePatch | 4.9 | pinned for future use; no action installs it yet | [CorePatch release](https://github.com/LSPosed/CorePatch/releases/tag/4.9) |
 
@@ -54,15 +54,17 @@ Chinese-edition MuMu 6.8.0.0 installation, and they are the versions the toolkit
 | NeoZygisk module `zygisksu` | `v2.4` | `289` |
 
 The HMA configuration schema observed there is version `93`, which is the version this
-toolkit reads and writes. The Vector module is installed on that instance under the id
-`zygisk_vector`, not `vector`, and this toolkit installs and probes it at
-`/data/adb/modules/zygisk_vector`.
+toolkit reads and writes. The `zygisk_vector` module was already present on instance 0 as a manual
+install, not as anything this toolkit did; the toolkit installs and probes its own Vector artifact at
+`/data/adb/modules/zygisk_vector` on a verified clone, and that install has not been observed to
+succeed yet, as the concealment section below states.
 
 Dependencies are downloaded at run time from those official release pages into
 `%LOCALAPPDATA%\mumu-root-hide-toolkit\assets`, and each one is verified against its pinned size
 and SHA-256 hash before it is used. Design intent: a dependency is never fetched from an
 elevated phase, so nothing is downloaded after rights are raised. `Conceal` therefore only fetches
-when you pass `-FetchDependencies`, and an elevated retry never fetches at all.
+when you pass `-FetchDependencies`, or when you type `FETCH` at the menu, and an elevated retry never
+fetches at all.
 
 ## Setup order
 
@@ -110,19 +112,23 @@ instance, so a noninteractive `Conceal` follows either a menu `Root12` run or a 
 
 `Verify` changes nothing in MuMu and prints the whole read-only report, so nothing it found stays
 invisible to you. The report is plain text with one field per line, so it can be read directly or
-searched for a single field:
+searched for a single field.
+
+The block below is an **illustrative** sample, not a captured run. The live runs this repository
+records used the Chinese edition, not the Global edition, and the instance list and clone index in
+this sample were composed for illustration; see Limitations for what was actually captured.
 
 ```text
-[Warning] The read-only report for the instance at index 2 is collected. Root state: Unverified. Global installation C:\Program Files\Netease\MuMu Global.
-  Install.Edition = Global
-  Install.InstallRoot = C:\Program Files\Netease\MuMu Global
-  Install.VmsPath = C:\Program Files\Netease\MuMu Global\vms
-  Install.ManagerPath = C:\Program Files\Netease\MuMu Global\shell\MuMuManager.exe
+[Warning] The read-only report for the instance at index 2 is collected. Root state: Unverified. Chinese installation C:\Program Files\Netease\MuMuPlayer.
+  Install.Edition = Chinese
+  Install.InstallRoot = C:\Program Files\Netease\MuMuPlayer
+  Install.VmsPath = C:\Program Files\Netease\MuMuPlayer\vms
+  Install.ManagerPath = C:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe
   Install.Source = Registry
-  ManagerVersion = 6.8.0.0
+  ManagerVersion = Unknown
   Instances:
-    Instance 0 | Base | Android 12.0 | Running False | RootSetting not-detected
-    Instance 2 | Android 12 | Android 12.0 | Running True | RootSetting True
+    Instance 0 | Roo+3d 12 | Android 12.0 | Running True | RootSetting False
+    Instance 1 | Roo+3d 15 | Android 15.0 | Running False | RootSetting True
   Virtualization = Enabled
   Guest.Root = Unverified
   Guest.Code = ADB_FAILED
@@ -131,15 +137,15 @@ searched for a single field:
   Guest.KernelSU = none
   Guest.DaemonCount = 0
   Guest.HmaInstalled = True
-  Guest.VectorModuleInstalled = True
+  Guest.VectorModuleInstalled = not-detected
   Ads.RestorePoint = Missing
-  Backups.CloneIndex = 7
-  Backups.CloneName = Android 12 clone
-  Concealment.Target = 7
+  Backups.CloneIndex = 4
+  Backups.CloneName = Android Device-3-1
+  Concealment.Target = 4
   Concealment.Status = Warning
   Concealment.Code = KERNELSU_ABSENT
-  Concealment.Packages = jp.pokemon.pokemontcgp
-  Concealment.InScope = jp.pokemon.pokemontcgp
+  Concealment.Packages = 1: "jp.pokemon.pokemontcgp"
+  Concealment.InScope = 1: "jp.pokemon.pokemontcgp"
   Concealment.OutOfScope = none
   Concealment.TemplateFound = True
   Concealment.IsWhitelist = False
@@ -150,7 +156,7 @@ searched for a single field:
   JournalOperation = Root12
   JournalId = 8fd6a6a800534e6c8b643490f7bb26df
   Failures:
-    Failure 1 = The Kitsune package query failed.
+    Failure 1 = Concealment evidence on the verified clone is KERNELSU_ABSENT, not a verified scope. The HMA scope ...
 ```
 
 The report names the installation identity, every discovered instance with its index, Android
@@ -159,8 +165,16 @@ evidence, the Hide My Applist and Vector module state, the advertisement restore
 verified clone backup, the concealment scope observed on that clone, the last journal state, and
 every failure it collected. A value the manager or the guest did not report is printed as
 `not-detected`, and a value that is present but empty is printed as `none`, so a field is never
-silently dropped. A clean instance prints `Failures: none` after the same field list, so an empty
+silently dropped. A field that carries a collection is printed as its count followed by its quoted
+elements, `1: "a.b"`, so two package names can never be read as one odd package name; an empty
+collection is printed as `none`, and a collection that could not be read at all is printed as
+`not-detected`, which is how a guest probe that failed to answer is distinguished from a guest that
+answered "absent". A clean instance prints `Failures: none` after the same field list, so an empty
 failure list is stated rather than implied.
+
+A concealment evidence that is not a verified scope is recorded in `Failures` with its code, so the
+status is never quieter than the report: a concealment warning makes `Verify` a `Warning`, and a
+concealment failure makes it a `CriticalError` that exits `1`.
 
 The `Concealment` lines are the evidence `Test-Concealment` collected by reading the installed
 Hide My Applist configuration on the verified clone, so the verifier is reachable and no concealment
@@ -237,7 +251,7 @@ Command-line parameters:
 | `-StartIndex <n>` | a free instance index that `Target Create` insists on before it calls the manager; it is never sent to the manager and never overwritten |
 | `-Confirmed` | the explicit confirmation required by `Root15`, `Target Create`, and `Target Clone` |
 | `-NonInteractive` | run one action and exit instead of opening the menu |
-| `-FetchDependencies` | `Conceal` only: fetch and verify the pinned HMA and Vector artifacts into the per-user cache before installing them; without it the run requires an already verified cache |
+| `-FetchDependencies` | `Conceal` only: fetch and verify the pinned HMA and Vector artifacts into the per-user cache before installing them; without it the run requires an already verified cache. The menu asks the same question and `FETCH` is the same opt-in |
 | `-SkipToolbar` | omit the menu banner |
 
 ## Android 12: the exact Kitsune choice
@@ -349,29 +363,36 @@ the manual handoff stays. On that clone the root comes from Kitsune, and the HMA
 module are the parts this toolkit can verify from observation. That result is also carried in the
 read-only `Verify` report, so it is not a claim you have to take on trust.
 
-`Conceal` installs or verifies its declared dependencies before it writes anything: the pinned HMA
-OSS artifact is installed as a package and the pinned Vector artifact is installed as the
-`zygisk_vector` module, both on the verified clone only, and both read back from the guest
-afterwards. HMA and Vector are exactly the two concealment dependencies. NeoZygisk is a root-side
-module, not a concealment dependency, so `Conceal` never acquires or installs it.
+`Conceal` installs or verifies its declared dependencies before it writes anything, on the verified
+clone only, and reads both back from the guest afterwards. The two dependencies are the pinned HMA
+OSS artifact, installed as a package, and the pinned Vector artifact, whose only accepted module id
+is `zygisk_vector`. That is the specified behavior and what the fixtures exercise; the Vector install
+has not been observed to succeed on a live clone, as the qualification note below states. NeoZygisk is
+a root-side module, not a concealment dependency, so `Conceal` never acquires or installs it.
 
 Acquisition and mutation are separate phases. The install step is cached-only, so it can never
 reach the network. The pinned assets are fetched and verified first, and only when you ask for it
-with `-FetchDependencies`:
+with `-FetchDependencies` on the command line or by typing `FETCH` at the menu:
 
 ```text
 Run-MumuToolkit.bat -Action Conceal -FetchDependencies -Packages com.example.app -NonInteractive
 ```
 
-Without `-FetchDependencies` the run uses the already verified per-user cache and fails closed with
-`ASSET_VERIFICATION_FAILED` if an asset is not there. An elevated retry never fetches: the toolkit
-downloads nothing after rights are raised.
+The menu asks the same question with the same explicit consent, so a cold cache is reachable without
+leaving the menu. Any other answer downloads nothing. Without that consent the run uses the already
+verified per-user cache and fails closed with `ASSET_VERIFICATION_FAILED`, and that failure names
+both remedies. An elevated retry never fetches: the toolkit downloads nothing after rights are
+raised.
 
-**Concealment is unqualified on this host.** The selected app
-`jp.pokemon.pokemontcgp` is not installed on the live clone 4, so the action refuses it with
-`PACKAGE_NOT_INSTALLED` and no concealment scope is applied. No APK is invented for a package
-that is absent; install the app on the clone yourself, or select apps that are installed, before
-concealment can be called qualified.
+**Concealment is unqualified on this host, for two independent reasons, and both are visible in the
+`Verify` report.** The pinned Vector module was **not** installed: the live dependency step on clone 4
+stopped with `MODULE_LAYOUT_UNSUPPORTED` before the move, so the HMA APK was installed and verified
+while the Vector module was not. Separately, the selected app `jp.pokemon.pokemontcgp` is not
+installed on the live clone 4, so the action refuses it with `PACKAGE_NOT_INSTALLED` and no
+concealment scope is applied. No APK is invented for a package that is absent; install the app on the
+clone yourself, or select apps that are installed, before concealment can be called qualified. The
+Vector install path has been exercised only by fixtures, and the flat-archive gate for the pinned v2.2
+asset has not been run against a live clone.
 
 ## Advertisement scope and restore
 
@@ -426,10 +447,16 @@ toolkit log.
 
 If elevation is declined or fails, the action fails closed: the result is a `CriticalError` naming
 the permission problem, the operation journal records the failure, nothing that changes MuMu is
-retried in this process, and no configuration is left half-written on purpose. The interactive menu
-stays open. Starting `Run-MumuToolkit.bat` from an elevated console (Run as administrator) is still
-supported and skips the prompt entirely, because a process that already holds rights is never asked
-for them again.
+retried in this process, and no configuration is left half-written on purpose. An unanswered UAC
+prompt is the same case: the prompt is waited on for a bounded time, and an expired prompt reports
+the bound and claims no elevated child. The interactive menu stays open. Starting
+`Run-MumuToolkit.bat` from an elevated console (Run as administrator) is still supported and skips
+the prompt entirely, because a process that already holds rights is never asked for them again.
+
+Only host access denials ask for rights. The classifier recognizes a .NET unauthorized-access or
+access-denied failure and a manager message that names one; a guest shell refusal such as `su:
+permission denied` is a guest answer and never raises a prompt. The two bounds are in Transport
+bounds above.
 
 The elevated retry is noninteractive. Bind every selection explicitly on the command line, with
 `-InstallRoot`, `-InstanceIndex`, `-SourceIndex`, `-Mode`, `-StartIndex`, and `-Packages`, or the
@@ -437,19 +464,49 @@ elevated child reports the missing selection instead of prompting for it.
 
 ## Transport bounds
 
-Every external process is started through one funnel, so a wedged `MuMuManager.exe` or a blocked
-ADB port cannot hang the menu. The wait is bounded at 120 seconds per call, the child is
-terminated when that bound expires, and the call is reported as a transport failure that names the
-timeout. Both redirected streams are drained while the child runs, so a large response cannot
-wedge it.
+Every external process except the elevated relaunch is started through one funnel, so a wedged
+`MuMuManager.exe` or a blocked ADB port cannot hang the menu. The wait is bounded at 120 seconds per
+call, the child is terminated when that bound expires, and the call is reported as a transport failure
+that names the timeout. Both redirected streams are drained while the child runs, so a large response
+cannot wedge it.
+
+A surviving grandchild can inherit a redirected handle and hold it open after the child itself has
+exited, so the stream never reaches EOF. When the bounded drain expires with output still
+uncollected, the call is reported as a transport failure that says so, and the capture is discarded
+rather than reported as empty output behind the child's real exit code. No caller therefore reads a
+clean exit with no output as a real negative: a package that could not be listed, a daemon that could
+not be queried, or a module that could not be probed is a transport failure, not an absent one.
 
 A read-only transport call is retried up to 3 times with a 2 second pause, and only for a
-transport failure or an explicit not-started transient such as a stopped instance. A semantic
-refusal is answered once, and nothing that changes MuMu is ever retried: a clone, create, install,
-root change, advertisement change, or module install runs exactly once. When a read-only retry is
-exhausted the result is `RecoverableError` with the last underlying error in its message, so a
-noninteractive run exits `2`. A read-only call can therefore take up to about 6 minutes to report
-a wedged manager, and a mutation up to about 2 minutes.
+transport failure or an explicit not-started transient such as a stopped instance. The read-only
+test is a whole-command invariant, not a first-token match: a request that carries an operator, a
+shell metacharacter, or any state-changing command word anywhere is never retried, so a command that
+starts read-only and then removes or moves something cannot be repeated. A semantic refusal is
+answered once, and nothing that changes MuMu is ever retried: a clone, create, install, root change,
+advertisement change, or module install runs exactly once. When a read-only retry is exhausted the
+result is `RecoverableError` with the last underlying error in its message, so a noninteractive run
+exits `2`. A read-only call therefore takes up to about 6 minutes to report a wedged manager, and a
+mutation up to about 2 minutes.
+
+A boot poll is not multiplied by the retry. The poll is its own retry, so its probe runs once per
+attempt and the whole poll stops at a 10 minute wall-clock budget, which puts one cold boot at **12
+minutes** in the worst case: the budget plus the one in-flight 120 second process bound. The 30
+attempt limit is a secondary ceiling that the budget normally reaches first.
+
+The elevated relaunch is the one process a person can hold open, because Windows shows the UAC
+consent dialog and waits for a human, so it carries its own two bounds and is documented separately
+from the 120 second funnel. The prompt has to be answered within 120 seconds, and the elevated child
+runs one whole action and is bounded at 60 minutes, which is above the worst case of the longest
+elevated action. An unanswered or expired prompt fails closed: the action reports a `CriticalError`
+that names the bound, no elevated child is claimed, and nothing is retried here.
+
+| Process | Bound |
+| --- | --- |
+| MuMu manager, guest ADB, and every other tool child | 120 seconds, then terminated |
+| one read-only call with its retry | about 6 minutes |
+| one boot poll | 12 minutes (10 minute budget plus one 120 second call) |
+| UAC prompt | 120 seconds, then failed closed |
+| elevated child action | 60 minutes, then terminated and failed closed |
 
 ## Noninteractive exit codes
 
@@ -485,9 +542,11 @@ These are the honest limits of the current state of the code.
   carries `io.github.huskydg.magisk` and has no built-in KernelSU target. `Root15` reports
   `KITSUNE_PRESENT` for it, and a source instance that already carries Kitsune cannot be
   qualified.
-- Concealment is unqualified. The target package `jp.pokemon.pokemontcgp` is not installed on the
-  live clone 4, so `Set-AppConcealment` refused it and no scope was applied. No APK is invented
-  for an absent package.
+- Concealment is unqualified, for two independent reasons. The live dependency step on clone 4 stopped
+  with `MODULE_LAYOUT_UNSUPPORTED` before the module move, so the HMA APK was installed and verified
+  while the pinned Vector artifact was not installed at all; that install path is fixture-tested only.
+  And the target package `jp.pokemon.pokemontcgp` is not installed on clone 4, so
+  `Set-AppConcealment` refused it and no scope was applied. No APK is invented for an absent package.
 - `RemoveAds` was a no-op on this host. There is no campaign file anywhere in the Chinese-edition
   installation, so the action reported success with an empty path set and wrote nothing. That is a
   fact about this installation, not evidence that the advertisement logic works.

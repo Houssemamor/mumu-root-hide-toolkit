@@ -270,6 +270,9 @@ function Get-ConcealmentPackageList {
     return Get-ToolkitResult -Status 'Success' -Message 'The installed package list was read.' -Data $packages
 }
 
+# A package probe answers true, false, or $null for a transport failure. Collapsing the third case into
+# false would report an unreadable guest as an absent package, which is the claim the caller is about to
+# make about the guest.
 function Test-ConcealmentPackageInstalled {
     param(
         [string]$ManagerPath,
@@ -279,7 +282,10 @@ function Test-ConcealmentPackageInstalled {
     )
 
     $call = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell dumpsys package ' + $PackageName) -Runner $Runner
-    if ($null -eq $call -or $call.ExitCode -ne 0) {
+    if ($null -eq $call -or $call.ExitCode -eq -1) {
+        return $null
+    }
+    if ($call.ExitCode -ne 0) {
         return $false
     }
     return ($null -ne (Get-ToolkitPackageVersion -Text ([string]$call.Text) -PackageName $PackageName))
@@ -799,12 +805,19 @@ function Install-ConcealmentDependencies {
         return New-ToolkitRootFailure -Journal $Journal -Message $quotedVector.Message -Data (New-ConcealmentState -Code ([string]$quotedVector.Data.Code) -Step 'asset' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
     $hmaInstalled = Test-ConcealmentPackageInstalled -ManagerPath $manager -InstanceIndex $instanceIndex -PackageName $script:ConcealmentHmaPackage -Runner $Runner
+    if ($null -eq $hmaInstalled) {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The HMA package state on the clone at index $instanceIndex could not be read, so the install was not attempted and the guest state is unknown." -Data (New-ConcealmentState -Code 'ADB_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+    }
     if (-not $hmaInstalled) {
         $apkInstall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command ('install -r ' + [string]$quotedApk.Data) -Runner $Runner
         if ($null -eq $apkInstall -or $apkInstall.ExitCode -ne 0) {
             return New-ToolkitRootFailure -Journal $Journal -Message "The verified HMA APK was not installed on the clone at index $instanceIndex." -Data (New-ConcealmentState -Code 'APK_INSTALL_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
-        if (-not (Test-ConcealmentPackageInstalled -ManagerPath $manager -InstanceIndex $instanceIndex -PackageName $script:ConcealmentHmaPackage -Runner $Runner)) {
+        $hmaReadBack = Test-ConcealmentPackageInstalled -ManagerPath $manager -InstanceIndex $instanceIndex -PackageName $script:ConcealmentHmaPackage -Runner $Runner
+        if ($null -eq $hmaReadBack) {
+            return New-ToolkitRootFailure -Journal $Journal -Message "The HMA package state on the clone at index $instanceIndex could not be read back after the install, so the install is not claimed." -Data (New-ConcealmentState -Code 'ADB_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        }
+        if (-not $hmaReadBack) {
             return New-ToolkitRootFailure -Journal $Journal -Message "The verified HMA APK install did not leave the package $($script:ConcealmentHmaPackage) installed on the clone at index $instanceIndex." -Data (New-ConcealmentState -Code 'APK_INSTALL_FAILED' -Step 'hma-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $installed += $script:ConcealmentHmaAssetId
@@ -818,6 +831,9 @@ function Install-ConcealmentDependencies {
         return New-ToolkitRootFailure -Journal $Journal -Message $moduleListCommand.Message -Data (New-ConcealmentState -Code ([string]$moduleListCommand.Data.Code) -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
     $moduleList = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $moduleListCommand.Data.Command -Runner $Runner
+    if ($null -ne $moduleList -and $moduleList.ExitCode -eq -1) {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The Vector module directory $($script:ConcealmentVectorModulePath) could not be read, so whether the module is installed is unknown and nothing was installed." -Data (New-ConcealmentState -Code 'ADB_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+    }
     if ($null -ne $moduleList -and $moduleList.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$moduleList.Text)) {
         $alreadyPresent += $script:ConcealmentVectorAssetId
     }
@@ -1179,6 +1195,9 @@ function Test-Concealment {
     }
 
     $kernelSuInstalled = Test-ConcealmentPackageInstalled -ManagerPath $manager -InstanceIndex $InstanceIndex -PackageName $script:ConcealmentKernelSUPackage -Runner $Runner
+    if ($null -eq $kernelSuInstalled) {
+        return New-ToolkitRootFailure -Journal $null -Message "The KernelSU package state on the instance at index $InstanceIndex could not be read, so no KernelSU profile state is claimed in either direction." -Data (New-ConcealmentState -Code 'ADB_FAILED' -Step 'verify' -InstanceIndex $InstanceIndex)
+    }
     $allowlistPresent = $false
     $allowlistLength = -1
     $allowlistCommand = New-ConcealmentGuestCommand -Command ('ls -l ' + $script:ConcealmentKernelSUAllowlistPath) -InstanceIndex $InstanceIndex

@@ -35,6 +35,10 @@ $script:ToolkitRegistryRoots = @(
 )
 $script:ToolkitRecoveryGuidance = 'Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.'
 $script:ToolkitInstanceChoiceLimit = 32
+# The concealment dependencies are downloaded only on an explicit word, so the menu can reach the same
+# acquisition the command line does without ever fetching silently. Anything but this word fetches
+# nothing, and an elevated retry never fetches at all.
+$script:ToolkitDependencyConsentWord = 'FETCH'
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
 . (Join-Path $PSScriptRoot 'Manifest.ps1')
@@ -531,7 +535,18 @@ function Invoke-ToolkitAction {
 
     if ($Action -ceq 'Verify') {
         $report = Get-ToolkitReport -Install $install.Data -Instance $selected -Journal $null -StateRoot $statePath -Runner $Runner
-        $status = if (@($report.Failures).Count -eq 0) { 'Success' } else { 'Warning' }
+        # A concealment evidence that is not verified is a failure of the report, so its severity
+        # reaches the action status instead of being printed beside a claimed Success.
+        $concealmentStatus = [string](Get-ToolkitRecordValue -Record (Get-ToolkitRecordValue -Record $report -PropertyNames @('Concealment')) -PropertyNames @('Status'))
+        $status = if ($concealmentStatus -ceq 'CriticalError') {
+            'CriticalError'
+        }
+        elseif (@($report.Failures).Count -eq 0) {
+            'Success'
+        }
+        else {
+            'Warning'
+        }
         # The concealment result is named in the headline so the summary line is never quieter than
         # the block it introduces.
         $concealmentCode = [string](Get-ToolkitRecordValue -Record (Get-ToolkitRecordValue -Record $report -PropertyNames @('Concealment')) -PropertyNames @('Code'))
@@ -663,6 +678,16 @@ function ConvertTo-ToolkitReportText {
     # A negative count or index is the report's own unread marker, not a measured value.
     if ($Value -is [int] -and [int]$Value -lt 0) {
         return $script:ToolkitReportAbsentText
+    }
+    if ($Value -isnot [string] -and $Value -isnot [ValueType]) {
+        # A collection is printed as its count and its quoted elements, so two package names can never
+        # be read as one odd package name with a separator in it.
+        $items = @($Value)
+        if ($items.Count -eq 0) {
+            return $script:ToolkitReportEmptyText
+        }
+        $quoted = @($items | ForEach-Object { '"' + (Protect-ToolkitText ([string]$_)) + '"' })
+        return ([string]$items.Count + ': ' + ($quoted -join ', '))
     }
     $text = [string]$Value
     if ($text.Length -eq 0) {
@@ -1002,13 +1027,23 @@ function Start-ToolkitController {
     }
     $runner = $ActionRunner
     if ($null -eq $runner) {
+        # A closure sees the locals it was built from, not the script scope, so the consent word is
+        # captured here where the runner is assembled.
+        $consentWord = $script:ToolkitDependencyConsentWord
         $runner = {
             param($Choice)
 
             $selectedPackages = @($Packages)
-            if ($Choice -ceq 'Conceal' -and $selectedPackages.Count -eq 0) {
-                $answer = [string](& $ask 'Comma-separated application package names for the Root template')
-                $selectedPackages = @($answer -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $fetchDependencies = $FetchDependencies
+            if ($Choice -ceq 'Conceal') {
+                if ($selectedPackages.Count -eq 0) {
+                    $answer = [string](& $ask 'Comma-separated application package names for the Root template')
+                    $selectedPackages = @($answer -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                }
+                # The consent is asked for exactly as the command line asks for it, so a cold cache is
+                # reachable from the menu and a declining answer still downloads nothing.
+                $consent = [string](& $ask ('Type ' + $consentWord + ' to download the pinned concealment dependencies into the per-user cache now'))
+                $fetchDependencies = $consent.Trim() -ceq $consentWord
             }
             $confirmed = $Confirmed
             if ($Choice -ceq 'Root15' -and -not $confirmed) {
@@ -1021,7 +1056,7 @@ function Start-ToolkitController {
                 $targetMode = $Mode
                 $targetStartIndex = $StartIndex
             }
-            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
+            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -FetchDependencies:$fetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
         }.GetNewClosure()
     }
 
@@ -1030,8 +1065,9 @@ function Start-ToolkitController {
         & $write 'Detect and Verify change nothing.'
         & $write 'Target identifies the instance to work on, or creates or clones one. Identify changes nothing; Create and Clone ask for CONFIRM first and are the only ways this toolkit adds an instance.'
         & $write 'Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone. Conceal changes only the verified clone.'
+        & $write 'Conceal asks whether to download its pinned Hide My Applist and Vector dependencies. Type FETCH to allow that download now; any other answer downloads nothing.'
         & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
-        & $write 'A mutating action that is denied the rights it needs asks for administrator rights once, in its own window, and fails closed if that is declined. Detect and Verify never ask.'
+        & $write 'A mutating action that is denied the rights it needs asks for administrator rights once, in its own window, and fails closed if that is declined or the prompt is not answered in time. Detect and Verify never ask.'
         foreach ($entry in @(Get-ToolkitActionCatalog)) {
             & $write ('  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)
         }

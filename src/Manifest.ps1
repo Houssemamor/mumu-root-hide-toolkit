@@ -390,7 +390,7 @@ function Save-ToolkitManifestAsset {
 
     $asset = Save-ToolkitAsset -Manifest $Manifest -Id $Id -CacheRoot $assetCacheRoot -Fetch $Fetch -RequireCached:$RequireCached
     if ($asset.Status -ne 'Success') {
-        return Get-ToolkitResult -Status 'CriticalError' -Message ('The pinned asset was not verified. ' + $asset.Message) -Data ([pscustomobject]@{ Code = 'ASSET_VERIFICATION_FAILED'; Asset = '' })
+        return Get-ToolkitResult -Status 'CriticalError' -Message ('The pinned asset was not verified. ' + $asset.Message + ' Acquire it with your explicit consent: pass -FetchDependencies on the command line, or type FETCH at the menu. Nothing is acquired without that consent.') -Data ([pscustomobject]@{ Code = 'ASSET_VERIFICATION_FAILED'; Asset = '' })
     }
     $path = [string]$asset.Data
     if ([string]::IsNullOrWhiteSpace($path) -or -not [IO.File]::Exists($path)) {

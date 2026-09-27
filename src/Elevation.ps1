@@ -22,9 +22,82 @@ $script:ToolkitDiskFileLimit = 100000
 # Only the actions that change MuMu may ask for administrator rights. Detect and Verify change
 # nothing, and the quit action is not an action at all, so a read-only run never raises a prompt.
 $script:ToolkitElevatableActions = @('Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+# The relaunch is the one external process a person can hold open, because Windows shows the UAC
+# consent dialog and waits for a human. Both halves carry their own bound: the prompt has to be
+# answered inside the shared transport bound, and the elevated child runs a whole action, whose own
+# worst case is its two cold-boot polls plus the bounded transport calls around them.
+if (-not (Test-Path variable:script:ToolkitElevatedPromptSeconds)) {
+    $script:ToolkitElevatedPromptSeconds = 120
+}
+if (-not (Test-Path variable:script:ToolkitElevatedActionSeconds)) {
+    $script:ToolkitElevatedActionSeconds = 3600
+}
 # A .NET access denial and a manager that names one are the same condition, so the seam recognizes
-# both the exception type and the Windows message. Nothing else may ask for rights.
-$script:ToolkitPermissionFailurePattern = '(?i)unauthorizedaccess|access (?:to the path .+ )?is denied|permission denied|e_accessdenied'
+# both the exception type and the Windows message. Nothing else may ask for rights. A guest shell
+# refusal is not host evidence: su prints "permission denied" inside the guest, and that must never
+# reach a UAC prompt, so the pattern names host access denials only.
+$script:ToolkitPermissionFailurePattern = '(?i)unauthorizedaccess|access (?:to the path .+ )?is denied|e_accessdenied'
+
+# The launch runs on a private runspace because the runas verb blocks the calling thread on the
+# consent dialog. A bound on the caller's own thread would therefore never be reached, so the launch
+# is waited on off-thread and an unanswered prompt fails closed.
+$script:ToolkitElevatedLaunchScript = @'
+param($FilePath, $QuotedArguments)
+try {
+    Start-Process -FilePath $FilePath -ArgumentList $QuotedArguments -Verb 'RunAs' -PassThru -ErrorAction Stop
+}
+catch {
+    $native = -1
+    if ($_.Exception -is [ComponentModel.Win32Exception]) {
+        $native = [int]$_.Exception.NativeErrorCode
+    }
+    return [pscustomobject]@{ LaunchError = [string]$_.Exception.Message; NativeErrorCode = $native }
+}
+'@
+
+function Invoke-ToolkitBoundedLaunch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Script,
+        [object[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)]
+        [int]$BoundSeconds
+    )
+
+    $runspace = $null
+    $pipeline = $null
+    try {
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.Open()
+        $pipeline = [powershell]::Create()
+        $pipeline.Runspace = $runspace
+        [void]$pipeline.AddScript($Script)
+        foreach ($argument in @($Arguments)) {
+            [void]$pipeline.AddArgument($argument)
+        }
+        $handle = $pipeline.BeginInvoke()
+        if (-not $handle.AsyncWaitHandle.WaitOne($BoundSeconds * 1000)) {
+            try {
+                $pipeline.Stop()
+            }
+            catch {
+            }
+            return $null
+        }
+        return @($pipeline.EndInvoke($handle))
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($null -ne $pipeline) {
+            $pipeline.Dispose()
+        }
+        if ($null -ne $runspace) {
+            $runspace.Dispose()
+        }
+    }
+}
 
 # The process entry point arms the elevation seam. It is kept here, next to the relaunch it performs,
 # so no embedded caller can raise a UAC prompt by accident: an unarmed seam simply does not elevate.
@@ -192,7 +265,8 @@ function Invoke-ElevatedToolkitAction {
     param(
         [string]$ScriptPath,
         [string[]]$Arguments = @(),
-        [scriptblock]$Runner = $null
+        [scriptblock]$Runner = $null,
+        [scriptblock]$Launch = $null
     )
 
     $argumentList = $null
@@ -207,35 +281,81 @@ function Invoke-ElevatedToolkitAction {
     $alreadyElevated = $false
     $exitCode = $null
     $exitCodeReported = $false
-    try {
-        $alreadyElevated = Test-ToolkitAdministrator
-        if ($null -ne $Runner) {
+    $elevatedChild = $null
+    if ($null -eq $Runner) {
+        $quotedArguments = @($argumentList | ForEach-Object { ConvertTo-ProcessArgument -Argument $_ })
+        $launchScript = $script:ToolkitElevatedLaunchScript
+        if ($null -ne $Launch) {
+            $launchScript = $Launch.ToString()
+        }
+        try {
+            $alreadyElevated = Test-ToolkitAdministrator
+            $outcome = Invoke-ToolkitBoundedLaunch -Script $launchScript -Arguments @($powershellPath, $quotedArguments) -BoundSeconds $script:ToolkitElevatedPromptSeconds
+        }
+        catch {
+            $outcome = $null
+        }
+        if ($null -eq $outcome) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message "The Windows UAC prompt was not answered within the $($script:ToolkitElevatedPromptSeconds) second bound, so no elevated child was confirmed and the action fails closed."
+        }
+        $launched = @($outcome)[0]
+        if ($launched -isnot [Diagnostics.Process]) {
+            $nativeErrorCode = -1
+            if ($null -ne $launched.PSObject.Properties['NativeErrorCode']) {
+                $nativeErrorCode = [int]$launched.NativeErrorCode
+            }
+            $message = if ($nativeErrorCode -eq 1223) {
+                'Elevation was denied or cancelled by Windows.'
+            }
+            else {
+                $launchFailure = if ($null -ne $launched.PSObject.Properties['LaunchError']) { [string]$launched.LaunchError } else { 'the elevated child did not start.' }
+                'Elevated launch failed: ' + (Protect-ToolkitText $launchFailure)
+            }
+            return Get-ToolkitResult -Status 'CriticalError' -Message $message
+        }
+        $elevatedChild = $launched
+        try {
+            if (-not $elevatedChild.WaitForExit($script:ToolkitElevatedActionSeconds * 1000)) {
+                try {
+                    $elevatedChild.Kill()
+                }
+                catch {
+                }
+                return Get-ToolkitResult -Status 'CriticalError' -Message "The elevated child did not complete within the $($script:ToolkitElevatedActionSeconds) second bound, so it was terminated and the action fails closed. Read the operation journal and the log before retrying."
+            }
+            $exitCode = $elevatedChild.ExitCode
+            $exitCodeReported = $true
+        }
+        catch {
+            return Get-ToolkitResult -Status 'CriticalError' -Message ('The elevated child could not be waited on: ' + (Protect-ToolkitText ([string]$_.Exception.Message)))
+        }
+        finally {
+            $elevatedChild.Dispose()
+        }
+    }
+    else {
+        try {
+            $alreadyElevated = Test-ToolkitAdministrator
             $outcome = & $Runner $powershellPath $argumentList 'RunAs'
             if ($null -ne $outcome -and $null -ne $outcome.PSObject -and $null -ne $outcome.PSObject.Properties['ExitCode']) {
                 $exitCode = $outcome.ExitCode
                 $exitCodeReported = $true
             }
         }
-        else {
-            $quotedArguments = @($argumentList | ForEach-Object { ConvertTo-ProcessArgument -Argument $_ })
-            $process = Start-Process -FilePath $powershellPath -ArgumentList $quotedArguments -Verb 'RunAs' -Wait -PassThru -ErrorAction Stop
-            $exitCode = $process.ExitCode
-            $exitCodeReported = $true
+        catch {
+            $exception = $_.Exception
+            $nativeErrorCode = -1
+            if ($exception -is [ComponentModel.Win32Exception]) {
+                $nativeErrorCode = $exception.NativeErrorCode
+            }
+            $message = if ($nativeErrorCode -eq 1223) {
+                'Elevation was denied or cancelled by Windows.'
+            }
+            else {
+                'Elevated launch failed: ' + (Protect-ToolkitText ([string]$exception.Message))
+            }
+            return Get-ToolkitResult -Status 'CriticalError' -Message $message
         }
-    }
-    catch {
-        $exception = $_.Exception
-        $nativeErrorCode = -1
-        if ($exception -is [ComponentModel.Win32Exception]) {
-            $nativeErrorCode = $exception.NativeErrorCode
-        }
-        $message = if ($nativeErrorCode -eq 1223) {
-            'Elevation was denied or cancelled by Windows.'
-        }
-        else {
-            'Elevated launch failed: ' + (Protect-ToolkitText ([string]$exception.Message))
-        }
-        return Get-ToolkitResult -Status 'CriticalError' -Message $message
     }
 
     if (-not $exitCodeReported) {

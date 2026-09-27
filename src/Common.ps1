@@ -12,7 +12,8 @@ if (-not (Test-Path variable:script:ToolkitProcessTimeoutSeconds)) {
     $script:ToolkitProcessTimeoutSeconds = 120
 }
 # A surviving grandchild can hold a redirected pipe open after the child itself is gone, so the
-# captured streams are drained with a bounded wait too.
+# captured streams are drained with a bounded wait too. Output that cannot be collected is a transport
+# failure, never a clean exit code, because every caller reads an empty success as a real negative.
 $script:ToolkitProcessDrainMilliseconds = 5000
 
 # A read-only transport call is retried only for a transport failure or an explicit not-started
@@ -26,9 +27,21 @@ if (-not (Test-Path variable:script:ToolkitReadOnlyDelaySeconds)) {
 # A semantic refusal is a decision, so it is never retried. Only a manager or guest that reports
 # the work is not under way yet counts as transient.
 $script:ToolkitTransientCallPattern = '(?i)\b(?:not\s+(?:started|running|ready|booted)|no\s+running\s+instance|device\s+offline)\b'
-# Only these guest command words read state and change nothing. Anything else, including a shell
-# su -c request whose payload the toolkit cannot inspect, is left unretried.
-$script:ToolkitReadOnlyGuestPattern = '^(?:shell\s+)?(?:getprop|dumpsys|pidof|cat|ls|base64)\b'
+# Only these guest command words read state and change nothing, so only a request that starts with one
+# of them can be a read-only call at all.
+$script:ToolkitReadOnlyGuestVerbs = @('getprop', 'dumpsys', 'pidof', 'cat', 'ls', 'base64')
+# Every word that changes something: the mutating words of the shared guest funnel above plus the
+# adb subcommands the toolkit issues. One of these anywhere in a request makes the request unretried,
+# so a first token that looks harmless cannot smuggle a mutation behind it.
+$script:ToolkitMutatingCommandWords = @(
+    'echo', 'mkdir', 'mv', 'rm', 'rmdir', 'unzip', 'cp', 'ln', 'chmod', 'chown', 'dd', 'truncate'
+    'su', 'sh', 'bash', 'am', 'pm', 'settings', 'setprop', 'reboot', 'kill'
+    'install', 'uninstall', 'push', 'pull', 'monkey', 'root', 'unroot', 'remount'
+    'forward', 'reverse', 'connect', 'delete', 'wait-for-device', 'kill-server'
+)
+# A shell metacharacter can start a second command, redirect output, or expand a substitution, so a
+# request carrying one is never retried whatever its words are.
+$script:ToolkitShellMetaCharacterPattern = '[|&;<>()$`''"*?\[\]{}]'
 
 function Test-ToolkitGuestPath {
     param([string]$Path)
@@ -83,6 +96,43 @@ function New-ToolkitGuestCommand {
         }
     }
     return Get-ToolkitResult -Status 'Success' -Message 'The guest command is safely quoted.' -Data ('shell su -c ' + [char]39 + $Command + [char]39)
+}
+
+# A guest command is retried only when the whole request reads state and changes nothing, so a repeated
+# install, push, move, or removal can never happen. The shared guest funnel accepts an optional shell
+# prefix, the operators, and the mutating verbs, so the first token alone proves nothing: the request
+# has to start with a read-only word, carry no operator or shell metacharacter, and name no
+# state-changing word anywhere.
+function Test-ToolkitReadOnlyGuestCommand {
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Command
+    )
+
+    if ($Command -isnot [string] -or [string]::IsNullOrWhiteSpace($Command)) {
+        return $false
+    }
+    if ($Command -match '[\x00-\x1f\x7f]' -or $Command -match $script:ToolkitShellMetaCharacterPattern) {
+        return $false
+    }
+    $tokens = @($Command -split ' ')
+    $first = 0
+    if ($tokens[0] -ceq 'shell') {
+        $first = 1
+    }
+    if ($tokens.Count -le $first -or $script:ToolkitReadOnlyGuestVerbs -cnotcontains $tokens[$first]) {
+        return $false
+    }
+    foreach ($token in $tokens) {
+        if ($script:ToolkitMutatingCommandWords -ccontains $token) {
+            return $false
+        }
+        if ($token.StartsWith('/') -and -not (Test-ToolkitGuestPath -Path $token)) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Get-ToolkitResult {
@@ -328,14 +378,31 @@ function Invoke-CheckedProcess {
         [void][Threading.Tasks.Task]::WaitAll(
             [Threading.Tasks.Task[]]@($standardOutputTask, $standardErrorTask),
             $script:ToolkitProcessDrainMilliseconds)
-        $text = if ($standardOutputTask.IsCompleted -and -not $standardOutputTask.IsFaulted) { $standardOutputTask.Result } else { '' }
-        $standardError = if ($standardErrorTask.IsCompleted -and -not $standardErrorTask.IsFaulted) { $standardErrorTask.Result } else { '' }
         if ($timedOut) {
             return [pscustomobject]@{
                 ExitCode = -1
                 Text = "The process did not exit within the $boundSeconds second timeout and was terminated: $FilePath"
             }
         }
+        # A surviving grandchild still holds the inherited handle, so the stream never reaches EOF and
+        # whatever it buffered cannot be collected. Reporting the child's own exit code here would hand
+        # every caller an empty success, which each one reads as a real negative, so the call fails
+        # closed with the reason instead of discarding the capture.
+        $uncollected = @()
+        if (-not ($standardOutputTask.IsCompleted -and -not $standardOutputTask.IsFaulted)) {
+            $uncollected += 'standard output'
+        }
+        if (-not ($standardErrorTask.IsCompleted -and -not $standardErrorTask.IsFaulted)) {
+            $uncollected += 'standard error'
+        }
+        if ($uncollected.Count -gt 0) {
+            return [pscustomobject]@{
+                ExitCode = -1
+                Text = "The process exited but its redirected $($uncollected -join ' and ') could not be collected within the $($script:ToolkitProcessDrainMilliseconds) millisecond drain, because a surviving grandchild still holds the inherited handle. The captured output is discarded and the result is unknown: $FilePath"
+            }
+        }
+        $text = $standardOutputTask.Result
+        $standardError = $standardErrorTask.Result
         if (-not [string]::IsNullOrEmpty($standardError)) {
             if (-not [string]::IsNullOrEmpty($text)) {
                 $text += [Environment]::NewLine
