@@ -8579,6 +8579,17 @@ function Invoke-MenuTests {
         foreach ($required in $expectedActions) {
             Assert-True (@(@($catalog | Where-Object { [string]$_.Name -ceq $required } | ForEach-Object { [string]$_.Description }) | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) "The menu catalog has no description for an action: $required"
         }
+        $catalogNumbers = @($catalog | ForEach-Object { [int]$_.Number })
+        Assert-Equal ((@(1..$catalog.Count) | ForEach-Object { [string]$_ }) -join ',') ($catalogNumbers -join ',') 'The menu catalog does not number its entries 1..N in order.'
+
+        # The rendered menu is what the operator reads, so each line must lead with the number it accepts.
+        $toolbarState = @{ Lines = @() }
+        $toolbarCode = Start-ToolkitController -StateRoot $menuStateRoot -Reader (New-MenuReader -Answers @('9')) -Writer ({ param($Line) $toolbarState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'menu rendered' }).GetNewClosure()
+        Assert-Equal 0 $toolbarCode 'The numbered menu did not return a zero exit code.'
+        $toolbarText = @($toolbarState.Lines) -join "`n"
+        foreach ($entry in $catalog) {
+            Assert-True ($toolbarText -match ('(?m)^\s+' + [regex]::Escape([string]$entry.Number) + '\s+' + [regex]::Escape([string]$entry.Name) + '\b')) "The menu does not offer $($entry.Number) for $($entry.Name)."
+        }
 
         $controllerSource = [IO.File]::ReadAllText($controllerScriptPath)
         Assert-True ($controllerSource -match 'while\s*\(\s*\$true\s*\)') 'The controller does not use a persistent while loop.'
@@ -8903,6 +8914,26 @@ function Invoke-MenuTests {
 
         $blankCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('   ', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 0 $blankCode 'A blank menu answer did not return normally.'
+
+        # The menu is numbered so the operator presses a digit instead of typing an action name, and the
+        # number is the only thing the prompt has to offer.
+        $numberState = @{ Calls = @() }
+        $numberCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('2', ' 4 ', '9')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $numberState.Calls += $Action; Get-ToolkitResult -Status 'Success' -Message 'numbered selection' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 0 $numberCode 'A numbered menu selection did not return a zero exit code.'
+        Assert-Equal 'Verify,Root12' ($numberState.Calls -join ',') 'A menu number did not dispatch the action the catalog lists at that position.'
+
+        $numberQuitState = @{ Calls = @() }
+        $numberQuitCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @([string]$catalog.Count)) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $numberQuitState.Calls += $Action }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 0 $numberQuitCode 'The last menu number did not quit.'
+        Assert-Equal 0 $numberQuitState.Calls.Count 'The last menu number ran an action instead of quitting.'
+
+        $outOfRangeState = @{ Lines = @() }
+        $outOfRangeCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('0', '99', 'Verify', 'Q')) -Writer ({ param($Line) $outOfRangeState.Lines += $Line }).GetNewClosure() -Runner ({ param($Action) $outOfRangeState.Lines += ('RAN:' + $Action); Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 0 $outOfRangeCode 'An out-of-range menu number did not return normally.'
+        $outOfRangeText = @($outOfRangeState.Lines) -join "`n"
+        Assert-Equal 1 ([regex]::Matches($outOfRangeText, 'RAN:')).Count 'An out-of-range menu number reached the dispatcher.'
+        Assert-True ($outOfRangeText -match 'RAN:Verify') 'An out-of-range menu number displaced the action that follows it.'
+        Assert-True ($outOfRangeText -match ('1-' + $catalog.Count)) 'An out-of-range menu number did not report the range the operator can press.'
 
         $eofCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @()) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 0 $eofCode 'An exhausted menu input did not return normally.'

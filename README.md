@@ -83,9 +83,11 @@ fetches at all.
 
 ## Actions
 
-Double-click `Run-MumuToolkit.bat` to open the interactive menu. On the command line `-Action`
-is honored only together with `-NonInteractive`; without `-NonInteractive` the launcher opens
-the menu and the `-Action` value is ignored, so every example below passes both.
+Double-click `Run-MumuToolkit.bat` to open the interactive menu. The menu is numbered, so you answer
+with the number it printed and press Enter; an action name is still accepted if you prefer to type it.
+On the command line `-Action` is honored only together with `-NonInteractive`; without
+`-NonInteractive` the launcher opens the menu and the `-Action` value is ignored, so every example
+below passes both.
 
 | Action | What it changes | Noninteractive command |
 | --- | --- | --- |

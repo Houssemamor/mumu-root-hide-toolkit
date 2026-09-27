@@ -55,17 +55,39 @@ $script:ToolkitDependencyConsentWord = 'FETCH'
 
 function Get-ToolkitActionCatalog {
     $catalog = @()
+    $number = 1
     foreach ($name in $script:ToolkitActions) {
         $catalog += [pscustomobject]@{
+            Number = $number
             Name = $name
             Description = [string]$script:ToolkitActionDescriptions[$name]
         }
+        $number++
     }
     $catalog += [pscustomobject]@{
+        Number = $number
         Name = 'Q'
         Description = [string]$script:ToolkitActionDescriptions['Q']
     }
     return $catalog
+}
+
+# The operator answers with the number the menu printed, so the number is resolved to the action name
+# before anything is dispatched. An exact action name is still accepted so an existing habit or a
+# scripted answer keeps working.
+function Resolve-ToolkitMenuChoice {
+    param([string]$Answer)
+
+    $choice = $Answer.Trim()
+    if ([string]::IsNullOrWhiteSpace($choice)) {
+        return $null
+    }
+    $entries = @(Get-ToolkitActionCatalog)
+    $number = 0
+    if ([int]::TryParse($choice, [ref]$number)) {
+        return ($entries | Where-Object { [int]$_.Number -eq $number } | Select-Object -First 1)
+    }
+    return ($entries | Where-Object { [string]$_.Name -ceq $choice } | Select-Object -First 1)
 }
 
 function Get-ToolkitDiscoverySources {
@@ -929,18 +951,23 @@ function Invoke-MenuLoop {
             return $exitCode
         }
         $answer = [string]$read
-        $choice = $answer.Trim()
-        if ([string]::IsNullOrWhiteSpace($choice)) {
+        $entry = Resolve-ToolkitMenuChoice -Answer $answer
+        if ($null -eq $entry) {
+            if (-not [string]::IsNullOrWhiteSpace($answer.Trim())) {
+                # An answer that matches no printed number is reported against the printed range instead
+                # of being dispatched as an action name, so a mistyped digit never runs something.
+                & $write ('Select a number from 1-' + @(Get-ToolkitActionCatalog).Count + ', or press Enter to see the menu again.')
+            }
             continue
         }
-        if ($choice -ceq 'Q') {
+        if ([string]$entry.Name -ceq 'Q') {
             return $exitCode
         }
         $arguments = @{}
         foreach ($key in @($ActionArguments.Keys)) {
             $arguments[[string]$key] = $ActionArguments[$key]
         }
-        $arguments['Action'] = $choice
+        $arguments['Action'] = [string]$entry.Name
         $arguments['Runner'] = $Runner
         $arguments['StateRoot'] = $StateRoot
         $arguments['LogPath'] = $LogPath
@@ -1040,7 +1067,7 @@ function Start-ToolkitController {
 
     $read = $Reader
     if ($null -eq $read) {
-        $read = { param() Read-Host 'Select an action' }
+        $read = { param() Read-Host ('Select an action (1-' + @(Get-ToolkitActionCatalog).Count + ')') }
     }
     $ask = $Prompt
     if ($null -eq $ask) {
@@ -1094,7 +1121,7 @@ function Start-ToolkitController {
         & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
         & $write 'A mutating action that is denied the rights it needs asks for administrator rights once, in its own window, and fails closed if that is declined or the prompt is not answered in time. Detect and Verify never ask.'
         foreach ($entry in @(Get-ToolkitActionCatalog)) {
-            & $write ('  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)
+            & $write ('  ' + ([string]$entry.Number) + '  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)
         }
     }
     return (Invoke-MenuLoop -Reader $read -Writer $write -Runner $runner -StateRoot $statePath -LogPath $logPath)
