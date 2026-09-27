@@ -9668,7 +9668,9 @@ Write-Output 'STANDALONE_OK'
         foreach ($controllerSwitch in @('ElevatedChild', 'FetchDependencies', 'Confirmed', 'Packages')) {
             Assert-True ($controllerBlock -ccontains $controllerSwitch) "The controller does not declare the parameter: $controllerSwitch"
         }
-        $administratorPreflight = Test-ToolkitAdministrator
+        # The administrator probe is pinned for this block because a CI runner process already holds
+        # rights, and the elevation outcomes under test must not depend on who ran the suite.
+        function Test-ToolkitAdministrator { return $false }
         $permissionFailureMessage = 'Campaign replacement failed: Access to the path ''C:\MuMu Global\shell\ad\campaign.json'' is denied.'
         $elevationAttempts = @{
             Attempts = 0
@@ -9761,17 +9763,17 @@ Write-Output 'STANDALONE_OK'
         Assert-Equal 'CriticalError' $unarmed.Status 'An unarmed process reported a permission failure as anything but a failure.'
         Assert-Equal 'ACCESS_DENIED' $unarmed.Data.Code 'An unarmed process changed the reported failure code.'
 
+        # An already-elevated host gains nothing from a second prompt, asserted with the probe pinned to
+        # true so the branch is covered on a non-elevated developer machine and on an elevated runner.
+        function Test-ToolkitAdministrator { return $true }
         $elevationAttempts.Attempts = 0
         $elevationAttempts.Launches = @()
-        $alreadyElevated = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $grantedElevationRunner
-        Assert-Equal 1 $elevationAttempts.Attempts 'The mutating action was not attempted exactly once.'
-        if ($administratorPreflight) {
-            Assert-Equal 0 $elevationAttempts.Launches.Count 'A process that already holds rights asked Windows for them again.'
-            Assert-Equal 'CriticalError' $alreadyElevated.Status 'A process that already holds rights hid the permission failure.'
-        }
-        else {
-            Assert-Equal 1 $elevationAttempts.Launches.Count 'A non-elevated permission failure did not reach the elevation seam.'
-        }
+        $elevatedHost = Invoke-ToolkitActionWithElevation -Action 'RemoveAds' -InstallRoot 'C:\MuMu Global' -StateRoot 'C:\toolkit state' -ElevationRunner $grantedElevationRunner
+        Assert-Equal 1 $elevationAttempts.Attempts 'An already-elevated host did not attempt the action in process.'
+        Assert-Equal 0 $elevationAttempts.Launches.Count 'An already-elevated host asked Windows for rights again.'
+        Assert-Equal 'CriticalError' $elevatedHost.Status 'An already-elevated host hid the permission failure.'
+        Assert-Equal 'ACCESS_DENIED' $elevatedHost.Data.Code 'An already-elevated host changed the reported failure code.'
+        Remove-Item -LiteralPath 'function:Test-ToolkitAdministrator' -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath 'function:Invoke-ToolkitAction' -ErrorAction SilentlyContinue
     }
     finally {
