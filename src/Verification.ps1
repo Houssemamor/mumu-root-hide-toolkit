@@ -107,6 +107,8 @@ function Get-ToolkitInstanceSettings {
     return Get-ToolkitResult -Status 'Success' -Message 'The instance settings were read.' -Data $values
 }
 
+# The poll answers BOOTED or names the bound that ended it, because a timeout message that always names the
+# attempt count is false whenever the wall-clock budget ended the wait first.
 function Wait-ToolkitBootCompleted {
     param(
         [string]$ManagerPath,
@@ -114,22 +116,24 @@ function Wait-ToolkitBootCompleted {
         [scriptblock]$Runner = $null
     )
 
+    $budgetBound = "the $($script:ToolkitBootPollBudgetSeconds) second wall-clock budget"
+    $attemptBound = "the $($script:ToolkitBootPollAttempts) attempt ceiling"
     $budgetDeadline = [DateTime]::UtcNow.AddSeconds($script:ToolkitBootPollBudgetSeconds)
     for ($attempt = 1; $attempt -le $script:ToolkitBootPollAttempts; $attempt++) {
         if ([DateTime]::UtcNow -ge $budgetDeadline) {
-            return $false
+            return [pscustomobject]@{ Code = 'BUDGET'; Bound = $budgetBound }
         }
         # This probe is the poll's own retry, so it is not retried inside one attempt: that would
         # multiply the process bound by the attempt count instead of bounding the poll.
         $probe = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command 'shell getprop sys.boot_completed' -Runner $Runner -NoRetry
         if ($null -ne $probe -and $probe.ExitCode -eq 0 -and ([string]$probe.Text).Trim() -ceq '1') {
-            return $true
+            return [pscustomobject]@{ Code = 'BOOTED'; Bound = '' }
         }
         if ($attempt -lt $script:ToolkitBootPollAttempts -and [DateTime]::UtcNow -lt $budgetDeadline) {
             Start-Sleep -Seconds $script:ToolkitBootPollDelaySeconds
         }
     }
-    return $false
+    return [pscustomobject]@{ Code = 'ATTEMPTS'; Bound = $attemptBound }
 }
 
 function Get-ToolkitRootSetting {
@@ -526,8 +530,10 @@ function Get-ToolkitGuestState {
         Kitsune = ''
         KernelSU = ''
         DaemonCount = -1
-        HmaInstalled = $false
-        VectorModuleInstalled = $false
+        # A guest that answered answers true or false. A package list the guest never answered leaves the
+        # field absent, because an absence claim has to be a claim the guest made.
+        HmaInstalled = $null
+        VectorModuleInstalled = $null
         Failure = ''
     }
     if ([string]::IsNullOrWhiteSpace($ManagerPath) -or $InstanceIndex -lt 0) {
@@ -544,7 +550,12 @@ function Get-ToolkitGuestState {
         $checks = Test-Android12Root -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
         if ($null -ne $checks -and $null -ne $checks.Data) {
             $guest['Kitsune'] = [string](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('VersionName'))
-            $guest['DaemonCount'] = [int](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('DaemonCount'))
+            # A count the guest never produced keeps the report's own unread marker, because casting a
+            # missing count to zero would be a claim that no root daemon is running.
+            $daemonCount = Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('DaemonCount')
+            if ($null -ne $daemonCount -and [int]$daemonCount -ge 0) {
+                $guest['DaemonCount'] = [int]$daemonCount
+            }
         }
     }
     elseif ($AndroidVersion -ceq '15.0') {
@@ -554,7 +565,12 @@ function Get-ToolkitGuestState {
         }
         $checks = Test-Android15Root -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Runner $Runner
         if ($null -ne $checks -and $null -ne $checks.Data) {
-            $guest['RootPermission'] = [bool](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('RootPermission'))
+            # A vendor root setting the check never read keeps the report's own unread marker, because
+            # casting a missing value to false would claim the vendor root is disabled.
+            $rootPermission = Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('RootPermission')
+            if ($null -ne $rootPermission) {
+                $guest['RootPermission'] = [bool]$rootPermission
+            }
             $guest['KernelSU'] = [string](Get-ToolkitRecordValue -Record $checks.Data -PropertyNames @('KernelSUVersion'))
         }
     }
@@ -618,6 +634,11 @@ function Get-ToolkitGuestState {
             $guest['VectorModuleInstalled'] = $null
             $guest['Failure'] = $guest['Failure'] + " The Vector module at $modulePath could not be read: $([string]$module.Text)"
         }
+        elseif ($null -ne $module) {
+            # A guest that answered owns the answer: an exit status that is not a transport failure is the
+            # guest reporting the directory is not there.
+            $guest['VectorModuleInstalled'] = $false
+        }
     }
     return $guest
 }
@@ -639,8 +660,8 @@ function Get-ToolkitReport {
         Kitsune = ''
         KernelSU = ''
         DaemonCount = -1
-        HmaInstalled = $false
-        VectorModuleInstalled = $false
+        HmaInstalled = $null
+        VectorModuleInstalled = $null
         Failure = ''
     }
     $report = [ordered]@{

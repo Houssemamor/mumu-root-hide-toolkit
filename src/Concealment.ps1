@@ -871,6 +871,12 @@ function Install-ConcealmentDependencies {
             return New-ToolkitRootFailure -Journal $Journal -Message $listingCommand.Message -Data (New-ConcealmentState -Code ([string]$listingCommand.Data.Code) -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
         }
         $listing = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $instanceIndex -Command $listingCommand.Data.Command -Runner $Runner
+        if ($null -eq $listing -or $listing.ExitCode -eq -1) {
+            # A transport failure leaves the entry list empty, which is not a layout the archive can be
+            # blamed for, so it is reported the same way the module directory probe above reports one.
+            (& $cleanupStaging)
+            return New-ToolkitRootFailure -Journal $Journal -Message "The extracted Vector module directory could not be read, so the archive layout is unknown and nothing was installed." -Data (New-ConcealmentState -Code 'ADB_FAILED' -Step 'vector-install' -InstanceIndex $instanceIndex -Fields $cloneFields)
+        }
         $entries = @()
         if ($null -ne $listing -and $listing.ExitCode -eq 0) {
             $entries = @(([string]$listing.Text) -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })

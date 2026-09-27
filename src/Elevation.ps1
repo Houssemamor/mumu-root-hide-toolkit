@@ -29,6 +29,10 @@ $script:ToolkitElevatableActions = @('Target', 'Root12', 'Root15', 'Conceal', 'R
 if (-not (Test-Path variable:script:ToolkitElevatedPromptSeconds)) {
     $script:ToolkitElevatedPromptSeconds = 120
 }
+# A consent answered in the instant the prompt bound expires still returns a child, so the launch is
+# collected once more inside this grace. The bound has already ended the wait, so the child that comes
+# back is terminated rather than run unobserved.
+$script:ToolkitElevatedLaunchGraceMilliseconds = 5000
 if (-not (Test-Path variable:script:ToolkitElevatedActionSeconds)) {
     $script:ToolkitElevatedActionSeconds = 3600
 }
@@ -58,11 +62,16 @@ catch {
 function Invoke-ToolkitBoundedLaunch {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Script,
+        [AllowEmptyString()]
+        [string]$Script = '',
         [object[]]$Arguments = @(),
         [Parameter(Mandatory = $true)]
         [int]$BoundSeconds
     )
+
+    if ([string]::IsNullOrWhiteSpace($Script)) {
+        return [pscustomobject]@{ Code = 'LAUNCH_FAILED'; TerminatedChild = $false; Output = @() }
+    }
 
     $runspace = $null
     $pipeline = $null
@@ -76,18 +85,68 @@ function Invoke-ToolkitBoundedLaunch {
             [void]$pipeline.AddArgument($argument)
         }
         $handle = $pipeline.BeginInvoke()
-        if (-not $handle.AsyncWaitHandle.WaitOne($BoundSeconds * 1000)) {
+        # PowerShell closes this handle itself once the pipeline has been collected, so it is only waited
+        # on until then and is disposed below on the path where it is still open.
+        $waitHandle = $handle.AsyncWaitHandle
+        try {
+            if (-not $waitHandle.WaitOne($BoundSeconds * 1000)) {
+                # A consent answered in the instant the bound expires still returns a child, so the late
+                # answer is collected inside a short grace before the runspace is torn down. The bound
+                # already ended the wait, so the child is terminated instead of run unobserved.
+                $lateOutput = @()
+                $answeredLate = $false
+                try {
+                    $answeredLate = $waitHandle.WaitOne($script:ToolkitElevatedLaunchGraceMilliseconds)
+                }
+                catch {
+                    $answeredLate = $false
+                }
+                if ($answeredLate) {
+                    try {
+                        $lateOutput = @($pipeline.EndInvoke($handle))
+                    }
+                    catch {
+                        $lateOutput = @()
+                    }
+                    $terminated = $false
+                    foreach ($lateItem in $lateOutput) {
+                        if ($lateItem -isnot [Diagnostics.Process]) {
+                            continue
+                        }
+                        try {
+                            if (-not $lateItem.HasExited) {
+                                $lateItem.Kill()
+                                $terminated = $true
+                            }
+                            [void]$lateItem.WaitForExit($script:ToolkitElevatedLaunchGraceMilliseconds)
+                        }
+                        catch {
+                        }
+                        $lateItem.Dispose()
+                    }
+                    return [pscustomobject]@{ Code = 'UNANSWERED'; TerminatedChild = $terminated; Output = @() }
+                }
+                try {
+                    $pipeline.Stop()
+                }
+                catch {
+                }
+                return [pscustomobject]@{ Code = 'UNANSWERED'; TerminatedChild = $false; Output = @() }
+            }
+            return [pscustomobject]@{ Code = 'LAUNCHED'; TerminatedChild = $false; Output = @($pipeline.EndInvoke($handle)) }
+        }
+        finally {
+            # The wait handle is a kernel handle, so it is closed here rather than left to the garbage
+            # collector on a path that runs once per elevated relaunch.
             try {
-                $pipeline.Stop()
+                $waitHandle.Dispose()
             }
             catch {
             }
-            return $null
         }
-        return @($pipeline.EndInvoke($handle))
     }
     catch {
-        return $null
+        return [pscustomobject]@{ Code = 'LAUNCH_FAILED'; TerminatedChild = $false; Output = @() }
     }
     finally {
         if ($null -ne $pipeline) {
@@ -266,7 +325,7 @@ function Invoke-ElevatedToolkitAction {
         [string]$ScriptPath,
         [string[]]$Arguments = @(),
         [scriptblock]$Runner = $null,
-        [scriptblock]$Launch = $null
+        [object]$Launch = $null
     )
 
     $argumentList = $null
@@ -286,7 +345,8 @@ function Invoke-ElevatedToolkitAction {
         $quotedArguments = @($argumentList | ForEach-Object { ConvertTo-ProcessArgument -Argument $_ })
         $launchScript = $script:ToolkitElevatedLaunchScript
         if ($null -ne $Launch) {
-            $launchScript = $Launch.ToString()
+            # The seam is a script or a scriptblock, so a test can hand over either form.
+            $launchScript = if ($Launch -is [scriptblock]) { $Launch.ToString() } else { [string]$Launch }
         }
         try {
             $alreadyElevated = Test-ToolkitAdministrator
@@ -295,10 +355,16 @@ function Invoke-ElevatedToolkitAction {
         catch {
             $outcome = $null
         }
-        if ($null -eq $outcome) {
+        if ($null -eq $outcome -or [string]$outcome.Code -ceq 'LAUNCH_FAILED') {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The elevated launch could not be run, so no elevated child was confirmed and the action fails closed.'
+        }
+        if ($outcome.TerminatedChild) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message "The Windows UAC prompt was not answered within the $($script:ToolkitElevatedPromptSeconds) second bound. The child that late consent created was waited on and terminated, no outcome is claimed for it, and the action fails closed."
+        }
+        if ([string]$outcome.Code -ceq 'UNANSWERED') {
             return Get-ToolkitResult -Status 'CriticalError' -Message "The Windows UAC prompt was not answered within the $($script:ToolkitElevatedPromptSeconds) second bound, so no elevated child was confirmed and the action fails closed."
         }
-        $launched = @($outcome)[0]
+        $launched = @($outcome.Output)[0]
         if ($launched -isnot [Diagnostics.Process]) {
             $nativeErrorCode = -1
             if ($null -ne $launched.PSObject.Properties['NativeErrorCode']) {

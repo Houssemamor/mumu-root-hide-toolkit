@@ -441,7 +441,8 @@ function Invoke-TransportTests {
         }.GetNewClosure()
         $budgetPoll = Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $budgetRunner
         $budgetStopwatch.Stop()
-        Assert-True (-not $budgetPoll) 'The boot poll reported a ready instance that never booted.'
+        Assert-Equal 'BUDGET' ([string]$budgetPoll.Code) "The boot poll did not name the wall-clock budget as the bound that ended the wait. ($($budgetPoll.Bound))"
+        Assert-True ([string]$budgetPoll.Bound -match '(?i)budget') "The boot poll bound text does not name the budget: $($budgetPoll.Bound)"
         Assert-True ($budgetStopwatch.Elapsed.TotalSeconds -le ($script:ToolkitBootPollBudgetSeconds + 5)) "The boot poll ran past its wall-clock budget: $($budgetStopwatch.Elapsed.TotalSeconds) seconds."
 
         $script:ToolkitBootPollDelaySeconds = 0
@@ -454,7 +455,7 @@ function Invoke-TransportTests {
             }
             return [pscustomobject]@{ ExitCode = 0; Text = '1' }
         }.GetNewClosure()
-        Assert-True (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $pollTransportRunner) 'The boot poll did not recover from a transient first attempt.'
+        Assert-Equal 'BOOTED' ([string](Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $pollTransportRunner).Code) 'The boot poll did not recover from a transient first attempt.'
         Assert-Equal 2 $pollTransportState.Count 'The boot poll retried inside a single attempt instead of moving to the next attempt.'
 
         # The poll probe is excluded from the transport retry, so its own worst case is one process bound
@@ -467,7 +468,9 @@ function Invoke-TransportTests {
             [pscustomobject]@{ ExitCode = -1; Text = 'Process launch failed: the manager is busy' }
         }.GetNewClosure()
         $script:ToolkitBootPollAttempts = 2
-        Assert-True (-not (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $alwaysPollRunner)) 'The boot poll reported a ready instance whose transport always failed.'
+        $attemptPoll = Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 0 -Runner $alwaysPollRunner
+        Assert-Equal 'ATTEMPTS' ([string]$attemptPoll.Code) "A poll that ran out of attempts did not name the attempt ceiling. ($($attemptPoll.Bound))"
+        Assert-True ([string]$attemptPoll.Bound -match '(?i)attempt') "The boot poll bound text does not name the attempt ceiling: $($attemptPoll.Bound)"
         Assert-Equal 2 $alwaysPollState.Count 'The boot poll probe was retried inside one poll attempt.'
     }
     finally {
@@ -2683,6 +2686,7 @@ function Invoke-SafetyTests {
     Assert-True ([int]$actionBound.Value -ge 600 -and [int]$actionBound.Value -le 14400) "The elevated child bound is not a defensible bound: $($actionBound.Value)"
     Assert-True ([int]$actionBound.Value -gt [int]$promptBound.Value) 'The elevated child bound is not above the UAC prompt bound.'
     Assert-True ($elevationSource -notmatch '(?i)Start-Process[^;\r\n]*-Wait') 'The elevated relaunch still waits on the child without a bound.'
+    Assert-True ($elevationSource -match '\$waitHandle\.Dispose\(\)') 'The elevated launch seam never closes the wait handle it blocks on.'
     $elevationParameters = @((Get-Command Invoke-ElevatedToolkitAction -CommandType Function).Parameters.Keys)
     Assert-True ($elevationParameters -ccontains 'Launch') 'The elevated relaunch has no bounded launch seam for a test.'
 
@@ -2696,7 +2700,26 @@ function Invoke-SafetyTests {
         $unanswered = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'Unanswered') -Launch $unansweredRunner
         Assert-Equal 'CriticalError' $unanswered.Status 'An unanswered UAC prompt did not fail closed.'
         Assert-True ($unanswered.Message -match '(?i)prompt|not answered|bound') "An unanswered UAC prompt did not name the prompt bound: $($unanswered.Message)"
+        Assert-True ($unanswered.Message -notmatch '(?i)terminated') "An unanswered UAC prompt claimed a terminated child: $($unanswered.Message)"
         Assert-Equal 1 (Get-ToolkitExitCode $unanswered) 'An unanswered UAC prompt did not map to the critical exit code.'
+
+        # A consent answered in the instant the bound expires still creates a child, so the late answer is
+        # collected, the child is waited on and killed, and the run fails closed without claiming an
+        # outcome for it. The child records its own id so the test can prove it is gone.
+        $latePidPath = Join-Path $testRoot 'elevated late child.pid'
+        # The child is named as a literal in the launch text because the launch runs in a private
+        # runspace, which does not see anything captured by this scope.
+        $lateLaunchText = "param(`$ActualFilePath, `$ActualQuotedArguments) `$lateChild = Start-Process -FilePath '$(Join-Path $PSHOME 'powershell.exe')' -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('$latePidPath', [string]`$lateChild.Id); Start-Sleep -Milliseconds 1500; `$lateChild"
+        $lateAnswer = Invoke-ElevatedToolkitAction -ScriptPath $fakeScript -Arguments @('-Fixture', 'Late') -Launch $lateLaunchText
+        Assert-Equal 'CriticalError' $lateAnswer.Status 'A consent answered after the prompt bound did not fail closed.'
+        Assert-True ($lateAnswer.Message -match '(?i)not answered|bound') "A late consent did not name the prompt bound: $($lateAnswer.Message)"
+        Assert-True ($lateAnswer.Message -match '(?i)terminated') "A child created after the prompt bound was not reported as terminated: $($lateAnswer.Message)"
+        $lateChildId = [int][IO.File]::ReadAllText($latePidPath)
+        $survivingLateChild = Get-Process -Id $lateChildId -ErrorAction SilentlyContinue
+        if ($null -ne $survivingLateChild) {
+            $survivingLateChild.Dispose()
+        }
+        Assert-True ($null -eq $survivingLateChild) "The elevated child created after the bound was not terminated (id $lateChildId)."
 
         $script:ToolkitElevatedPromptSeconds = 30
         $script:ToolkitElevatedActionSeconds = 1
@@ -5043,6 +5066,10 @@ function Invoke-Root12Tests {
         $bootTimeoutCase = Invoke-Root12Case -State $bootTimeoutState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
         Assert-Root12Failure -Result $bootTimeoutCase.Result -Journal $bootTimeoutCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A boot timeout was accepted.'
+        # A message that always names the attempt count is false whenever the wall-clock budget ended the
+        # poll first, so the bound that actually ended the wait is named instead.
+        Assert-True ($bootTimeoutCase.Result.Message -match '(?i)attempt ceiling|budget') "The boot timeout did not name the bound that ended the wait: $($bootTimeoutCase.Result.Message)"
+        Assert-True ($bootTimeoutCase.Result.Message -notmatch 'after \d+ checks') "The boot timeout still names an attempt count: $($bootTimeoutCase.Result.Message)"
         Assert-Equal -1 (Get-Root12CallIndex -Calls $bootTimeoutState.Calls -Pattern '*pidof magiskd*') 'A boot timeout still verified the root daemon.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $bootTimeoutState.Calls -Pattern '*root_permission*-val*false*') 'A boot timeout disabled the temporary vendor root.'
         Assert-Equal $bootTimeoutState.CloneIndex $bootTimeoutCase.Result.Data.CloneIndex 'A boot timeout did not report the recoverable clone.'
@@ -5069,6 +5096,8 @@ function Invoke-Root12Tests {
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
         Assert-Root12Failure -Result $missingPackageCase.Result -Journal $missingPackageCase.Journal -Code 'PACKAGE_MISSING' -Message 'A missing Kitsune package was accepted.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $missingPackageState.Calls -Pattern '*root_permission*-val*false*') 'A missing Kitsune package disabled the temporary vendor root.'
+        # The daemon query never ran, so the count is unread rather than a measured zero.
+        Assert-Equal -1 $missingPackageCase.Result.Data.DaemonCount 'A missing Kitsune package reported a measured root daemon count.'
 
         foreach ($versionCase in @(
                 [pscustomobject]@{ Name = '30.0'; Code = '28000'; Label = 'name' },
@@ -5083,6 +5112,7 @@ function Invoke-Root12Tests {
                 -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
             Assert-Root12Failure -Result $versionFailure.Result -Journal $versionFailure.Journal -Code 'PACKAGE_VERSION_MISMATCH' -Message "An unpinned Kitsune version was accepted: $($versionCase.Label)."
             Assert-Equal -1 (Get-Root12CallIndex -Calls $versionState.Calls -Pattern '*root_permission*-val*false*') "An unpinned Kitsune version disabled the temporary vendor root: $($versionCase.Label)."
+            Assert-Equal -1 $versionFailure.Result.Data.DaemonCount "An unpinned Kitsune version reported a measured root daemon count: $($versionCase.Label)."
         }
 
         foreach ($nearNameCase in @(
@@ -5380,6 +5410,8 @@ function Invoke-Root12Tests {
                 -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
             Assert-Root12Failure -Result $transportFailure.Result -Journal $transportFailure.Journal -Code 'ADB_FAILED' -Message "An unreadable $($transportCase.Label) was accepted."
             Assert-Equal -1 (Get-Root12CallIndex -Calls $transportState.Calls -Pattern '*root_permission*-val*false*') "An unreadable $($transportCase.Label) disabled the temporary vendor root."
+            # A count the guest never produced is not a count of zero, so the unread marker is reported.
+            Assert-Equal -1 $transportFailure.Result.Data.DaemonCount "An unreadable $($transportCase.Label) reported a measured root daemon count."
         }
 
         $bootAdbState = New-Root12ManagerState -Install $install
@@ -6306,7 +6338,7 @@ function Invoke-Root15Tests {
         $foreignSettingVerified = Test-Android15Root -ManagerPath $install.ManagerPath -InstanceIndex 7 -Runner (New-Root15ManagerRunner -State $foreignSettingVerifiedState)
         Assert-Equal 'CriticalError' $foreignSettingVerified.Status 'The Android 15 root checks accepted a vendor root setting for another instance.'
         Assert-Equal 'ROOT_SETTING_UNREADABLE' $foreignSettingVerified.Data.Code 'A vendor root setting for another instance reported the wrong code.'
-        Assert-Equal $false $foreignSettingVerified.Data.RootPermission 'A vendor root setting for another instance was reported as verified.'
+        Assert-Equal $null $foreignSettingVerified.Data.RootPermission 'A vendor root setting for another instance was reported as a disabled vendor root.'
         Assert-Equal 0 @(Get-Root15Calls -State $foreignSettingVerifiedState -Pattern 'adb*').Count 'A vendor root setting for another instance still issued an ADB request.'
 
         $matchingIndexState = New-Root15ManagerState -Install $install
@@ -6347,7 +6379,8 @@ function Invoke-Root15Tests {
         $bootTimeoutState.BootReadyPolls = 99
         $bootTimeoutCase = Invoke-Root15Case -State $bootTimeoutState -Instance $android15 -JournalRoot $journalRoot
         Assert-Root15Failure -Result $bootTimeoutCase.Result -Journal $bootTimeoutCase.Journal -Code 'BOOT_TIMEOUT' -Message 'A failed boot was accepted.'
-        Assert-True ($bootTimeoutCase.Result.Message -match '2 checks') 'The boot timeout did not report the number of checks.'
+        Assert-True ($bootTimeoutCase.Result.Message -match '(?i)attempt ceiling|budget') "The boot timeout did not name the bound that ended the wait: $($bootTimeoutCase.Result.Message)"
+        Assert-True ($bootTimeoutCase.Result.Message -notmatch 'after \d+ checks') "The boot timeout still names an attempt count: $($bootTimeoutCase.Result.Message)"
         Assert-Equal -1 (Get-Root15CallIndex -Calls $bootTimeoutState.Calls -Pattern '*dumpsys package*') 'A failed boot verified the KernelSU package.'
         Assert-Equal -1 (Get-Root15CallIndex -Calls $bootTimeoutState.Calls -Pattern '*su -c id*') 'A failed boot verified the root shell.'
 
@@ -6558,6 +6591,7 @@ function Invoke-Root15Tests {
         $verifyUnreadableChecks = Test-Android15Root -ManagerPath $install.ManagerPath -InstanceIndex $successState.CloneIndex -Runner (New-Root15ManagerRunner -State $verifyUnreadableState)
         Assert-Equal 'CriticalError' $verifyUnreadableChecks.Status 'An unreadable vendor root setting was accepted by the checks.'
         Assert-Equal 'ROOT_SETTING_UNREADABLE' $verifyUnreadableChecks.Data.Code 'An unreadable vendor root setting reported the wrong code.'
+        Assert-Equal $null $verifyUnreadableChecks.Data.RootPermission 'A vendor root setting that could not be read was reported as a disabled vendor root.'
 
         $blankManagerState = New-Root15ManagerState -Install $install
         $blankManagerChecks = Test-Android15Root -ManagerPath '   ' -InstanceIndex $successState.CloneIndex -Runner (New-Root15ManagerRunner -State $blankManagerState)
@@ -6689,17 +6723,18 @@ function Invoke-VerificationTests {
             param($ActualFilePath, $ActualArgumentList)
             [pscustomobject]@{ ExitCode = 0; Text = '1' }
         }.GetNewClosure()
-        Assert-True (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $readyRunner) 'The shared boot wait did not report a ready instance.'
+        Assert-Equal 'BOOTED' ([string](Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $readyRunner).Code) 'The shared boot wait did not report a ready instance.'
         $notReadyRunner = {
             param($ActualFilePath, $ActualArgumentList)
             $sharedState.Polls++
             [pscustomobject]@{ ExitCode = 0; Text = '0' }
         }.GetNewClosure()
         $sharedState.Polls = 0
-        Assert-True (-not (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $notReadyRunner)) 'The shared boot wait reported a ready instance that never booted.'
+        $notReadyPoll = Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $notReadyRunner
+        Assert-Equal 'ATTEMPTS' ([string]$notReadyPoll.Code) 'The shared boot wait reported a ready instance that never booted.'
         Assert-Equal 2 $sharedState.Polls 'The shared boot wait did not stop at its poll bound.'
         $throwingRunner = { param($ActualFilePath, $ActualArgumentList) throw 'transport failure' }.GetNewClosure()
-        Assert-True (-not (Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $throwingRunner)) 'The shared boot wait reported a ready instance whose transport failed.'
+        Assert-Equal 'ATTEMPTS' ([string](Wait-ToolkitBootCompleted -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -InstanceIndex 7 -Runner $throwingRunner).Code) 'The shared boot wait reported a ready instance whose transport failed.'
     }
     finally {
         if ($null -ne $bootAttemptsVariable) {
@@ -6848,6 +6883,7 @@ $script:ConcealmentCodes = @(
     'ASSET_VERIFICATION_FAILED',
     'ASSET_PATH_INVALID',
     'APK_INSTALL_FAILED',
+    'ADB_FAILED',
     'MODULE_PUSH_FAILED',
     'MODULE_EXTRACT_FAILED',
     'MODULE_LAYOUT_UNSUPPORTED',
@@ -8226,6 +8262,18 @@ name=Vector
         Assert-Equal 0 @($flatDefectState.Files.Keys | Where-Object { [string]$_ -like '*vector-extract*' }).Count "A refused Vector archive left its staging directory behind: $($flatLayoutDefect.Label)."
     }
 
+    # A post-extract listing that could not be read is a transport failure, not a rejected archive, so
+    # it is never reported as the pinned archive carrying an unsupported layout.
+    $unreadableListingState = New-ConcealmentGuestState -Install $install
+    $unreadableListingState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentSelectedPackage)
+    $unreadableListingState.AdbFailPattern = '*ls /data/local/tmp/vector-extract*'
+    $unreadableListingState.AdbFailExitCode = -1
+    $unreadableListingJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $unreadableListingResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $unreadableListingJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $unreadableListingState)
+    Assert-ConcealmentFailure -Result $unreadableListingResult -Journal $unreadableListingJournal -Code 'ADB_FAILED' -Message 'A post-extract listing that could not be read was reported as a rejected archive layout.'
+    Assert-Equal 0 @($unreadableListingState.Modules).Count 'A post-extract listing that could not be read still installed the Vector module.'
+    Assert-Equal 0 @($unreadableListingState.Files.Keys | Where-Object { [string]$_ -like '*vector-extract*' }).Count 'A post-extract listing that could not be read left its staging directory behind.'
+
     $partialScopeState = New-ConcealmentGuestState -Install $install
     $partialScopeState.Packages = @($script:ConcealmentRootPackages[0], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage, $script:ConcealmentSecondPackage)
     $partialScopeState.Files[$partialScopeState.ConfigPath] = (New-ConcealmentConfigText -Scope @{$script:ConcealmentSelectedPackage = 'Root'})
@@ -8676,8 +8724,10 @@ function Invoke-MenuTests {
         $unrootedReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses -NoKitsune -NoRootShell -NoVectorModule -NoPackageList))
         Assert-Equal 'Unverified' $unrootedReport.Guest.Root 'The report did not report an unverified root.'
         Assert-Equal '' $unrootedReport.Guest.Kitsune 'The report invented a Kitsune package version.'
-        Assert-Equal $false $unrootedReport.Guest.HmaInstalled 'The report invented an HMA package state.'
-        Assert-Equal $false $unrootedReport.Guest.VectorModuleInstalled 'The report invented a Vector module state.'
+        Assert-Equal $null $unrootedReport.Guest.HmaInstalled 'A package list the guest never answered was reported as an absent Hide My Applist package.'
+        # The guest answered the module probe with a refusal, and a refusal is the guest reporting the
+        # pinned module directory is not there.
+        Assert-Equal $false $unrootedReport.Guest.VectorModuleInstalled 'A guest that refused the Vector module probe was not reported as an absent module.'
         Assert-True (@($unrootedReport.Failures).Count -ge 1) 'The report did not record its unreadable guest sections.'
         Assert-Equal 'None' $unrootedReport.JournalState 'The report invented a journal state without a journal.'
         Assert-Equal 0 $unrootedReport.Mutated 'The unverified report claims a mutation.'
@@ -8696,6 +8746,30 @@ function Invoke-MenuTests {
         $unreadableModuleLines = @(Format-ToolkitReport -Report $unreadableModuleReport)
         Assert-True ((@($unreadableModuleLines) -join "`n") -match 'Guest\.VectorModuleInstalled = not-detected') "An unreadable Vector module probe did not print not-detected: $(@($unreadableModuleLines) -join ' ')"
         Assert-True (@($unreadableModuleReport.Failures).Count -ge 1) 'An unreadable Vector module probe did not record a failure.'
+
+        # The Hide My Applist presence field answers true, false, or not at all, because a package list
+        # the guest never answered is not a guest that reported the package absent.
+        $absentHmaResponses = Get-MenuGuestResponses
+        $absentHmaResponses['pm list packages'] = @(0, ('package:me.weishu.kernelsu' + [Environment]::NewLine + 'package:io.github.huskydg.magisk'))
+        $absentHmaReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $absentHmaResponses)
+        Assert-Equal $false $absentHmaReport.Guest.HmaInstalled 'A guest whose answered package list carries no Hide My Applist package was not reported as absent.'
+        Assert-True ((@(Format-ToolkitReport -Report $absentHmaReport) -join "`n") -match 'Guest\.HmaInstalled = False') 'A guest that answered without Hide My Applist did not print False.'
+        Assert-Equal 0 @($absentHmaReport.Failures).Count "An answered absence recorded a failure: $(@($absentHmaReport.Failures) -join '|')"
+
+        $unreadableHmaResponses = Get-MenuGuestResponses
+        $unreadableHmaResponses['pm list packages'] = @(-1, 'Process launch failed: the manager is busy')
+        $unreadableHmaReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $unreadableHmaResponses)
+        Assert-Equal $null $unreadableHmaReport.Guest.HmaInstalled 'A package list that could not be read was reported as an absent Hide My Applist package.'
+        Assert-True ((@(Format-ToolkitReport -Report $unreadableHmaReport) -join "`n") -match 'Guest\.HmaInstalled = not-detected') "An unreadable package list did not print not-detected: $(@(Format-ToolkitReport -Report $unreadableHmaReport) -join ' ')"
+        Assert-True ((@($unreadableHmaReport.Failures) -join '|') -match '(?i)package list') "An unreadable package list recorded no reason: $(@($unreadableHmaReport.Failures) -join '|')"
+
+        # A daemon query the guest never answered is an unread count, not a count of zero daemons.
+        $unreadableDaemonResponses = Get-MenuGuestResponses
+        $unreadableDaemonResponses['pidof magiskd'] = @(-1, 'Process launch failed: the manager is busy')
+        $unreadableDaemonReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $unreadableDaemonResponses)
+        Assert-Equal -1 $unreadableDaemonReport.Guest.DaemonCount 'A daemon query that could not be read reported zero root daemons.'
+        Assert-True ((@(Format-ToolkitReport -Report $unreadableDaemonReport) -join "`n") -match 'Guest\.DaemonCount = not-detected') "A failed daemon query did not print not-detected: $(@(Format-ToolkitReport -Report $unreadableDaemonReport) -join ' ')"
+        Assert-True ((@($unreadableDaemonReport.Failures) -join '|') -match '(?i)daemon') "A failed daemon query recorded no reason: $(@($unreadableDaemonReport.Failures) -join '|')"
 
         $unsupportedReport = Get-ToolkitReport -Install $unsupportedInstall.Install -Instance ([pscustomobject]@{ Index = 2; Install = $unsupportedInstall.Install }) -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
         Assert-Equal 'Unsupported' $unsupportedReport.Guest.Root 'The report probed an unsupported Android version.'
@@ -9096,7 +9170,7 @@ function Invoke-MenuTests {
         Assert-Equal 1 $childStateFiles.Count "A refused noninteractive action wrote state other than its log: $($childStateFiles -join '|')"
         Assert-True ($childStateFiles[0] -match '\.log$') "A refused noninteractive action wrote state other than its log: $($childStateFiles[0])"
 
-        $flowState = @{ Calls = @(); Confirmed = $null; Packages = @(); CloneIndex = -1; Fetches = @() }
+        $flowState = @{ Calls = @(); Confirmed = $null; Packages = @(); CloneIndex = -1; Fetches = @(); FetchModes = @(); AssetsVerified = $false }
         function Install-Android12Root {
             param([object]$Instance, [object]$Manifest, [object]$Journal, [bool]$Interactive = $false, [string]$Confirmation = '', [string]$CacheRoot = '', [scriptblock]$Runner = $null, [scriptblock]$Prompt = $null, [object]$ResumeClone = $null, [switch]$RequireCachedAsset)
             $flowState.Calls += 'Root12'
@@ -9286,7 +9360,16 @@ function Invoke-MenuTests {
         function Save-ToolkitManifestAsset {
             param([object]$Manifest, [string]$Id, [string]$CacheRoot = '', [scriptblock]$Fetch = $null, [switch]$RequireCached)
             $flowState.Fetches += $Id
+            # The cached-only flag is what tells an explicit acquisition apart from a cache-only install.
+            $flowState.FetchModes += [bool]$RequireCached
             return (Get-ToolkitResult -Status 'Success' -Message 'shadowed asset acquisition.' -Data ([pscustomobject]@{ Code = 'OK'; Asset = 'C:\assets\fixture' }))
+        }
+        function Get-VerifiedAsset {
+            param($Manifest, $Id, $CacheRoot)
+            if ($flowState.AssetsVerified) {
+                return (Get-ToolkitResult -Status 'Success' -Message 'Asset verified.' -Data 'C:\cache\fixture')
+            }
+            return (Get-ToolkitResult -Status 'CriticalError' -Message 'Asset is not available locally.')
         }
         $concealOrdered = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot $menuStateRoot
         Assert-Equal 'Success' $concealOrdered.Status "The concealment dispatch failed. $($concealOrdered.Message)"
@@ -9296,10 +9379,12 @@ function Invoke-MenuTests {
 
         $flowState.Calls = @()
         $flowState.Fetches = @()
+        $flowState.FetchModes = @()
         $concealFetching = Invoke-ToolkitAction -Action 'Conceal' -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Packages @('jp.pokemon.pokemontcgp') -StateRoot $menuStateRoot -FetchDependencies
         Assert-Equal 'Success' $concealFetching.Status "The fetching concealment dispatch failed. $($concealFetching.Message)"
         Assert-Equal 'ConcealDependencies|Conceal' ($flowState.Calls -join '|') 'The opt-in concealment run did not install its dependencies before the scope write.'
         Assert-Equal 'hma|vector' ($flowState.Fetches -join '|') 'The opt-in concealment run did not ask for both pinned dependencies first.'
+        Assert-Equal 0 @($flowState.FetchModes | Where-Object { $_ }).Count 'The opt-in concealment run did not reach the network for a dependency.'
 
         $flowState.Calls = @()
         $flowState.Fetches = @()
@@ -9333,6 +9418,33 @@ function Invoke-MenuTests {
         $declinedConsentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
         Assert-Equal 0 $declinedConsentCode 'The menu did not exit normally after a declined dependency consent.'
         Assert-Equal 0 $flowState.Fetches.Count 'A declined menu consent still reached the network for a dependency.'
+
+        # An explicit -FetchDependencies on the command line is the consent, so the menu must not ask a
+        # second question and then discard it.
+        $consentState.Questions = @()
+        $consentState.Answers = @('jp.pokemon.pokemontcgp')
+        $flowState.Calls = @()
+        $flowState.Fetches = @()
+        $flowState.FetchModes = @()
+        $flowState.AssetsVerified = $false
+        $commandLineConsentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -FetchDependencies -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        Assert-Equal 0 $commandLineConsentCode 'The menu did not exit normally after an explicit command line dependency opt-in.'
+        Assert-True ((@($consentState.Questions) -join '|') -notmatch 'FETCH') 'The menu asked for a dependency consent the command line already gave.'
+        Assert-Equal 'hma|vector' ($flowState.Fetches -join '|') 'The command line opt-in did not reach the pinned dependency acquisition.'
+        Assert-Equal 0 @($flowState.FetchModes | Where-Object { $_ }).Count 'The command line opt-in did not acquire the pinned dependencies instead of using the cache alone.'
+
+        # A cache that already holds both verified pinned assets needs no download, so the question is
+        # not worth asking and the answer cannot be required to finish the run.
+        $consentState.Questions = @()
+        $consentState.Answers = @('jp.pokemon.pokemontcgp')
+        $flowState.Calls = @()
+        $flowState.Fetches = @()
+        $flowState.FetchModes = @()
+        $flowState.AssetsVerified = $true
+        $hotCacheCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        Assert-Equal 0 $hotCacheCode 'The menu did not exit normally on a cache that needs no download.'
+        Assert-True ((@($consentState.Questions) -join '|') -notmatch 'FETCH') 'The menu asked for a download consent on a cache that needs no download.'
+        $flowState.AssetsVerified = $false
 
         Assert-True ($controllerSource -match "'FETCH'") 'The menu does not carry the explicit dependency consent word.'
         Assert-True ($controllerSource -match 'Type FETCH') 'The menu does not ask the operator for the dependency consent.'
@@ -9448,7 +9560,12 @@ if ($report.Mutated -ne $false) { throw 'The report claims a mutation.' }
 if (@($report.Install.Edition) -cne 'Global') { throw 'The report lost the installation.' }
 $guest = Get-ToolkitGuestState -ManagerPath '__MANAGER__' -InstanceIndex 2 -AndroidVersion '12.0'
 if ([string]::IsNullOrWhiteSpace([string]$guest.Failure)) { throw 'The guest state reported no reason for being unread.' }
-if ($guest.HmaInstalled -ne $false) { throw 'The guest state invented an HMA package state.' }
+if ($null -ne $guest.HmaInstalled) { throw 'The guest state invented an HMA package state.' }
+if ($null -ne $guest.VectorModuleInstalled) { throw 'The guest state invented a Vector module state.' }
+if ($guest.DaemonCount -ne -1) { throw 'The guest state invented a root daemon count.' }
+function Test-Android15Root { param($ManagerPath, $InstanceIndex, $Runner) return (Get-ToolkitResult -Status 'CriticalError' -Message 'the vendor root setting could not be read.' -Data ([pscustomobject]@{ Code = 'ROOT_SETTING_UNREADABLE' })) }
+$guest15 = Get-ToolkitGuestState -ManagerPath '__MANAGER__' -InstanceIndex 3 -AndroidVersion '15.0'
+if ($null -ne $guest15.RootPermission) { throw 'A vendor root setting that could not be read was reported as a disabled vendor root.' }
 $restorePoints = @(Get-ToolkitCampaignRestorePoints -StateRoot '__STATE__' -Install $install)
 if ($restorePoints.Count -ne 0) { throw 'An empty state root reported a restore point.' }
         $unassigned = Get-ToolkitSharedValue -Name 'ConcealmentHmaPackage' -Default 'absent'
@@ -10556,10 +10673,40 @@ function Invoke-DocsTests {
     Assert-True ($boundsSection.Value -match '(?i)UAC') 'The transport bounds section does not state the elevation bounds.'
     Assert-True ($boundsSection.Value -match '(?i)fail[s]? closed') 'The transport bounds section does not state that an unanswered prompt fails closed.'
     Assert-True ($boundsSection.Value -match '(?i)uncollected|discarded') 'The transport bounds section does not state what happens when captured output cannot be collected.'
+    # Whichever bound ends the wait is the one that is reported, so neither bound may be documented as
+    # the one that always ends it.
+    Assert-True ($boundsSection.Value -notmatch '(?i)secondary ceiling that the budget normally reaches first') 'The transport bounds section still claims the budget normally ends the boot poll before the attempt ceiling.'
+    Assert-True ($boundsSection.Value -match '(?i)attempt ceiling') 'The transport bounds section does not name the boot poll attempt ceiling.'
+    Assert-True ($boundsSection.Value -match '(?is)whichever\s+bound') 'The transport bounds section does not state that the first bound reached ends the boot poll.'
 
     Assert-True ($readme -match '(?i)Type FETCH|FETCH') 'README does not document the menu dependency consent word.'
-    Assert-True ($readme -match '(?is)collection.{0,300}?not-detected') 'README does not document that an unread collection is printed as not-detected.'
     Assert-True ($readme -match '(?is)collection.{0,200}?count.{0,120}?quoted\s+elements') 'README does not document how a collected report field is rendered.'
+
+    # README claims a field the guest never reported prints as not-detected, so the renderer is bound to
+    # that claim here instead of the claim being bound to the prose.
+    $unreadReportText = @(Format-ToolkitReport -Report ([pscustomobject]@{
+                Install          = [pscustomobject]@{ Edition = 'Global'; InstallRoot = 'C:\MuMu'; VmsPath = 'C:\MuMu\vms'; ManagerPath = 'C:\MuMu\shell\MuMuManager.exe'; Source = 'Fallback' }
+                ManagerVersion   = '6.8.0.0'
+                Instances        = @()
+                Guest            = [pscustomobject]@{ Root = 'Unverified'; Code = 'GUEST_UNREAD'; RootPermission = $null; Kitsune = ''; KernelSU = ''; DaemonCount = -1; HmaInstalled = $null; VectorModuleInstalled = $null; Failure = '' }
+                JournalState     = 'None'
+                JournalOperation = ''
+                JournalId        = ''
+                Failures         = @('the guest could not be read')
+                Mutated          = $false
+            })) -join "`n"
+    foreach ($unreadLine in @(
+            '  Guest.DaemonCount = not-detected'
+            '  Guest.HmaInstalled = not-detected'
+            '  Guest.VectorModuleInstalled = not-detected'
+            '  Concealment.InScope = not-detected'
+            '  Ads.RestorePoint = not-detected'
+            '  Instances: none'
+        )) {
+        Assert-True ($unreadReportText.Contains($unreadLine)) "The report did not render an unread field as not-detected: $unreadLine"
+    }
+    Assert-True ($unreadReportText -notmatch '(?m)^  Guest\.HmaInstalled = False$') 'An unread guest was rendered as an absent Hide My Applist package.'
+    Assert-True ($unreadReportText -notmatch '(?m)^  Guest\.DaemonCount = 0$') 'An unread daemon count was rendered as zero daemons.'
 
     Assert-True ($license -match 'MIT License') 'LICENSE is not the MIT license.'
     Assert-True ($license -match 'Permission is hereby granted, free of charge') 'LICENSE does not contain the MIT grant.'

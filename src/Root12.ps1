@@ -77,14 +77,21 @@ function New-Android12Recovery {
         RootVerified = $false
         VersionName = ''
         VersionCode = ''
-        DaemonCount = 0
+        # The recovery record starts unread, so a step that never reached the daemon query cannot report a
+        # measured count of zero.
+        DaemonCount = -1
         DaemonSamples = 0
     }
     if ($null -ne $Checks) {
         $record.RootVerified = [bool](Get-Android12RecordField -Record $Checks -Name 'RootVerified')
         $record.VersionName = [string](Get-Android12RecordField -Record $Checks -Name 'VersionName')
         $record.VersionCode = [string](Get-Android12RecordField -Record $Checks -Name 'VersionCode')
-        $record.DaemonCount = [int](Get-Android12RecordField -Record $Checks -Name 'DaemonCount')
+        # A checks record that carries no count leaves the recovery record unread, so no step can report
+        # a measured zero daemons it never measured.
+        $recordDaemonCount = Get-Android12RecordField -Record $Checks -Name 'DaemonCount'
+        if ($null -ne $recordDaemonCount -and [int]$recordDaemonCount -ge 0) {
+            $record.DaemonCount = [int]$recordDaemonCount
+        }
         $record.DaemonSamples = [int](Get-Android12RecordField -Record $Checks -Name 'DaemonSamples')
     }
     return $record
@@ -270,7 +277,8 @@ function Test-Android12Root {
 
     $packageCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command ('shell dumpsys package ' + $script:ToolkitKitsunePackageName) -Runner $Runner
     if ($null -eq $packageCall -or $packageCall.ExitCode -ne 0) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune package query failed.' -Data (@{ Code = 'ADB_FAILED' })
+        # The daemon query never ran, so its count is unread rather than a measured zero.
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune package query failed.' -Data (@{ Code = 'ADB_FAILED'; DaemonCount = -1 })
     }
     $packageFields = Get-ToolkitPackageVersion -Text ([string]$packageCall.Text) -PackageName $script:ToolkitKitsunePackageName
     if ($null -eq $packageFields) {
@@ -279,7 +287,7 @@ function Test-Android12Root {
                 PackageName = $script:ToolkitKitsunePackageName
                 VersionName = ''
                 VersionCode = ''
-                DaemonCount = 0
+                DaemonCount = -1
                 RootVerified = $false
             }
     }
@@ -291,7 +299,7 @@ function Test-Android12Root {
                 PackageName = $script:ToolkitKitsunePackageName
                 VersionName = $versionName
                 VersionCode = $versionCode
-                DaemonCount = 0
+                DaemonCount = -1
                 RootVerified = $false
             })
     }
@@ -356,7 +364,8 @@ function Test-Android12Root {
             })
     }
     else {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED'; DaemonSamples = $daemonSamples })
+        # The daemon query never produced a count, so the field is unread rather than a measured zero.
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED'; DaemonCount = -1; DaemonSamples = $daemonSamples })
     }
 
     $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
@@ -604,8 +613,9 @@ function Install-Android12Root {
     if ($null -eq $preInstallLaunch -or $preInstallLaunch.ExitCode -ne 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not accept the launch request that precedes the APK install, so the verified APK was not installed. The temporary vendor root was left enabled.' -Data (New-Android12Recovery -Code 'PREINSTALL_LAUNCH_FAILED' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
-    if (-not (Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner)) {
-        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 before the APK install after $($script:ToolkitBootPollAttempts) checks, so the verified APK was not installed. The temporary vendor root was left enabled." -Data (New-Android12Recovery -Code 'PREINSTALL_BOOT_TIMEOUT' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    $bootWait = Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner
+    if ([string]$bootWait.Code -cne 'BOOTED') {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 before $($bootWait.Bound) ended the wait, so the verified APK was not installed. The temporary vendor root was left enabled." -Data (New-Android12Recovery -Code 'PREINSTALL_BOOT_TIMEOUT' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The clone was launched and reported sys.boot_completed=1 before the APK install, because the MuMu manager rejects ADB on a stopped instance.' -Data (New-Android12Recovery -Code 'OK' -Step 'preinstall-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
@@ -670,8 +680,9 @@ function Install-Android12Root {
     if ($null -eq $launch -or $launch.ExitCode -ne 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not accept the cold-boot launch request.' -Data (New-Android12Recovery -Code 'BOOT_CONTROL_FAILED' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
-    if (-not (Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner)) {
-        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 after $($script:ToolkitBootPollAttempts) checks. The Kitsune root state is unknown and the vendor root was left enabled." -Data (New-Android12Recovery -Code 'BOOT_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    $coldBootWait = Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner
+    if ([string]$coldBootWait.Code -cne 'BOOTED') {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 before $($coldBootWait.Bound) ended the wait. The Kitsune root state is unknown and the vendor root was left enabled." -Data (New-Android12Recovery -Code 'BOOT_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
     $checks = Test-Android12Root -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner

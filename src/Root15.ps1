@@ -20,7 +20,9 @@ function New-Android15RootState {
         SourceIndex = $SourceIndex
         CloneIndex = $CloneIndex
         CloneName = $CloneName
-        RootPermission = $false
+        # The vendor root setting is unread until a read answers for this instance, so a failed read
+        # cannot be reported as a disabled vendor root.
+        RootPermission = $null
         KernelSU = $false
         RootShell = $false
         KitsuneAbsent = $false
@@ -53,7 +55,8 @@ function Test-Android15Root {
         return Get-ToolkitResult -Status 'CriticalError' -Message ('The Android 15 vendor root setting could not be read. ' + $rootSetting.Message) -Data (New-Android15RootState -Code 'ROOT_SETTING_UNREADABLE')
     }
     if ($rootSetting.Data.Value -ne $true) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Android 15 instance does not report the enabled built-in root.' -Data (New-Android15RootState -Code 'ROOT_NOT_ENABLED')
+        # The read answered for this instance, so a disabled vendor root is a claim the manager made.
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The Android 15 instance does not report the enabled built-in root.' -Data (New-Android15RootState -Code 'ROOT_NOT_ENABLED' -Fields @{ RootPermission = $false })
     }
     $fields = @{ RootPermission = $true }
 
@@ -226,7 +229,7 @@ function Enable-Android15Root {
             return New-ToolkitRootFailure -Journal $Journal -Message ('The clone did not report a readable vendor root setting after the change. ' + $enabledSetting.Message) -Data (New-Android15RootState -Code 'ROOT_SETTING_UNREADABLE' -Step 'root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
         }
         if ($enabledSetting.Data.Value -ne $true) {
-            return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not report the enabled built-in root after the change.' -Data (New-Android15RootState -Code 'ROOT_NOT_ENABLED' -Step 'root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+            return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not report the enabled built-in root after the change.' -Data (New-Android15RootState -Code 'ROOT_NOT_ENABLED' -Step 'root-enable' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName -Fields @{ RootPermission = $false })
         }
     }
     try {
@@ -246,8 +249,9 @@ function Enable-Android15Root {
     catch {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The cold boot could not be journaled.' -Data (New-Android15RootState -Code 'JOURNAL_WRITE_FAILED' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
-    if (-not (Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner)) {
-        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 after $($script:ToolkitBootPollAttempts) checks, so the Android 15 root state is unknown. The built-in root was left enabled on the clone." -Data (New-Android15RootState -Code 'BOOT_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    $bootWait = Wait-ToolkitBootCompleted -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner
+    if ([string]$bootWait.Code -cne 'BOOTED') {
+        return New-ToolkitRootFailure -Journal $Journal -Message "The clone did not report sys.boot_completed=1 before $($bootWait.Bound) ended the wait, so the Android 15 root state is unknown. The built-in root was left enabled on the clone." -Data (New-Android15RootState -Code 'BOOT_TIMEOUT' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
     $checks = Test-Android15Root -ManagerPath $manager -InstanceIndex $cloneIndex -Runner $Runner

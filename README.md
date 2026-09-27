@@ -135,7 +135,7 @@ this sample were composed for illustration; see Limitations for what was actuall
   Guest.RootPermission = not-detected
   Guest.Kitsune = none
   Guest.KernelSU = none
-  Guest.DaemonCount = 0
+  Guest.DaemonCount = not-detected
   Guest.HmaInstalled = True
   Guest.VectorModuleInstalled = not-detected
   Ads.RestorePoint = Missing
@@ -166,11 +166,14 @@ verified clone backup, the concealment scope observed on that clone, the last jo
 every failure it collected. A value the manager or the guest did not report is printed as
 `not-detected`, and a value that is present but empty is printed as `none`, so a field is never
 silently dropped. A field that carries a collection is printed as its count followed by its quoted
-elements, `1: "a.b"`, so two package names can never be read as one odd package name; an empty
-collection is printed as `none`, and a collection that could not be read at all is printed as
-`not-detected`, which is how a guest probe that failed to answer is distinguished from a guest that
-answered "absent". A clean instance prints `Failures: none` after the same field list, so an empty
-failure list is stated rather than implied.
+elements, `1: "a.b"`, so two package names can never be read as one odd package name, an empty
+collection is printed as `none`, and a collection the report could not read at all, such as
+`Concealment.InScope` on a report with no concealment evidence, is printed as `not-detected`. The
+guest root daemon count and the Hide My Applist and Vector module states are tri-state on purpose: a
+probe the guest never answered prints `not-detected` and is recorded in `Failures`, which is how a
+probe that failed to answer is distinguished from a guest that answered "absent". A clean instance
+prints `Failures: none` after the same field list, so an empty failure list is stated rather than
+implied.
 
 A concealment evidence that is not a verified scope is recorded in `Failures` with its code, so the
 status is never quieter than the report: a concealment warning makes `Verify` a `Warning`, and a
@@ -379,10 +382,12 @@ Run-MumuToolkit.bat -Action Conceal -FetchDependencies -Packages com.example.app
 ```
 
 The menu asks the same question with the same explicit consent, so a cold cache is reachable without
-leaving the menu. Any other answer downloads nothing. Without that consent the run uses the already
-verified per-user cache and fails closed with `ASSET_VERIFICATION_FAILED`, and that failure names
-both remedies. An elevated retry never fetches: the toolkit downloads nothing after rights are
-raised.
+leaving the menu. Any other answer downloads nothing. The question is asked only when a download is
+actually missing, so a cache that already holds both verified pinned assets is used without a prompt,
+and an explicit `-FetchDependencies` on the command line is honored instead of being asked about
+again. Without that consent the run uses the already verified per-user cache and fails closed with
+`ASSET_VERIFICATION_FAILED`, and that failure names both remedies. An elevated retry never fetches: the
+toolkit downloads nothing after rights are raised.
 
 **Concealment is unqualified on this host, for two independent reasons, and both are visible in the
 `Verify` report.** The pinned Vector module was **not** installed: the live dependency step on clone 4
@@ -490,22 +495,28 @@ mutation up to about 2 minutes.
 
 A boot poll is not multiplied by the retry. The poll is its own retry, so its probe runs once per
 attempt and the whole poll stops at a 10 minute wall-clock budget, which puts one cold boot at **12
-minutes** in the worst case: the budget plus the one in-flight 120 second process bound. The 30
-attempt limit is a secondary ceiling that the budget normally reaches first.
+minutes** in the worst case: the budget plus the one in-flight 120 second process bound. Whichever
+bound is reached first ends the wait, and that is the bound the timeout message names: with fast
+answers the 30 attempt ceiling ends the poll, and the budget ends it only when a probe is slow enough
+to eat into it.
 
 The elevated relaunch is the one process a person can hold open, because Windows shows the UAC
 consent dialog and waits for a human, so it carries its own two bounds and is documented separately
-from the 120 second funnel. The prompt has to be answered within 120 seconds, and the elevated child
-runs one whole action and is bounded at 60 minutes, which is above the worst case of the longest
-elevated action. An unanswered or expired prompt fails closed: the action reports a `CriticalError`
-that names the bound, no elevated child is claimed, and nothing is retried here.
+from the 120 second funnel. The consent is bounded by a 120 second timeout rather than by a proven
+120 second wall clock: the toolkit stops waiting at that point, and it cannot say when Windows closes
+a dialog nobody answered. The elevated child that does run runs one whole action and is bounded at 60
+minutes, which is above the worst case of the longest elevated action. An unanswered or expired prompt
+fails closed: the action reports a `CriticalError` that names the bound, no elevated child is claimed,
+and nothing is retried here. A consent answered in the instant the timeout expires can still create a
+child; that child is waited on and terminated, and the run still fails closed without claiming an
+outcome for it.
 
 | Process | Bound |
 | --- | --- |
 | MuMu manager, guest ADB, and every other tool child | 120 seconds, then terminated |
 | one read-only call with its retry | about 6 minutes |
 | one boot poll | 12 minutes (10 minute budget plus one 120 second call) |
-| UAC prompt | 120 seconds, then failed closed |
+| UAC prompt | 120 second timeout, then failed closed; a child created by a late consent is terminated |
 | elevated child action | 60 minutes, then terminated and failed closed |
 
 ## Noninteractive exit codes

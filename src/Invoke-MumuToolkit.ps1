@@ -961,6 +961,27 @@ function Invoke-MenuLoop {
     }
 }
 
+# The menu asks for the download consent only when a download is actually missing, so a hot cache asks
+# nothing. Verification is read-only: it hashes the cached files and never reaches the network.
+function Test-ToolkitConcealmentCacheHot {
+    $cacheRoot = ''
+    $manifest = $null
+    try {
+        $cacheRoot = Get-ToolkitAssetCacheRoot
+        $manifest = Get-ToolkitManifest -Path (Join-Path $PSScriptRoot 'Manifest.json')
+    }
+    catch {
+        return $false
+    }
+    foreach ($assetId in @($script:ConcealmentDependencyAssetIds)) {
+        $verified = Get-VerifiedAsset -Manifest $manifest -Id $assetId -CacheRoot $cacheRoot
+        if ([string]$verified.Status -cne 'Success') {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Start-ToolkitController {
     param(
         [string]$Action = '',
@@ -1034,16 +1055,20 @@ function Start-ToolkitController {
             param($Choice)
 
             $selectedPackages = @($Packages)
+            # An explicit -FetchDependencies is the consent, and a cache that already holds both verified
+            # pinned assets needs no download, so the question is asked only when it can change the run.
             $fetchDependencies = $FetchDependencies
             if ($Choice -ceq 'Conceal') {
                 if ($selectedPackages.Count -eq 0) {
                     $answer = [string](& $ask 'Comma-separated application package names for the Root template')
                     $selectedPackages = @($answer -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                 }
-                # The consent is asked for exactly as the command line asks for it, so a cold cache is
-                # reachable from the menu and a declining answer still downloads nothing.
-                $consent = [string](& $ask ('Type ' + $consentWord + ' to download the pinned concealment dependencies into the per-user cache now'))
-                $fetchDependencies = $consent.Trim() -ceq $consentWord
+                if (-not $fetchDependencies -and -not (Test-ToolkitConcealmentCacheHot)) {
+                    # The consent is asked for exactly as the command line asks for it, so a cold cache is
+                    # reachable from the menu and a declining answer still downloads nothing.
+                    $consent = [string](& $ask ('Type ' + $consentWord + ' to download the pinned concealment dependencies into the per-user cache now'))
+                    $fetchDependencies = $consent.Trim() -ceq $consentWord
+                }
             }
             $confirmed = $Confirmed
             if ($Choice -ceq 'Root15' -and -not $confirmed) {
@@ -1065,7 +1090,7 @@ function Start-ToolkitController {
         & $write 'Detect and Verify change nothing.'
         & $write 'Target identifies the instance to work on, or creates or clones one. Identify changes nothing; Create and Clone ask for CONFIRM first and are the only ways this toolkit adds an instance.'
         & $write 'Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone. Conceal changes only the verified clone.'
-        & $write 'Conceal asks whether to download its pinned Hide My Applist and Vector dependencies. Type FETCH to allow that download now; any other answer downloads nothing.'
+        & $write 'Conceal asks whether to download its pinned Hide My Applist and Vector dependencies when the per-user cache does not already hold them. Type FETCH to allow that download now; any other answer downloads nothing.'
         & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
         & $write 'A mutating action that is denied the rights it needs asks for administrator rights once, in its own window, and fails closed if that is declined or the prompt is not answered in time. Detect and Verify never ask.'
         foreach ($entry in @(Get-ToolkitActionCatalog)) {
