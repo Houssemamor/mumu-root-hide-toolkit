@@ -10918,6 +10918,12 @@ catch {
             Write-Output ("  {0}" -f $frame.Trim())
         }
     }
+    if (-not [string]::IsNullOrWhiteSpace([string]$env:GITHUB_ACTIONS)) {
+        # A log line is only readable with a token, while a workflow command becomes a check annotation
+        # that is readable without one, so a failed run states its own cause on the run summary.
+        $annotation = ([string]$_.Exception.Message) -replace '%', '%25' -replace ':', '%3A' -replace "`r", ' ' -replace "`n", ' '
+        [Console]::Error.WriteLine("::error title=Suite $($script:CurrentTestSuite) failed::$annotation")
+    }
     $exitCode = 1
 }
 finally {
