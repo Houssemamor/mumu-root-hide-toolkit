@@ -521,6 +521,13 @@ function Install-Android12Root {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The selected instance VMS path is unavailable.' -Data (@{ Code = 'INSTANCE_INVALID' })
     }
 
+    # The confirmation gate is placed before the dependency work on purpose. A run that stops for a
+    # missing confirmation has not been authorized yet, so it must not reach the network or write to the
+    # per-user asset cache, and it must not be the run that fails because a download could not happen.
+    if (-not $Interactive) {
+        return New-ToolkitRootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: The Kitsune install into the system partition must be confirmed by the operator, and only ' + $script:ToolkitKitsunePrompt + ' is accepted. No instance was changed and the dependency cache was not touched.') -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
+    }
+
     $asset = Prepare-Android12Asset -Manifest $Manifest -CacheRoot $CacheRoot -RequireCached:$RequireCachedAsset
     if ($asset.Status -ne 'Success') {
         return New-ToolkitRootFailure -Journal $Journal -Message $asset.Message -Data $asset.Data
@@ -531,14 +538,10 @@ function Install-Android12Root {
     }
     $apkInstallCommand = [string]$installCommand.Data
     try {
-        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The pinned Kitsune asset was verified by size and SHA-256 before any instance change.' -Data (@{ Asset = [string]$asset.Data })
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message 'The pinned Kitsune asset was verified by size and SHA-256 after the operator confirmation and before any instance change.' -Data (@{ Asset = [string]$asset.Data })
     }
     catch {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Kitsune asset could not be journaled.' -Data (@{ Code = 'JOURNAL_WRITE_FAILED' })
-    }
-
-    if (-not $Interactive) {
-        return New-ToolkitRootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: The Kitsune install into the system partition must be confirmed by the operator, and only ' + $script:ToolkitKitsunePrompt + ' is accepted. No instance was changed.') -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
     }
 
     $cloneIndex = -1

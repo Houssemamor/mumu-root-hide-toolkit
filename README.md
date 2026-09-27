@@ -138,12 +138,12 @@ confirmation in the menu, and the menu never closes itself when an action fails.
 | `RemoveAds` | MuMu campaign display flags inside the selected installation | `Run-MumuToolkit.bat -Action RemoveAds -NonInteractive` |
 | `Restore` | the MuMu campaign files, from the toolkit restore point | `Run-MumuToolkit.bat -Action Restore -NonInteractive` |
 
-`Root12` is menu-only. A noninteractive run resolves the installation and the instance, verifies the
-pinned Kitsune artifact, and then returns `USER_CONFIRMATION_REQUIRED` without creating a clone and
-without changing anything in MuMu, because the exact Kitsune choice must be confirmed by a person
-and the noninteractive dispatcher carries no confirmation token. It may still have placed the
-verified artifact in the local cache, as described under [Pinned versions](#pinned-versions). There
-is no one-command Android 12 root automation; use the menu for that action.
+`Root12` is menu-only. A noninteractive run resolves the installation and the instance and then
+returns `USER_CONFIRMATION_REQUIRED` without creating a clone, without changing anything in MuMu, and
+without reaching the network or the dependency cache, because the exact Kitsune choice must be
+confirmed by a person and the noninteractive dispatcher carries no confirmation token. The pinned
+artifact is verified only once that confirmation exists. There is no one-command Android 12 root
+automation; use the menu for that action.
 
 `Conceal` needs a verified clone record from a completed `Root12` or `Root15` run for the same
 instance, so a noninteractive `Conceal` follows either a menu `Root12` run or a noninteractive
@@ -201,11 +201,10 @@ before your first root run:
 - `Conceal` asks first. It only fetches when you pass `-FetchDependencies`, or when you type `FETCH`
   at the menu, and its install step is cached-only, so an elevated retry can never reach the network.
 - `Root12` fetches the pinned Kitsune artifact itself when the per-user cache does not already hold
-  a verified copy, and it does not stop to ask. It does this as one of its first steps, which means
-  even a `Root12` run that then refuses for a missing confirmation has already placed the verified
-  file in `%LOCALAPPDATA%\mumu-root-hide-toolkit\assets`. "Changed nothing" in this document always
-  means changed nothing in MuMu; the local cache may still have been filled. To pre-place the file
-  yourself, put the pinned asset in the cache directory under its `id` before running `Root12`.
+  a verified copy, and it does not stop to ask. It does that only after the operator has confirmed
+  the workflow, so a run that is refused for a missing confirmation reaches neither the network nor
+  the cache. To pre-place the file yourself, put the pinned asset in the cache directory under its
+  `id` before running `Root12`.
 
 ## How the safety rules work
 

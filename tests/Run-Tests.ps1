@@ -4765,6 +4765,25 @@ function Invoke-Root12Tests {
         Assert-True ($nonInteractiveCase.Result.Message -match 'USER_CONFIRMATION_REQUIRED') 'The non-interactive failure did not report USER_CONFIRMATION_REQUIRED.'
         Assert-Equal 0 @($nonInteractiveState.Calls).Count 'A non-interactive request mutated the instance.'
 
+        # A run that stops for a missing confirmation must not touch the dependency cache, because the
+        # operator never agreed to the work that the cached artifact exists for.
+        $emptyCacheRoot = Join-Path $root12Root 'empty asset cache'
+        $coldCacheState = New-Root12ManagerState -Install $install
+        $coldCacheCase = Invoke-Root12Case -State $coldCacheState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $emptyCacheRoot -Interactive $false -RequireCachedAsset
+        Assert-Root12Failure -Result $coldCacheCase.Result -Journal $coldCacheCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A non-interactive request reached the dependency cache before the confirmation gate.'
+        Assert-Equal 0 @($coldCacheState.Calls).Count 'A non-interactive request mutated the instance before the confirmation gate.'
+        $coldCacheFiles = @()
+        if (Test-Path -LiteralPath $emptyCacheRoot) {
+            $coldCacheFiles = @(Get-ChildItem -LiteralPath $emptyCacheRoot -Recurse -File -Force -ErrorAction SilentlyContinue)
+        }
+        Assert-Equal 0 $coldCacheFiles.Count 'A refused non-interactive request wrote to the dependency cache.'
+
+        $coldCacheInteractiveState = New-Root12ManagerState -Install $install
+        $coldCacheInteractiveCase = Invoke-Root12Case -State $coldCacheInteractiveState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $emptyCacheRoot -Interactive $true -RequireCachedAsset
+        Assert-Root12Failure -Result $coldCacheInteractiveCase.Result -Journal $coldCacheInteractiveCase.Journal -Code 'ASSET_VERIFICATION_FAILED' -Message 'A confirmed request skipped the pinned asset verification.'
+
         $decliningState = New-Root12ManagerState -Install $install
         $decliningCase = Invoke-Root12Case -State $decliningState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { 'no' }
