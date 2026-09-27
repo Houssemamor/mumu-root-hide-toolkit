@@ -10477,11 +10477,12 @@ function Invoke-DocsTests {
         Assert-True (Test-Path -LiteralPath $requiredPath -PathType Leaf) "A required documentation or publishing file is missing: $requiredPath"
     }
 
-    $readme = Get-Content -LiteralPath $readmePath -Raw
-    $notice = Get-Content -LiteralPath $noticePath -Raw
-    $license = Get-Content -LiteralPath $licensePath -Raw
-    $workflow = Get-Content -LiteralPath $workflowPath -Raw
-    $gitignore = Get-Content -LiteralPath $gitignorePath -Raw
+    # Line endings are normalized because the documentation assertions below anchor on line starts and ends, and a CRLF checkout on Windows leaves a carriage return before the newline that defeats those anchors.
+    $readme = (Get-Content -LiteralPath $readmePath -Raw) -replace "`r`n", "`n"
+    $notice = (Get-Content -LiteralPath $noticePath -Raw) -replace "`r`n", "`n"
+    $license = (Get-Content -LiteralPath $licensePath -Raw) -replace "`r`n", "`n"
+    $workflow = (Get-Content -LiteralPath $workflowPath -Raw) -replace "`r`n", "`n"
+    $gitignore = (Get-Content -LiteralPath $gitignorePath -Raw) -replace "`r`n", "`n"
 
     # The upstream release pages are derived from the pinned manifest so the documentation cannot drift from the pins.
     $manifest = Get-ToolkitManifest -Path $manifestPath
