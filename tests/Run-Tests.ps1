@@ -10822,10 +10822,24 @@ function Invoke-CommonTests {
     Assert-True ($logPath.StartsWith($logRoot, [StringComparison]::OrdinalIgnoreCase)) 'Log path is outside the per-user log directory.'
 }
 
+# Each suite announces itself before it runs, so a failure names the suite that broke and the log shows
+# how far the run got. The name is also what the failure report carries.
+function Invoke-TestSuite {
+    param(
+        [string]$Name,
+        [scriptblock]$Body
+    )
+
+    $script:CurrentTestSuite = $Name
+    Write-Output "RUN  ${Name}"
+    & $Body
+}
+
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('mumu-toolkit-tests-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 $originalTestAppData = $env:APPDATA
 $exitCode = 0
+$script:CurrentTestSuite = $Suite
 try {
     switch ($Suite) {
         'Manifest' {
@@ -10875,28 +10889,35 @@ try {
             Invoke-DocsTests
         }
         'All' {
-            Invoke-ManifestTests
-            Invoke-AssetTests
-            Invoke-ResultTests
-            Invoke-ProcessTests
-            Invoke-JournalTests
-            Invoke-DiscoveryTests
-            Invoke-SafetyTests
-            Invoke-TransportTests
-            Invoke-AdsTests
-            Invoke-VerificationTests
-            Invoke-ConcealmentTests
-            Invoke-TargetTests
-            Invoke-Root12Tests
-            Invoke-Root15Tests
-            Invoke-MenuTests
-            Invoke-DocsTests
-            Invoke-CommonTests
+            Invoke-TestSuite 'Manifest' { Invoke-ManifestTests }
+            Invoke-TestSuite 'Asset' { Invoke-AssetTests }
+            Invoke-TestSuite 'Result' { Invoke-ResultTests }
+            Invoke-TestSuite 'Process' { Invoke-ProcessTests }
+            Invoke-TestSuite 'Journal' { Invoke-JournalTests }
+            Invoke-TestSuite 'Discovery' { Invoke-DiscoveryTests }
+            Invoke-TestSuite 'Safety' { Invoke-SafetyTests }
+            Invoke-TestSuite 'Transport' { Invoke-TransportTests }
+            Invoke-TestSuite 'Ads' { Invoke-AdsTests }
+            Invoke-TestSuite 'Verification' { Invoke-VerificationTests }
+            Invoke-TestSuite 'Concealment' { Invoke-ConcealmentTests }
+            Invoke-TestSuite 'Target' { Invoke-TargetTests }
+            Invoke-TestSuite 'Root12' { Invoke-Root12Tests }
+            Invoke-TestSuite 'Root15' { Invoke-Root15Tests }
+            Invoke-TestSuite 'Menu' { Invoke-MenuTests }
+            Invoke-TestSuite 'Docs' { Invoke-DocsTests }
+            Invoke-TestSuite 'Common' { Invoke-CommonTests }
         }
     }
 }
 catch {
-    Write-Output "FAIL ${Suite}: $($_.Exception.Message)"
+    # The suite name, the assertion message, and the line are all reported because a CI log that only
+    # says a run failed costs a whole build cycle to diagnose.
+    Write-Output ("FAIL {0}: {1}" -f $script:CurrentTestSuite, $_.Exception.Message)
+    foreach ($frame in @([string]$_.ScriptStackTrace -split "`n")) {
+        if (-not [string]::IsNullOrWhiteSpace($frame)) {
+            Write-Output ("  {0}" -f $frame.Trim())
+        }
+    }
     $exitCode = 1
 }
 finally {
