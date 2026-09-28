@@ -28,6 +28,21 @@ $script:ToolkitActionDescriptions = @{
     Restore   = 'Restore the MuMu campaign files from the toolkit restore point.'
     Q         = 'Quit the toolkit.'
 }
+$script:ToolkitActionGroups = @{
+    Detect    = 'Inspect'
+    Verify    = 'Inspect'
+    Target    = 'Prepare'
+    Root12    = 'Change'
+    Root15    = 'Change'
+    Conceal   = 'Change'
+    RemoveAds = 'Change'
+    Restore   = 'Change'
+    Q         = 'Exit'
+}
+$script:ToolkitMenuTitle = 'MuMu Root Hide Toolkit'
+# The menu is rewritten before every prompt so it never scrolls out of reach, which is why it is a
+# numbered legend rather than the full description. The descriptions live in the README.
+$script:ToolkitMenuSummary = 'Detect and Verify change nothing. Everything else works on a verified clone and needs an explicit confirmation. Administrator rights are asked for only if an action is denied them.'
 $script:ToolkitRegistryRoots = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -88,6 +103,36 @@ function Resolve-ToolkitMenuChoice {
         return ($entries | Where-Object { [int]$_.Number -eq $number } | Select-Object -First 1)
     }
     return ($entries | Where-Object { [string]$_.Name -ceq $choice } | Select-Object -First 1)
+}
+
+# The menu is grouped the way the actions relate to each other, and the groups are emitted in the order
+# the catalog lists them so the grouping follows the numbering without a second ordering to maintain.
+function Format-ToolkitMenuBanner {
+    $title = [string]$script:ToolkitMenuTitle
+    # Each element is parenthesized because a comma binds tighter than + here, and an unparenthesized
+    # pair would be joined into a single line by the string addition.
+    $lines = @(('  ' + $title), ('  ' + ('-' * $title.Length)))
+    $currentGroup = ''
+    $row = ''
+    foreach ($entry in @(Get-ToolkitActionCatalog)) {
+        $group = [string]$script:ToolkitActionGroups[[string]$entry.Name]
+        if ([string]::IsNullOrWhiteSpace($group)) {
+            $group = 'Other'
+        }
+        if ($group -cne $currentGroup) {
+            if (-not [string]::IsNullOrWhiteSpace($row)) {
+                $lines += $row.TrimEnd()
+            }
+            $row = '  ' + $group.PadRight(8)
+            $currentGroup = $group
+        }
+        $row += '  ' + ([string]$entry.Number) + ' ' + ([string]$entry.Name).PadRight(9)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($row)) {
+        $lines += $row.TrimEnd()
+    }
+    $lines += '  ' + $script:ToolkitMenuSummary
+    return $lines
 }
 
 function Get-ToolkitDiscoverySources {
@@ -164,7 +209,9 @@ function Get-ToolkitMenuChoice {
     }
     $answer = ''
     try {
-        $answer = [string](& $Prompt ($Label + ' (1-' + $Count + '): '))
+        # Read-Host appends its own colon to the prompt, so the label must not carry one or the operator
+        # sees a doubled colon.
+        $answer = [string](& $Prompt ($Label + ' (1-' + $Count + ')'))
     }
     catch {
         return $null
@@ -805,11 +852,75 @@ function Format-ToolkitReport {
 }
 
 function Format-ToolkitResult {
-    param([object]$Result)
+    param(
+        [object]$Result,
+        [switch]$Interactive
+    )
 
     $lines = @('[' + [string]$Result.Status + '] ' + [string]$Result.Message)
     $data = $Result.Data
-    if ($null -ne $data -and $data -is [Collections.IDictionary]) {
+    # A person reads a discovery as a summary and the instance it settled on, while a script reads the
+    # field form, so the two renderers differ and the field form is left exactly as it was for the
+    # noninteractive path.
+    $isDiscovery = $Interactive -and $null -ne $data -and $data -is [Collections.IDictionary] -and
+        $data.Contains('Edition') -and $data.Contains('InstanceIndex')
+    $isInstanceList = $Interactive -and $null -ne $data -and $data -is [Collections.IDictionary] -and
+        $data.Contains('Instances')
+    if ($isDiscovery) {
+        # A boolean reads as yes or no for a person; the machine renderer keeps True and False.
+        $humanFlag = {
+            param($Value)
+            $flag = Get-ToolkitRecordValue -Record $data -PropertyNames @($Value)
+            if ($flag -is [bool]) {
+                if ($flag) { 'yes' } else { 'no' }
+            }
+            else {
+                [string]$flag
+            }
+        }
+        $edition = [string](Get-ToolkitRecordValue -Record $data -PropertyNames @('Edition'))
+        $installRoot = [string](Get-ToolkitRecordValue -Record $data -PropertyNames @('InstallRoot'))
+        $summary = '  Installation'
+        if (-not [string]::IsNullOrWhiteSpace($edition)) {
+            $summary += ': ' + $edition
+        }
+        if (-not [string]::IsNullOrWhiteSpace($installRoot)) {
+            $summary += '  ' + $installRoot
+        }
+        $lines += $summary
+        $lines += ('  Selected: ' + [string](Get-ToolkitRecordValue -Record $data -PropertyNames @('InstanceIndex')) +
+            ' | ' + [string](Get-ToolkitRecordValue -Record $data -PropertyNames @('InstanceName')) +
+            ' | Android ' + [string](Get-ToolkitRecordValue -Record $data -PropertyNames @('AndroidVersion')) +
+            ' | Running ' + (& $humanFlag 'Running') +
+            ' | Vendor root ' + (& $humanFlag 'RootSetting'))
+        $log = Get-ToolkitRecordValue -Record $data -PropertyNames @('Log')
+        if (-not [string]::IsNullOrWhiteSpace([string]$log)) {
+            $lines += ('  Log: ' + [string]$log)
+        }
+    }
+    elseif ($isInstanceList) {
+        $edition = [string](Get-ToolkitRecordValue -Record $data -PropertyNames @('Edition'))
+        $installRoot = [string](Get-ToolkitRecordValue -Record $data -PropertyNames @('InstallRoot'))
+        $count = @($data['Instances']).Count
+        if (-not [string]::IsNullOrWhiteSpace($edition) -or -not [string]::IsNullOrWhiteSpace($installRoot)) {
+            $summary = '  Installation'
+            if (-not [string]::IsNullOrWhiteSpace($edition)) {
+                $summary += ': ' + $edition
+            }
+            if (-not [string]::IsNullOrWhiteSpace($installRoot)) {
+                $summary += '  ' + $installRoot
+            }
+            $summary += '  (' + [string]$count + ' instance(s))'
+            $lines += $summary
+        }
+        $lines += '  Instances:'
+        $lines += @(Format-ToolkitInstanceChoices -Choices $data['Instances'])
+        $log = Get-ToolkitRecordValue -Record $data -PropertyNames @('Log')
+        if (-not [string]::IsNullOrWhiteSpace([string]$log)) {
+            $lines += ('  Log: ' + [string]$log)
+        }
+    }
+    elseif ($null -ne $data -and $data -is [Collections.IDictionary]) {
         foreach ($key in @($data.Keys | Sort-Object)) {
             if ([string]$key -ceq 'Log' -or [string]$key -ceq 'Instances') {
                 continue
@@ -922,7 +1033,8 @@ function Invoke-MenuLoop {
         [scriptblock]$Runner = $null,
         [hashtable]$ActionArguments = @{},
         [string]$StateRoot = '',
-        [string]$LogPath = ''
+        [string]$LogPath = '',
+        [switch]$ShowBanner
     )
 
     $write = $Writer
@@ -931,6 +1043,13 @@ function Invoke-MenuLoop {
     }
     $exitCode = 0
     while ($true) {
+        # The banner is rewritten before every prompt so the choices stay on screen no matter how long the
+        # previous action scrolled, rather than being printed once and left behind.
+        if ($ShowBanner) {
+            foreach ($bannerLine in @(Format-ToolkitMenuBanner)) {
+                & $write $bannerLine
+            }
+        }
         $read = $null
         try {
             $read = & $Reader
@@ -942,7 +1061,7 @@ function Invoke-MenuLoop {
             }
             $logEntry = Write-ToolkitLogEntry -Level 'Error' -Message ('The menu could not read a selection: ' + $message) -LogPath $LogPath
             $failure = Get-ToolkitResult -Status 'CriticalError' -Message ('The menu could not read a selection. ' + $message) -Data (@{ Code = 'MENU_READ_FAILED'; Log = $logEntry })
-            foreach ($line in @(Format-ToolkitResult -Result $failure)) {
+            foreach ($line in @(Format-ToolkitResult -Result $failure -Interactive)) {
                 & $write $line
             }
             return (Get-ToolkitExitCode $failure)
@@ -978,7 +1097,7 @@ function Invoke-MenuLoop {
         catch {
             $result = Get-ToolkitResult -Status 'CriticalError' -Message 'The action could not be completed.' -Data (@{ Code = 'ACTION_THREW' })
         }
-        foreach ($line in @(Format-ToolkitResult -Result $result)) {
+        foreach ($line in @(Format-ToolkitResult -Result $result -Interactive)) {
             & $write $line
         }
         $code = Get-ToolkitExitCode $result
@@ -1112,19 +1231,7 @@ function Start-ToolkitController {
         }.GetNewClosure()
     }
 
-    if (-not $SkipToolbar) {
-        & $write 'MuMu Root Hide Toolkit'
-        & $write 'Detect and Verify change nothing.'
-        & $write 'Target identifies the instance to work on, or creates or clones one. Identify changes nothing; Create and Clone ask for CONFIRM first and are the only ways this toolkit adds an instance.'
-        & $write 'Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone. Conceal changes only the verified clone.'
-        & $write 'Conceal asks whether to download its pinned Hide My Applist and Vector dependencies when the per-user cache does not already hold them. Type FETCH to allow that download now; any other answer downloads nothing.'
-        & $write 'RemoveAds and Restore change only the MuMu campaign files inside the selected installation, and every change keeps an exact backup.'
-        & $write 'A mutating action that is denied the rights it needs asks for administrator rights once, in its own window, and fails closed if that is declined or the prompt is not answered in time. Detect and Verify never ask.'
-        foreach ($entry in @(Get-ToolkitActionCatalog)) {
-            & $write ('  ' + ([string]$entry.Number) + '  ' + ([string]$entry.Name).PadRight(10) + [string]$entry.Description)
-        }
-    }
-    return (Invoke-MenuLoop -Reader $read -Writer $write -Runner $runner -StateRoot $statePath -LogPath $logPath)
+    return (Invoke-MenuLoop -Reader $read -Writer $write -Runner $runner -StateRoot $statePath -LogPath $logPath -ShowBanner:(-not $SkipToolbar))
 }
 
 if ($MyInvocation.InvocationName -ne '.') {

@@ -8607,8 +8607,64 @@ function Invoke-MenuTests {
         Assert-Equal 0 $toolbarCode 'The numbered menu did not return a zero exit code.'
         $toolbarText = @($toolbarState.Lines) -join "`n"
         foreach ($entry in $catalog) {
-            Assert-True ($toolbarText -match ('(?m)^\s+' + [regex]::Escape([string]$entry.Number) + '\s+' + [regex]::Escape([string]$entry.Name) + '\b')) "The menu does not offer $($entry.Number) for $($entry.Name)."
+            Assert-True ($toolbarText -match ('\s' + [regex]::Escape([string]$entry.Number) + '\s+' + [regex]::Escape([string]$entry.Name) + '\b')) "The menu does not offer $($entry.Number) for $($entry.Name)."
         }
+        foreach ($group in @('Inspect', 'Prepare', 'Change', 'Exit')) {
+            Assert-True ($toolbarText -match ('(?m)^\s+' + $group + '\b')) "The menu does not group its actions under: $group"
+        }
+        foreach ($entry in $catalog) {
+            Assert-True (-not [string]::IsNullOrWhiteSpace([string]$script:ToolkitActionGroups[[string]$entry.Name])) "The menu has no group for the action: $($entry.Name)"
+        }
+
+        # The menu has to stay on screen, so it is written before every prompt rather than once at startup.
+        $repeatState = @{ Lines = @() }
+        $repeatCode = Start-ToolkitController -StateRoot $menuStateRoot -Reader (New-MenuReader -Answers @('1', '1', '9')) -Writer ({ param($Line) $repeatState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure()
+        Assert-Equal 0 $repeatCode 'A repeated menu session did not return a zero exit code.'
+        $bannerCount = @(@($repeatState.Lines) | Where-Object { [string]$_ -match 'MuMu Root Hide Toolkit' }).Count
+        Assert-Equal 3 $bannerCount 'The menu banner was not written before every prompt.'
+
+        $skippedState = @{ Lines = @() }
+        $skippedCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('9')) -Writer ({ param($Line) $skippedState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure()
+        Assert-Equal 0 $skippedCode 'A suppressed menu did not return a zero exit code.'
+        Assert-Equal 0 @(@($skippedState.Lines) | Where-Object { [string]$_ -match 'MuMu Root Hide Toolkit' }).Count 'SkipToolbar still printed the menu banner.'
+
+        # Read-Host supplies the trailing colon, so a prompt that carries one renders a doubled colon.
+        $promptState = @{ Questions = @() }
+        $null = Get-ToolkitMenuChoice -Label 'Select the MuMu instance' -Count 3 -Prompt ({ param($Question) $promptState.Questions += $Question; '2' }).GetNewClosure()
+        Assert-Equal 'Select the MuMu instance (1-3)' @($promptState.Questions)[0] 'The instance prompt carries its own colon and renders a doubled one.'
+
+        # Interactive output is for a person, so a discovery is a summary and an instance list rather than
+        # a field dump. The noninteractive renderer keeps the field form because scripts parse it.
+        $discoveryInstances = @(
+            [pscustomobject]@{ Index = 0; Name = 'Roo+3d 12'; AndroidVersion = '12.0'; Running = $false; Eligible = $true; RootSetting = $false },
+            [pscustomobject]@{ Index = 2; Name = 'Roo+3d 12-Houssem'; AndroidVersion = '12.0'; Running = $false; Eligible = $true; RootSetting = $false }
+        )
+        $discoveryResult = Get-ToolkitResult -Status 'Success' -Message 'Discovered the installation.' -Data ([ordered]@{
+                Edition        = 'Chinese'
+                InstallRoot    = 'D:\MuMu'
+                ManagerPath    = 'D:\MuMu\nx_main\MuMuManager.exe'
+                InstanceCount  = 2
+                InstanceIndex  = 0
+                InstanceName   = 'Roo+3d 12'
+                AndroidVersion = '12.0'
+                Running        = $false
+                RootSetting    = $false
+                Instances      = $discoveryInstances
+            })
+        $humanLines = @(Format-ToolkitResult -Result $discoveryResult -Interactive)
+        $humanText = @($humanLines) -join "`n"
+        Assert-True ($humanText -match 'Chinese') 'The interactive discovery does not name the edition.'
+        Assert-True ($humanText -match 'Selected: 0 \| Roo\+3d 12 \| Android 12\.0') 'The interactive discovery does not show the instance it settled on.'
+        Assert-True ($humanText -match 'Running no \| Vendor root no') 'The interactive discovery does not render a boolean as yes or no for a person.'
+        Assert-True ($humanText -notmatch 'ManagerPath\s*=') 'The interactive discovery still dumps the manager path.'
+        Assert-True ($humanText -notmatch 'InstanceCount\s*=') 'The interactive discovery still dumps the instance count as a field.'
+        Assert-True ($humanText -notmatch 'InstallRoot\s*=') 'The interactive discovery still dumps the install root as a field.'
+
+        $machineLines = @(Format-ToolkitResult -Result $discoveryResult)
+        $machineText = @($machineLines) -join "`n"
+        Assert-True ($machineText -match 'ManagerPath\s*=') 'The noninteractive discovery no longer renders the field form.'
+        Assert-True ($machineText -match 'InstanceCount\s*=') 'The noninteractive discovery no longer renders the instance count.'
+        Assert-True ($machineText -match 'Instance 0 \| Roo\+3d 12') 'The noninteractive discovery no longer lists the instances.'
 
         $controllerSource = [IO.File]::ReadAllText($controllerScriptPath)
         Assert-True ($controllerSource -match 'while\s*\(\s*\$true\s*\)') 'The controller does not use a persistent while loop.'
@@ -9295,16 +9351,21 @@ function Invoke-MenuTests {
             Assert-True ((@($toolbarState.Lines) -join "`n") -match ('\b' + [regex]::Escape($catalogName) + '\b')) "The toolbar does not list an action: $catalogName"
         }
         $toolbarText = @($toolbarState.Lines) -join "`n"
-        Assert-True ($toolbarText -match '(?i)verified clone') 'The toolbar does not state the verified clone requirement.'
-        Assert-True ($toolbarText -match '(?i)RemoveAds and Restore') 'The toolbar does not name the advertisement actions.'
-        Assert-True ($toolbarText -match '(?i)campaign files inside the selected installation') 'The toolbar does not scope the advertisement actions to the selected installation.'
-        Assert-True ($toolbarText -match '(?i)keeps an exact backup') 'The toolbar does not state the advertisement backup boundary.'
-        Assert-True ($toolbarText -match '(?i)Root12 and Root15 stop the selected instance when needed, create and verify a clone, and change only that clone') 'The toolbar does not describe what Root12 and Root15 do to the selected instance.'
-        Assert-True ($toolbarText -match '(?i)Conceal changes only the verified clone') 'The toolbar does not describe what Conceal changes.'
-        Assert-True ($toolbarText -match '(?i)asks for administrator rights once') 'The toolbar does not state that a denied action asks for rights once.'
-        Assert-True ($toolbarText -match '(?i)Detect and Verify never ask') 'The toolbar does not state that the read-only actions never ask for rights.'
-        Assert-True ($toolbarText -match '(?i)Target identifies the instance to work on, or creates or clones one\. Identify changes nothing; Create and Clone ask for CONFIRM first') 'The toolbar does not describe the target selection modes.'
-        Assert-True ($toolbarText -notmatch '(?i)change only a verified clone of the selected instance') 'The toolbar hides that Root12 and Root15 also stop the selected instance.'
+        # The menu is a compact legend so it can be rewritten before every prompt, which is why the
+        # safety disclosures it used to carry are asserted in the README instead of on screen.
+        $menuBannerLines = @(Format-ToolkitMenuBanner)
+        Assert-True ($menuBannerLines.Count -le 8) "The menu banner is not compact: it is $($menuBannerLines.Count) lines and is rewritten before every prompt."
+        $menuReadme = (Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw) -replace "`r`n", "`n"
+        foreach ($disclosure in @(
+                @{ Pattern = '(?i)creates and verifies a clone'; Message = 'The README does not state the clone-first requirement.' }
+                @{ Pattern = '(?i)inside the selected installation'; Message = 'The README does not scope the advertisement actions to the selected installation.' }
+                @{ Pattern = '(?i)exact byte backup'; Message = 'The README does not state the advertisement backup boundary.' }
+                @{ Pattern = '(?i)changes only the verified clone'; Message = 'The README does not state what Conceal changes.' }
+                @{ Pattern = '(?i)once and only once'; Message = 'The README does not state that a denied action asks for rights at most once.' }
+                @{ Pattern = '(?i)never ask for rights'; Message = 'The README does not state that the read-only actions never ask for rights.' }
+            )) {
+            Assert-True ($menuReadme -match $disclosure.Pattern) $disclosure.Message
+        }
 
         $skipState = @{ Lines = @() }
         $skipCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) $skipState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner ({ param($Choice) }).GetNewClosure()
@@ -9497,7 +9558,9 @@ function Invoke-MenuTests {
         $flowState.AssetsVerified = $false
 
         Assert-True ($controllerSource -match "'FETCH'") 'The menu does not carry the explicit dependency consent word.'
-        Assert-True ($controllerSource -match 'Type FETCH') 'The menu does not ask the operator for the dependency consent.'
+        # The consent question is composed from the consent word at run time, so the source is asserted on
+        # the composition rather than on a literal sentence that used to sit in the menu banner.
+        Assert-True ($controllerSource -match "(?m)'Type '\s*\+\s*\`$consentWord") 'The menu does not ask the operator for the dependency consent.'
         Assert-True (([IO.File]::ReadAllText($commonPath)) -notmatch 'Type FETCH') 'The transport module carries the menu prompt text.'
 
         # A run with no verified clone record changes nothing at all, so no dependency is installed.

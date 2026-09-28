@@ -107,23 +107,47 @@ eligible, the action stops with `INSTANCE_SELECTION_REQUIRED` rather than pickin
 
 ### The interactive menu
 
-Double-click `Run-MumuToolkit.bat`. The menu is numbered, so you answer with the number it printed:
+Double-click `Run-MumuToolkit.bat`. The menu is numbered and grouped, and it is written again before
+every prompt so the choices never scroll out of reach. Answer with the number it shows:
 
 ```text
-  1  Detect    Discover MuMu installations and instances and report their state.
-  2  Verify    Collect the read-only status report for the selected instance.
-  3  Target    Identify the instance to work on, or create or clone one.
-  4  Root12    Root an Android 12 instance with the pinned Kitsune release on a verified clone.
-  5  Root15    Enable the built-in Android 15 root on a verified clone.
-  6  Conceal   Apply the Root concealment template to explicitly selected apps on a verified clone.
-  7  RemoveAds Suppress the MuMu campaign advertisements for the selected installation.
-  8  Restore   Restore the MuMu campaign files from the toolkit restore point.
-  9  Q         Quit the toolkit.
+  MuMu Root Hide Toolkit
+  ----------------------
+  Inspect   1 Detect     2 Verify
+  Prepare   3 Target
+  Change    4 Root12     5 Root15     6 Conceal    7 RemoveAds  8 Restore
+  Exit      9 Q
+  Detect and Verify change nothing. Everything else works on a verified clone and needs an explicit
+  confirmation. Administrator rights are asked for only if an action is denied them.
 Select an action (1-9):
+```
+
+Because the menu stays on screen it is a legend rather than a description. What each action does is in
+[Actions](#actions) below, and what it is allowed to change is in
+[How the safety rules work](#how-the-safety-rules-work).
+
+Here is a real session, captured: `Detect` on the Chinese installation, then quit.
+
+```text
+  MuMu Root Hide Toolkit
+  ----------------------
+  Inspect   1 Detect     2 Verify
+  Prepare   3 Target
+  Change    4 Root12     5 Root15     6 Conceal    7 RemoveAds  8 Restore
+  Exit      9 Q
+  Detect and Verify change nothing. Everything else works on a verified clone and needs an explicit confirmation. Administrator rights are asked for only if an action is denied them.
+Select an action (1-9): 1
+[Success] Discovered Chinese installation D:\Program Files\Netease\MuMuPlayer with 3 instance(s).
+  Installation: Chinese  D:\Program Files\Netease\MuMuPlayer
+  Selected: 0 | Roo+3d 12 | Android 12.0 | Running no | Vendor root no
 ```
 
 An action name is still accepted if you prefer to type it. Every mutating action asks for its
 confirmation in the menu, and the menu never closes itself when an action fails.
+
+Interactive output is written for a person: a discovery is a summary line and the instance it settled
+on, rather than a field dump. **`-NonInteractive` output is unchanged and stays in the `Field = Value`
+form**, because that is what a script reads.
 
 ## Actions
 
