@@ -109,6 +109,7 @@ function Enable-Android15Root {
         [object]$Instance,
         [object]$Journal,
         [switch]$Confirmed,
+        [object]$ResumeClone = $null,
         [scriptblock]$Runner = $null
     )
 
@@ -176,37 +177,54 @@ function Enable-Android15Root {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The Android 15 root start could not be journaled.' -Data (New-Android15RootState -Code 'JOURNAL_WRITE_FAILED' -Step 'start' -SourceIndex $sourceIndex)
     }
 
-    $clone = New-InstanceClone -ManagerPath $manager -Instance $Instance -Journal $Journal -Runner $Runner
-    $cloneIsResult = ($null -ne $clone -and $clone -is [pscustomobject] -and $null -ne $clone.PSObject.Properties['Status'])
-    if ($cloneIsResult -and [string]$clone.Status -ne 'Success') {
-        return $clone
+    # A recorded clone is resumed rather than copied again, so choosing "continue on its clone" in the menu
+    # does not silently spend a second instance. The recorded identity, version, installation boundary and
+    # disk are revalidated against the manager first, exactly as the Android 12 resume path does, because a
+    # recorded index is a claim about the past rather than a reading of the present.
+    $cloneIndex = -1
+    $cloneName = ''
+    if ($null -ne $ResumeClone) {
+        $resume = Assert-Android12ResumeClone -ManagerPath $manager -VmsPath $vmsPath -Record $ResumeClone -Runner $Runner
+        if ($resume.Status -ne 'Success') {
+            return New-ToolkitRootFailure -Journal $Journal -Message $resume.Message -Data (New-Android15RootState -Code ([string]$resume.Data.Code) -Step 'resume' -SourceIndex $sourceIndex -CloneIndex ([int](Get-Android12RecordField -Record $resume.Data -Name 'CloneIndex')) -CloneName ([string](Get-Android12RecordField -Record $resume.Data -Name 'CloneName')))
+        }
+        $cloneIndex = [int]$resume.Data.CloneIndex
+        $cloneName = [string]$resume.Data.CloneName
+        $cloneMessage = "The Android 15 root workflow resumed on the verified clone at index $cloneIndex. Its identity, Android version, installation boundary and disk were revalidated and no second clone was created."
     }
-    $unverifiedClone = {
-        New-ToolkitRootFailure -Journal $Journal -Message 'The MuMu manager did not report a verified instance clone, so no instance was reconfigured.' -Data (New-Android15RootState -Code 'CLONE_UNVERIFIED' -Step 'clone' -SourceIndex $sourceIndex)
-    }
-    if (-not $cloneIsResult -or $null -eq $clone.Data -or $clone.Data -is [Array] -or
-        $clone.Data -isnot [Collections.IDictionary] -or -not $clone.Data.Contains('CloneIndex') -or
-        -not $clone.Data.Contains('CloneName')) {
-        return (& $unverifiedClone)
-    }
-    $reportedCloneIndex = $clone.Data['CloneIndex']
-    if ($reportedCloneIndex -isnot [string] -and $reportedCloneIndex -isnot [int] -and $reportedCloneIndex -isnot [long]) {
-        return (& $unverifiedClone)
-    }
-    $cloneIndex = 0
-    if (-not [int]::TryParse([string]$reportedCloneIndex, [ref]$cloneIndex) -or $cloneIndex -lt 0) {
-        return (& $unverifiedClone)
-    }
-    if ($cloneIndex -eq $sourceIndex) {
-        return (& $unverifiedClone)
-    }
-    $reportedCloneName = $clone.Data['CloneName']
-    if ($reportedCloneName -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedCloneName)) {
-        return (& $unverifiedClone)
-    }
-    $cloneName = [string]$reportedCloneName
+    else {
+        $clone = New-InstanceClone -ManagerPath $manager -Instance $Instance -Journal $Journal -Runner $Runner
+        $cloneIsResult = ($null -ne $clone -and $clone -is [pscustomobject] -and $null -ne $clone.PSObject.Properties['Status'])
+        if ($cloneIsResult -and [string]$clone.Status -ne 'Success') {
+            return $clone
+        }
+        $unverifiedClone = {
+            New-ToolkitRootFailure -Journal $Journal -Message 'The MuMu manager did not report a verified instance clone, so no instance was reconfigured.' -Data (New-Android15RootState -Code 'CLONE_UNVERIFIED' -Step 'clone' -SourceIndex $sourceIndex)
+        }
+        if (-not $cloneIsResult -or $null -eq $clone.Data -or $clone.Data -is [Array] -or
+            $clone.Data -isnot [Collections.IDictionary] -or -not $clone.Data.Contains('CloneIndex') -or
+            -not $clone.Data.Contains('CloneName')) {
+            return (& $unverifiedClone)
+        }
+        $reportedCloneIndex = $clone.Data['CloneIndex']
+        if ($reportedCloneIndex -isnot [string] -and $reportedCloneIndex -isnot [int] -and $reportedCloneIndex -isnot [long]) {
+            return (& $unverifiedClone)
+        }
+        $cloneIndex = 0
+        if (-not [int]::TryParse([string]$reportedCloneIndex, [ref]$cloneIndex) -or $cloneIndex -lt 0) {
+            return (& $unverifiedClone)
+        }
+        if ($cloneIndex -eq $sourceIndex) {
+            return (& $unverifiedClone)
+        }
+        $reportedCloneName = $clone.Data['CloneName']
+        if ($reportedCloneName -isnot [string] -or [string]::IsNullOrWhiteSpace($reportedCloneName)) {
+            return (& $unverifiedClone)
+        }
+        $cloneName = [string]$reportedCloneName
 
-    $cloneMessage = "The Android 15 root workflow continues on the clone at index $cloneIndex, which is the only instance it will reconfigure. The selected instance at index $sourceIndex is only stopped for the clone."
+        $cloneMessage = "The Android 15 root workflow continues on the clone at index $cloneIndex, which is the only instance it will reconfigure. The selected instance at index $sourceIndex is only stopped for the clone."
+    }
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message $cloneMessage -Data (New-Android15RootState -Code 'OK' -Step 'clone' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }

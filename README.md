@@ -136,8 +136,10 @@ Select an instance (1-3), or N, A, B or Q:
 at all, because `no` would claim a measurement that was never taken. The real guest root, and which
 implementation provides it, is reported by `Status` on the selected instance.
 
-**2. The target screen.** Every guest change in this toolkit is made on a clone, so the source instance is
-never written to. There is no in-place option because `Root12`, `Root15` and `Conceal` all refuse one.
+**2. The target screen.** It decides, it does not perform. Every guest change in this toolkit is made on a
+clone, and the action that makes the change is the only thing that makes the clone, so this screen records
+the choice and asks for no confirmation. The action asks for the confirmation that covers the clone it is
+about to make.
 
 ```text
   Instance 0  Roo+3d 12  Android 12.0
@@ -151,13 +153,23 @@ never written to. There is no in-place option because `Root12`, `Root15` and `Co
 Select a target (1-4):
 ```
 
+Rows 1 and 2 are declarations, not clones. The action receives the **source** instance and makes exactly
+one clone. An earlier version had this screen clone and the root action clone that clone, which spent a
+second full instance on every root run; the test suite now asserts the action is handed the source and that
+a resumed run asks for no clone at all.
+
 **Keep device info** is the same choice the MuMu GUI offers, and it is verified rather than assumed. The
-manager's own `clone` subcommand has no such flag, so rows 1 and 2 both clone and then read the simulated
-`android_id`, `mac_address` and `imei` back: row 1 compares them against the source and claims the device
-info was kept only if they match, row 2 writes fresh values and claims they differ only if the read-back
-confirms it. A run where neither is true reports `IDENTIFIER_KEEP_UNVERIFIED` or
-`IDENTIFIER_FRESH_UNVERIFIED` instead of a success. Row 3 continues on the clone a previous run already
-verified, and refuses when there is no such record.
+manager's own `clone` subcommand has no such flag, so the identifiers are read and compared around the clone
+the action makes: row 1 compares the clone's `android_id`, `mac_address` and `imei` against the source and
+claims the device info was kept only if they match, row 2 writes fresh values and claims they differ only
+if the read-back confirms it. A run where neither is true reports `IDENTIFIER_KEEP_UNVERIFIED` or
+`IDENTIFIER_FRESH_UNVERIFIED` instead of a success. The identifier step is reported as its own result, so a
+run that rooted successfully and then failed to set fresh identifiers does not claim both.
+
+**Continue on its clone** resolves the clone a previous root action verified and recorded in the operation
+journal, and the action resumes it rather than copying again. It reads the journal, not the manager, so it
+is available before anything is started, and it refuses with `CLONE_RECORD_MISSING` when there is no record
+rather than making a new clone behind your back.
 
 **3. The action screen.** The rows are filtered by the instance's Android version, so an entry that cannot
 work is never offered:

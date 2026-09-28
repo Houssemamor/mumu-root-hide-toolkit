@@ -638,11 +638,12 @@ function Resolve-ToolkitScreenChoice {
     return [pscustomobject]@{ Kind = 'Action'; Action = $action }
 }
 
-# The target screen carried out. A clone is made through the existing Target action so it keeps the same
-# journal, the same boundary checks and the same confirmation as any other clone, and the identifier
-# choice is then applied and verified on the clone that action produced. Continuing on a prepared clone
-# is the only path that reuses something: it asks the journal for the clone a previous run verified, and
-# it refuses when there is none rather than making a new one behind the operator's back.
+# The target screen decided, not performed. Every guest change in this toolkit is made on a clone, and the
+# action that makes the change is the only thing that makes the clone: the earlier version had this screen
+# clone and the action clone the clone, which silently spent a second full instance on every root run.
+#
+# So the screen now records a declaration and changes nothing. It asks for no confirmation, because there is
+# nothing to confirm yet; the action asks for the confirmation that covers the clone it is about to make.
 function Invoke-ToolkitMenuTarget {
     param(
         [string]$Choice,
@@ -651,88 +652,45 @@ function Invoke-ToolkitMenuTarget {
         [object]$Instance,
         [scriptblock]$Ask = $null,
         [scriptblock]$Show = $null,
-        [scriptblock]$Runner = $null,
+        [scriptblock]$ActionRunner = $null,
+        [scriptblock]$ProcessRunner = $null,
         [hashtable]$ActionArguments = @{}
     )
 
     $sourceIndex = [int](Get-ToolkitRecordValue -Record $Instance -PropertyNames @('Index'))
-    $installRoot = [string](Get-ToolkitRecordValue -Record $Install -PropertyNames @('InstallRoot'))
-    $managerPath = [string](Get-ToolkitRecordValue -Record $Install -PropertyNames @('ManagerPath'))
+    $sourceName = [string](Get-ToolkitRecordValue -Record $Instance -PropertyNames @('Name'))
 
-    # The disclosure is shown through its own seam rather than through the ask seam, because the ask seam
-    # returns the operator's answer and a disclosure line printed through it would be read as one.
-    $reveal = $Show
-    if ($null -eq $reveal) {
-        $reveal = { param($Line) Write-ToolkitConsoleLine $Line }
-    }
-
-    # Every exit from this function returns one object, and the writer calls it. A single stray value
-    # would unroll into an array here and turn the whole screen into an unreadable shape.
+    # Continuing on a clone resolves the clone a previous root action verified and recorded. It reads the
+    # operation journal, not the manager, so it is available before anything is started, and it refuses
+    # when there is no record rather than making a new clone behind the operator's back.
     if ($Choice -ceq 'ContinueClone') {
         $clone = Get-ToolkitVerifiedClone -StateRoot $StateRoot -Install $Install -Index $sourceIndex
         if ($clone.Status -ne 'Success') {
             return [pscustomobject]@{ Lines = @(Format-ToolkitResult -Result $clone -Interactive); Result = $clone; Proceed = $false; Target = $null }
         }
-        $target = [pscustomobject]@{ Mode = 'Continue'; Index = [int]$clone.Data.CloneIndex; Name = [string]$clone.Data.CloneName }
-        return [pscustomobject]@{ Lines = @('  Using the clone recorded at index ' + [string]$target.Index + ' (' + $target.Name + ').'); Result = $null; Proceed = $true; Target = $target }
-    }
-
-    # Each element is parenthesized because a comma binds tighter than + here, so an unparenthesized pair
-    # is joined onto one line and the array-coercion result becomes a single disclosure string.
-    $disclosure = @(
-        ('  This will add one MuMu instance by copying instance ' + [string]$sourceIndex + '.')
-        '  * The source is shut down first and the copy starts with every app and setting it had.'
-    )
-    if ($Choice -ceq 'CloneFreshInfo') {
-        $disclosure += '  * The copy then gets a new android id and mac address, and a new imei when the source had one.'
-    }
-    else {
-        $disclosure += '  * The copy keeps the source android id, mac address and imei.'
-    }
-    $disclosure += '  * The source instance is not written to.'
-    foreach ($line in $disclosure) {
-        & $reveal $line
-    }
-    if ($null -ne $Ask) {
-        $answer = [string](& $Ask ('Type CONFIRM to clone instance ' + [string]$sourceIndex))
-        if ($answer.Trim() -cne 'CONFIRM') {
-            $refused = Get-ToolkitResult -Status 'CriticalError' -Message 'The clone was not confirmed, so no instance was created and nothing was changed.' -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
-            return [pscustomobject]@{ Lines = @(Format-ToolkitResult -Result $refused -Interactive); Result = $refused; Proceed = $false; Target = $null }
+        $target = [pscustomobject]@{
+            Mode = 'Continue'
+            SourceIndex = $sourceIndex
+            SourceName = $sourceName
+            ResumeClone = $clone.Data
+            CloneIndex = [int]$clone.Data.CloneIndex
+            CloneName = [string]$clone.Data.CloneName
+            FreshIdentifiers = $false
         }
+        return [pscustomobject]@{ Lines = @('  Continuing on the verified clone at index ' + [string]$target.CloneIndex + ' (' + $target.CloneName + '). No second clone is made.'); Result = $null; Proceed = $true; Target = $target }
     }
 
-    # A throw from the clone is turned into a reported failure rather than being allowed to escape the
-    # screen, because an exception that leaves the loop kills the menu, and the menu is required to stay
-    # open when an action fails.
-    $result = $null
-    try {
-        $result = Invoke-ToolkitActionWithElevation -Action 'Target' -InstallRoot $installRoot -SourceIndex $sourceIndex -StateRoot $StateRoot -Mode 'Clone' -Confirmed -Prompt $Ask -Runner $Runner
+    $fresh = ($Choice -ceq 'CloneFreshInfo')
+    $target = [pscustomobject]@{
+        Mode = 'Clone'
+        SourceIndex = $sourceIndex
+        SourceName = $sourceName
+        ResumeClone = $null
+        CloneIndex = -1
+        CloneName = ''
+        FreshIdentifiers = $fresh
     }
-    catch {
-        $result = Get-ToolkitResult -Status 'CriticalError' -Message ('The clone could not be completed. ' + (Protect-ToolkitText ([string]$_.Exception.Message))) -Data (@{ Code = 'ACTION_THREW' })
-    }
-    $lines = @(Format-ToolkitResult -Result $result -Interactive)
-    if ($result.Status -ne 'Success') {
-        return [pscustomobject]@{ Lines = $lines; Result = $result; Proceed = $false; Target = $null }
-    }
-    $cloneIndex = [int]$result.Data.Index
-
-    $identifiers = $null
-    try {
-        $identifiers = Resolve-ToolkitCloneIdentifiers -ManagerPath $managerPath -SourceIndex $sourceIndex -CloneIndex $cloneIndex -Fresh:($Choice -ceq 'CloneFreshInfo') -Runner $Runner
-    }
-    catch {
-        $identifiers = Get-ToolkitResult -Status 'CriticalError' -Message ('The clone identifiers could not be read. ' + (Protect-ToolkitText ([string]$_.Exception.Message))) -Data (@{ Code = 'ACTION_THREW' })
-    }
-    $lines += @(Format-ToolkitResult -Result $identifiers -Interactive)
-    if ($identifiers.Status -ne 'Success') {
-        # The clone exists and is left in place, so the outcome is reported and the operator decides. The
-        # toolkit never deletes the clone here, because a clone the operator may still want is not the
-        # toolkit's to remove.
-        return [pscustomobject]@{ Lines = $lines; Result = $identifiers; Proceed = $false; Target = $null }
-    }
-    $target = [pscustomobject]@{ Mode = 'Clone'; Index = $cloneIndex; Name = [string]$result.Data.Name }
-    return [pscustomobject]@{ Lines = $lines; Result = $identifiers; Proceed = $true; Target = $target }
+    return [pscustomobject]@{ Lines = @(); Result = $null; Proceed = $true; Target = $target }
 }
 
 # A fresh instance, which carries nothing from any source. The engine is asked for explicitly because the
@@ -742,7 +700,10 @@ function Invoke-ToolkitMenuNewInstance {
         [object]$Install,
         [string]$StateRoot,
         [scriptblock]$Ask = $null,
-        [scriptblock]$Runner = $null,
+        # The two seams are separate for the same reason as on the target screen: the action seam dispatches
+        # the create, the process seam runs the manager's own instance query to find the next free index.
+        [scriptblock]$ActionRunner = $null,
+        [scriptblock]$ProcessRunner = $null,
         [hashtable]$ActionArguments = @{}
     )
 
@@ -764,7 +725,14 @@ function Invoke-ToolkitMenuNewInstance {
 
     $result = $null
     try {
-        $result = Invoke-ToolkitActionWithElevation -Action 'Target' -InstallRoot $installRoot -StateRoot $StateRoot -Mode 'Create' -AndroidVersion $version -Confirmed -Prompt $Ask -Runner $Runner
+        if ($null -ne $ActionRunner) {
+            $result = & $ActionRunner 'Target'
+        }
+        else {
+            # The process seam is forwarded so the create can read the manager for the next free index. A
+            # production run leaves it unset and reaches the real manager through the action.
+            $result = Invoke-ToolkitActionWithElevation -Action 'Target' -InstallRoot $installRoot -StateRoot $StateRoot -Mode 'Create' -AndroidVersion $version -Confirmed -Prompt $Ask -Runner $ProcessRunner
+        }
     }
     catch {
         $result = Get-ToolkitResult -Status 'CriticalError' -Message ('The instance could not be created. ' + (Protect-ToolkitText ([string]$_.Exception.Message))) -Data (@{ Code = 'ACTION_THREW' })

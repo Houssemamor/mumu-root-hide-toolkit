@@ -310,11 +310,14 @@ function Resolve-ToolkitInstance {
     param(
         [object]$Install,
         [int]$InstanceIndex = -1,
-        [scriptblock]$Prompt = $null
+        [scriptblock]$Prompt = $null,
+        [scriptblock]$Runner = $null
     )
 
     $managerPath = [string](Get-ToolkitFirstProperty -InputObject $Install -PropertyNames @('ManagerPath'))
-    $instances = @(Get-MuMuInstances -Install $Install -ManagerPath $managerPath)
+    # The runner is forwarded so the instance lookup reaches the same seam as every other manager call. A
+    # lookup that ignored it would reach the real manager even when the caller supplied a substitute.
+    $instances = @(Get-MuMuInstances -Install $Install -ManagerPath $managerPath -Runner $Runner)
     if ($instances.Count -eq 1 -and $null -ne $instances[0].PSObject.Properties['Status']) {
         return $instances[0]
     }
@@ -508,7 +511,12 @@ function Invoke-ToolkitTarget {
         [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [scriptblock]$Prompt = $null,
-        [scriptblock]$Runner = $null
+        [scriptblock]$Runner = $null,
+        # The process seam is separate from the action seam because the create prompt reads the manager to
+        # find the next free index. A caller that only wants to fake the action does not have to fake the
+        # manager query, and a caller that only wants to fake the manager query is not mistaken for a
+        # failed action.
+        [scriptblock]$ProcessRunner = $null
     )
 
     $targetMode = ''
@@ -517,6 +525,13 @@ function Invoke-ToolkitTarget {
     }
     elseif ($null -ne $Prompt) {
         $targetMode = ([string](& $Prompt 'Target mode: Identify, Create, or Clone')).Trim()
+    }
+    # Free index discovery, instance listing and the manager create all run through the same process seam,
+    # so the create prompt, the target choice and the manager call cannot disagree about what the manager
+    # reports. A caller that supplied only the action seam still gets the real manager.
+    $managerRunner = $ProcessRunner
+    if ($null -eq $managerRunner) {
+        $managerRunner = $Runner
     }
     if ([string]::IsNullOrWhiteSpace($targetMode)) {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive target run requires an explicit mode. Pass -Mode Identify, -Mode Create, or -Mode Clone. No instance was created or changed.' -Data (@{ Code = 'TARGET_MODE_REQUIRED' })
@@ -533,7 +548,7 @@ function Invoke-ToolkitTarget {
         }
         # The next free index is offered as the default, so a blank answer means the obvious choice and an
         # operator who just pressed Enter does not have to be told a refusal for the thing they agreed to.
-        $suggested = Get-ToolkitNextFreeInstanceIndex -Install $Install -Runner $Runner
+        $suggested = Get-ToolkitNextFreeInstanceIndex -Install $Install -Runner $managerRunner
         if ($suggested -lt 0) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'The next free instance index could not be read from the MuMu manager, so no index is offered and no instance was created. Pass an explicit -StartIndex.' -Data (@{ Code = 'START_INDEX_UNREADABLE' })
         }
@@ -557,7 +572,7 @@ function Invoke-ToolkitTarget {
 
     $targetSourceIndex = $SourceIndex
     if ($targetMode -ceq 'Clone') {
-        $source = Resolve-ToolkitCloneSource -Install $Install -SourceIndex $SourceIndex -InstanceIndex $InstanceIndex -Prompt $Prompt -Runner $Runner
+        $source = Resolve-ToolkitCloneSource -Install $Install -SourceIndex $SourceIndex -InstanceIndex $InstanceIndex -Prompt $Prompt -Runner $managerRunner
         if ($source.Status -ne 'Success') {
             return $source
         }
@@ -570,7 +585,7 @@ function Invoke-ToolkitTarget {
     }
 
     $journal = New-ToolkitActionJournal -StateRoot $StateRoot -Operation 'Target' -Instance $Install
-    $result = Select-ToolkitTarget -Install $Install -Journal $journal -Mode $targetMode -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StartIndex $targetStartIndex -AndroidVersion $AndroidVersion -Confirmed:$targetConfirmed -Prompt $Prompt -Runner $Runner
+    $result = Select-ToolkitTarget -Install $Install -Journal $journal -Mode $targetMode -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StartIndex $targetStartIndex -AndroidVersion $AndroidVersion -Confirmed:$targetConfirmed -Prompt $Prompt -Runner $managerRunner
     return (Close-ToolkitActionJournal -Journal $journal -Result $result)
 }
 
@@ -590,6 +605,8 @@ function Invoke-ToolkitActionWithElevation {
         [string]$Mode = '',
         [object]$StartIndex = $null,
         [string]$AndroidVersion = '',
+        [object]$ResumeClone = $null,
+        [switch]$FreshIdentifiers,
         [switch]$Confirmed,
         [switch]$FetchDependencies,
         [switch]$ElevatedChild,
@@ -598,7 +615,7 @@ function Invoke-ToolkitActionWithElevation {
         [scriptblock]$ElevationRunner = $null
     )
 
-    $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -Runner $Runner
+    $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -ResumeClone $ResumeClone -FreshIdentifiers:$FreshIdentifiers -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -Runner $Runner
     # An elevated child is the one process that must never ask for rights again, and an unarmed seam
     # has no UAC prompt to raise, so both return the in-process outcome unchanged.
     if ($ElevatedChild -or $null -eq $ElevationRunner) {
@@ -640,6 +657,8 @@ function Invoke-ToolkitAction {
         [string]$Mode = '',
         [object]$StartIndex = $null,
         [string]$AndroidVersion = '',
+        [object]$ResumeClone = $null,
+        [switch]$FreshIdentifiers,
         [switch]$Confirmed,
         [switch]$FetchDependencies,
         [switch]$ElevatedChild,
@@ -676,7 +695,7 @@ function Invoke-ToolkitAction {
         return (Invoke-ToolkitTarget -Install $install.Data -StateRoot $statePath -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed:$Confirmed -Prompt $Prompt -Runner $Runner)
     }
 
-    $instance = Resolve-ToolkitInstance -Install $install.Data -InstanceIndex $InstanceIndex -Prompt $Prompt
+    $instance = Resolve-ToolkitInstance -Install $install.Data -InstanceIndex $InstanceIndex -Prompt $Prompt -Runner $Runner
     if ($instance.Status -ne 'Success') {
         return $instance
     }
@@ -729,7 +748,7 @@ function Invoke-ToolkitAction {
             return Get-ToolkitResult -Status 'CriticalError' -Message ('The dependency manifest could not be loaded, so no instance was changed. ' + [string]$_.Exception.Message) -Data (@{ Code = 'MANIFEST_INVALID' })
         }
         $journal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'Root12' -Instance $selected
-        $result = Install-Android12Root -Instance $selected -Manifest $manifest -Journal $journal -Interactive:($null -ne $Prompt) -Prompt $Prompt
+        $result = Install-Android12Root -Instance $selected -Manifest $manifest -Journal $journal -Interactive:($null -ne $Prompt) -Prompt $Prompt -ResumeClone $ResumeClone
         return (Close-ToolkitActionJournal -Journal $journal -Result $result)
     }
 
@@ -738,7 +757,7 @@ function Invoke-ToolkitAction {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'The Android 15 built-in root action requires an explicit confirmation. Rerun it with -Confirmed after the target instance has been checked. No instance was changed.' -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
         }
         $journal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'Root15' -Instance $selected
-        $result = Enable-Android15Root -Instance $selected -Journal $journal -Confirmed
+        $result = Enable-Android15Root -Instance $selected -Journal $journal -Confirmed -ResumeClone $ResumeClone
         return (Close-ToolkitActionJournal -Journal $journal -Result $result)
     }
 
@@ -747,7 +766,7 @@ function Invoke-ToolkitAction {
         if ([string]::IsNullOrWhiteSpace($version)) {
             $version = [string]$selected.AndroidVersion
         }
-        return Invoke-ToolkitFullSetup -Install $install.Data -StateRoot $statePath -InstanceIndex $selectedIndex -Packages $Packages -AndroidVersion $version -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -Prompt $Prompt -Runner $Runner
+        return Invoke-ToolkitFullSetup -Install $install.Data -StateRoot $statePath -InstanceIndex $selectedIndex -Packages $Packages -AndroidVersion $version -ResumeClone $ResumeClone -FreshIdentifiers:$FreshIdentifiers -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -Prompt $Prompt -Runner $Runner
     }
 
     if ($Action -ceq 'Conceal') {
@@ -1064,6 +1083,8 @@ function Invoke-MenuAction {
         [string]$Mode = '',
         [object]$StartIndex = $null,
         [string]$AndroidVersion = '',
+        [object]$ResumeClone = $null,
+        [switch]$FreshIdentifiers,
         [switch]$Confirmed,
         [switch]$FetchDependencies,
         [switch]$ElevatedChild,
@@ -1084,7 +1105,7 @@ function Invoke-MenuAction {
                 $result = & $Runner $Action
             }
             else {
-                $result = Invoke-ToolkitActionWithElevation -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -ElevationRunner $ElevationRunner
+                $result = Invoke-ToolkitActionWithElevation -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -ResumeClone $ResumeClone -FreshIdentifiers:$FreshIdentifiers -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -ElevationRunner $ElevationRunner
             }
         }
         catch {
@@ -1143,6 +1164,8 @@ function Invoke-ToolkitFullSetup {
         [int]$InstanceIndex = -1,
         [string[]]$Packages = @(),
         [string]$AndroidVersion = '',
+        [object]$ResumeClone = $null,
+        [switch]$FreshIdentifiers,
         [switch]$Confirmed,
         [switch]$FetchDependencies,
         [scriptblock]$Prompt = $null,
@@ -1185,6 +1208,7 @@ function Invoke-ToolkitFullSetup {
             Packages = @($step.Packages)
             Confirmed = $Confirmed
             FetchDependencies = $FetchDependencies
+            ResumeClone = $ResumeClone
             Prompt = $Prompt
             Runner = $Runner
             LogPath = ''
@@ -1253,7 +1277,12 @@ function Invoke-MenuLoop {
         [switch]$ShowBanner,
         [scriptblock]$Ask = $null,
         [int]$SeedInstanceIndex = -1,
-        [string]$InstallRoot = ''
+        [string]$InstallRoot = '',
+        # The process seam runs the manager itself. It is separate from the action seam because the screens
+        # read the manager directly (the next free index, the simulated identifiers) as well as dispatching
+        # actions, and a production run needs the real manager for the reads while the action seam stays
+        # swappable.
+        [scriptblock]$ProcessRunner = $null
     )
 
     $write = $Writer
@@ -1270,6 +1299,9 @@ function Invoke-MenuLoop {
     $selected = $null
     $target = $null
     $snapshot = $null
+    # The installation is kept for the screens and for the identifier read that follows a clone, so the
+    # manager path is not rediscovered after every action.
+    $installForMenu = $null
     # An instance named on the command line is the source the operator already chose, so the loop opens on
     # that instance's action screen instead of making them pick it again from the table. The action still
     # resolves its own clone, exactly as it does from the target screen, so nothing is written in place.
@@ -1279,7 +1311,17 @@ function Invoke-MenuLoop {
     # rather than by a table lookup that would silently select a different instance.
     if ($SeedInstanceIndex -ge 0) {
         $selected = [pscustomobject]@{ Index = $SeedInstanceIndex; Name = 'instance ' + [string]$SeedInstanceIndex; AndroidVersion = '' }
-        $target = [pscustomobject]@{ Mode = 'Source'; Index = $SeedInstanceIndex; Name = [string]$selected.Name }
+        # The seed declares the same target shape the target screen produces, so an action run against a
+        # command line instance index reaches the source and clones once, exactly as a chosen instance does.
+        $target = [pscustomobject]@{
+            Mode = 'Source'
+            SourceIndex = $SeedInstanceIndex
+            SourceName = [string]$selected.Name
+            ResumeClone = $null
+            CloneIndex = -1
+            CloneName = ''
+            FreshIdentifiers = $false
+        }
         $screen = 'Actions'
     }
 
@@ -1289,6 +1331,9 @@ function Invoke-MenuLoop {
         # that read its own copy would let a number on screen resolve against a different table.
         if ($screen -ceq 'Dashboard' -and $null -eq $snapshot) {
             $snapshot = Get-ToolkitDashboardSnapshot
+            if ($null -ne $snapshot -and $null -ne $snapshot.PSObject -and $null -ne $snapshot.PSObject.Properties['Data']) {
+                $installForMenu = Get-ToolkitRecordValue -Record $snapshot.Data -PropertyNames @('Install')
+            }
         }
         if ($ShowBanner) {
             if (-not $firstPrompt) {
@@ -1361,7 +1406,7 @@ function Invoke-MenuLoop {
                     $targetInstall = Get-ToolkitRecordValue -Record $freshTarget.Data -PropertyNames @('Install')
                 }
             }
-            $built = Invoke-ToolkitMenuTarget -Choice ([string]$choice.Target) -Install $targetInstall -StateRoot $StateRoot -Instance $selected -Ask $ask -Show ({ param($Line) & $write $line }).GetNewClosure() -Runner $Runner -ActionArguments $ActionArguments
+            $built = Invoke-ToolkitMenuTarget -Choice ([string]$choice.Target) -Install $targetInstall -StateRoot $StateRoot -Instance $selected -Ask $ask -Show ({ param($Line) & $write $line }).GetNewClosure() -ActionRunner $null -ProcessRunner $ProcessRunner -ActionArguments $ActionArguments
             foreach ($line in @($built.Lines)) {
                 & $write $line
             }
@@ -1405,7 +1450,10 @@ function Invoke-MenuLoop {
                 }
                 $newInstall = Get-ToolkitRecordValue -Record $fresh.Data -PropertyNames @('Install')
             }
-            $built = Invoke-ToolkitMenuNewInstance -Install $newInstall -StateRoot $StateRoot -Ask $ask -Runner $Runner -ActionArguments $ActionArguments
+            # The loop's runner is the action seam, so it is not handed to the builder as its process seam:
+            # a create needs a real manager call to find the next free index, and an action seam called with
+            # a file path returns an action result that reads as a failed launch.
+            $built = Invoke-ToolkitMenuNewInstance -Install $newInstall -StateRoot $StateRoot -Ask $ask -ActionRunner $null -ProcessRunner $ProcessRunner -ActionArguments $ActionArguments
             foreach ($line in @($built.Lines)) {
                 & $write $line
             }
@@ -1419,7 +1467,17 @@ function Invoke-MenuLoop {
             $snapshot = $null
             if ($null -ne $built.Instance) {
                 $selected = $built.Instance
-                $target = [pscustomobject]@{ Mode = 'Create'; Index = [int]$built.Index; Name = [string]$built.Name }
+                # A created instance is its own target: it was made for this run, so there is no source to
+                # clone from and nothing to keep or regenerate.
+                $target = [pscustomobject]@{
+                    Mode = 'Created'
+                    SourceIndex = [int]$built.Index
+                    SourceName = [string]$built.Name
+                    ResumeClone = $null
+                    CloneIndex = [int]$built.Index
+                    CloneName = [string]$built.Name
+                    FreshIdentifiers = $false
+                }
                 $screen = 'Actions'
             }
             continue
@@ -1456,7 +1514,7 @@ function Invoke-MenuLoop {
         if ($ShowBanner -and $action -in @('Root12', 'Root15', 'Conceal', 'FullSetup', 'RemoveAds', 'Restore')) {
             $disclosureInstance = $selected
             if ($null -ne $target) {
-                $disclosureInstance = [pscustomobject]@{ Index = [int]$target.Index; Name = [string]$target.Name }
+                $disclosureInstance = [pscustomobject]@{ Index = [int]$target.CloneIndex; Name = [string]$target.CloneName }
             }
             foreach ($line in @(Format-ToolkitDisclosure -Action $action -Instance $disclosureInstance -Packages @())) {
                 & $write $line
@@ -1471,8 +1529,16 @@ function Invoke-MenuLoop {
         $arguments['StateRoot'] = $StateRoot
         $arguments['LogPath'] = $LogPath
         if ($null -ne $target) {
-            $arguments['InstanceIndex'] = [int]$target.Index
+            # The action is handed the source, not a clone, because the action is what makes the single
+            # clone. Handing it a clone the target screen made is what spent a second instance per run.
+            $arguments['InstanceIndex'] = [int]$target.SourceIndex
             $arguments['AndroidVersion'] = [string]$selected.AndroidVersion
+            if ([string]$target.Mode -ceq 'Continue' -and $null -ne $target.ResumeClone) {
+                $arguments['ResumeClone'] = $target.ResumeClone
+            }
+            if ([bool]$target.FreshIdentifiers) {
+                $arguments['FreshIdentifiers'] = $true
+            }
         }
         if ($null -eq $Ask) {
             $arguments['Prompt'] = $ask
@@ -1486,6 +1552,27 @@ function Invoke-MenuLoop {
         }
         foreach ($line in @(Format-ToolkitResult -Result $result -Interactive)) {
             & $write $line
+        }
+        # The identifier choice is carried out here, on the clone the action reports, because the clone index
+        # is only known once the action has made it. It is reported as its own result so a run that rooted
+        # successfully and then failed to set fresh identifiers does not claim both.
+        if ($null -ne $target -and $result.Status -in @('Success', 'AlreadyApplied') -and $null -ne $ProcessRunner) {
+            $reportedClone = Get-ToolkitRecordValue -Record $result.Data -PropertyNames @('CloneIndex')
+            if ($null -ne $reportedClone -and [int]$reportedClone -ge 0) {
+                $identifiers = $null
+                try {
+                    $identifiers = Resolve-ToolkitCloneIdentifiers -ManagerPath ([string](Get-ToolkitFirstProperty -InputObject $installForMenu -PropertyNames @('ManagerPath'))) -SourceIndex ([int]$target.SourceIndex) -CloneIndex ([int]$reportedClone) -Fresh:([bool]$target.FreshIdentifiers) -Runner $ProcessRunner
+                }
+                catch {
+                    $identifiers = Get-ToolkitResult -Status 'CriticalError' -Message ('The clone identifiers could not be read. ' + (Protect-ToolkitText ([string]$_.Exception.Message))) -Data (@{ Code = 'ACTION_THREW' })
+                }
+                foreach ($line in @(Format-ToolkitResult -Result $identifiers -Interactive)) {
+                    & $write $line
+                }
+                if ($identifiers.Status -notin @('Success', 'AlreadyApplied')) {
+                    $exitCode = Get-ToolkitExitCode $identifiers
+                }
+            }
         }
         $code = Get-ToolkitExitCode $result
         if ($code -ne 0) {
@@ -1527,6 +1614,8 @@ function Start-ToolkitController {
         [string]$Mode = '',
         [object]$StartIndex = $null,
         [string]$AndroidVersion = '',
+        [object]$ResumeClone = $null,
+        [switch]$FreshIdentifiers,
         [switch]$Confirmed,
         [switch]$NonInteractive,
         [switch]$SkipToolbar,
@@ -1536,6 +1625,7 @@ function Start-ToolkitController {
         [scriptblock]$Writer = $null,
         [scriptblock]$Prompt = $null,
         [scriptblock]$ActionRunner = $null,
+        [scriptblock]$ProcessRunner = $null,
         [scriptblock]$ElevationRunner = $null
     )
 
@@ -1618,7 +1708,7 @@ function Start-ToolkitController {
                 $targetMode = $Mode
                 $targetStartIndex = $StartIndex
             }
-            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -AndroidVersion $AndroidVersion -Confirmed:$confirmed -FetchDependencies:$fetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
+            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -AndroidVersion $AndroidVersion -ResumeClone $ResumeClone -FreshIdentifiers:$FreshIdentifiers -Confirmed:$confirmed -FetchDependencies:$fetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
         }.GetNewClosure()
     }
 
@@ -1637,6 +1727,11 @@ function Start-ToolkitController {
     if ($InstanceIndex -ge 0) {
         $menuArguments['SeedInstanceIndex'] = $InstanceIndex
         $menuArguments['InstallRoot'] = $InstallRoot
+    }
+    # The process seam is left unset in a production run so the screens reach the real manager. A test that
+    # needs the screens to see a fake manager passes one; the action seam stays the loop's runner.
+    if ($null -ne $ProcessRunner) {
+        $menuArguments['ProcessRunner'] = $ProcessRunner
     }
     return (Invoke-MenuLoop @menuArguments)
 }

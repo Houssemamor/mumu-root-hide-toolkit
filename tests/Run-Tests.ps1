@@ -8836,6 +8836,43 @@ function Invoke-MenuTests {
         $noPackages = Invoke-ToolkitFullSetup -Install $screenSnapshot.Install -StateRoot $menuStateRoot -InstanceIndex 0 -AndroidVersion '12.0' -Confirmed -ActionRunner ({ param($Choice) throw 'must not run' }).GetNewClosure()
         Assert-Equal 'PACKAGES_REQUIRED' ([string]$noPackages.Data.Code) 'A full setup with no app list did not ask for one.'
 
+        # The target screen decides and does not perform. It makes no clone and asks for no confirmation,
+        # because there is nothing to confirm until an action makes the clone. The action is handed the
+        # source instance, which is what stopped the double clone.
+        $decisionCalls = New-Object System.Collections.ArrayList
+        $decisionProcess = {
+            param($Path, $Arguments)
+            [void]$decisionCalls.Add((@($Arguments) | ForEach-Object { [string]$_ }) -join ' ')
+            return [pscustomobject]@{ ExitCode = 0; Text = '{}' }
+        }.GetNewClosure()
+        $decisionKeep = Invoke-ToolkitMenuTarget -Choice 'CloneKeepInfo' -Install $screenSnapshot.Install -StateRoot $menuStateRoot -Instance $screenInstance -Ask ({ param($Q) throw 'the target screen must not ask anything' }).GetNewClosure() -Show ({ param($L) throw 'the target screen must not print' }).GetNewClosure() -ProcessRunner $decisionProcess
+        Assert-Equal $true $decisionKeep.Proceed 'Choosing to clone did not move on to the action screen.'
+        Assert-Equal $null $decisionKeep.Result 'Choosing to clone reported a result, so it did the work itself.'
+        Assert-Equal 0 $decisionKeep.Lines.Count 'Choosing to clone printed output, so it did the work itself.'
+        Assert-Equal 'Clone' ([string]$decisionKeep.Target.Mode) 'Choosing to clone did not record a clone declaration.'
+        Assert-Equal 0 ([int]$decisionKeep.Target.SourceIndex) 'The clone declaration did not keep the source index.'
+        Assert-Equal $false $decisionKeep.Target.FreshIdentifiers 'The keep-info choice recorded a fresh identifier request.'
+        Assert-Equal $null $decisionKeep.Target.ResumeClone 'A fresh clone declaration carried a resume record.'
+        Assert-Equal 0 $decisionCalls.Count 'The target screen reached the manager, so it can still clone.'
+
+        $decisionFresh = Invoke-ToolkitMenuTarget -Choice 'CloneFreshInfo' -Install $screenSnapshot.Install -StateRoot $menuStateRoot -Instance $screenInstance -Ask ({ param($Q) 'CONFIRM' }).GetNewClosure() -ProcessRunner $decisionProcess
+        Assert-Equal $true $decisionFresh.Target.FreshIdentifiers 'The fresh identifier choice was not recorded.'
+        Assert-Equal 0 $decisionCalls.Count 'The target screen reached the manager for the fresh identifier choice.'
+
+        # Continuing on a clone reads the operation journal, not the manager, and refuses when a previous
+        # root action recorded no clone. It never falls back to making one.
+        $noRecordedClone = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $screenSnapshot.Install -StateRoot $menuStateRoot -Instance $screenInstance -ProcessRunner $decisionProcess
+        Assert-Equal $false $noRecordedClone.Proceed 'Continuing with no recorded clone moved on to the action screen.'
+        Assert-Equal 'CLONE_RECORD_MISSING' ([string]$noRecordedClone.Result.Data.Code) 'Continuing with no recorded clone did not name the missing record.'
+        Assert-Equal 0 $decisionCalls.Count 'Continuing with no recorded clone reached the manager.'
+
+        # A recorded clone is carried as a resume record, and it names the clone the action will work on
+        # rather than the source, which is what makes a resumed run skip the copy. The record itself is
+        # asserted with the verified clone fixture, where the journal store and the install are set up.
+        $recorded = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $screenSnapshot.Install -StateRoot $menuStateRoot -Instance $screenInstance
+        Assert-Equal $false $recorded.Proceed 'Continuing with no recorded clone moved on to the action screen.'
+        Assert-Equal 'CLONE_RECORD_MISSING' ([string]$recorded.Result.Data.Code) 'Continuing with no recorded clone did not name the missing record.'
+
         # A tag that writes is red and a tag that reaches the network is yellow, so the consequence is
         # visible in the row itself and not only in the disclosure behind it.
         Assert-Equal 'Red' (Get-ToolkitTagColor -Tag 'changes guest') 'A guest change is not marked red.'
@@ -9145,6 +9182,61 @@ function Invoke-MenuTests {
         $verifiedClone = Get-ToolkitVerifiedClone -StateRoot $menuStateRoot -Install $reportInstall.Install -Index 2
         Assert-Equal 'Success' $verifiedClone.Status "The verified clone record was not recovered from the journal store. $($verifiedClone.Message)"
         Assert-Equal 7 $verifiedClone.Data.CloneIndex 'The recovered clone record has the wrong index.'
+
+        # The menu carries that recovered record to the action as a resume, so choosing to continue makes
+        # the action work on the recorded clone instead of copying the source a second time.
+        $menuResume = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $reportInstall.Install -StateRoot $menuStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source of the recorded clone' })
+        Assert-Equal $true $menuResume.Proceed 'A recorded clone did not move on to the action screen.'
+        Assert-Equal 'Continue' ([string]$menuResume.Target.Mode) 'A recorded clone did not record a resume.'
+        Assert-Equal 2 ([int]$menuResume.Target.SourceIndex) 'A recorded clone lost the source index.'
+        Assert-Equal 7 ([int]$menuResume.Target.CloneIndex) 'A recorded clone did not name the clone it will work on.'
+        Assert-True ($null -ne $menuResume.Target.ResumeClone) 'A recorded clone carried no resume record for the action.'
+        Assert-True ((@($menuResume.Lines) -join "`n") -match 'no second clone is made') 'Continuing on a clone did not say that no second clone is made.'
+
+        # The menu has to hand the action the source instance plus the resume record, and the action is what
+        # makes the clone. A declaration that never reached the action is what made the root copy the clone a
+        # second time, so the seam is asserted directly: the action receives the source index, and the
+        # recorded clone rides along so the action skips the copy.
+        $seamFlow = @{ ResumeSeen = 'not-called'; IndexSeen = -1; ClonesRequested = 0 }
+        $seamManagerState = New-TargetFixture -Name 'menu resume seam'
+        # The dispatch resolves the installation from the suite's fallback roots, so this fixture has to be
+        # discoverable before the action can be driven against it.
+        $script:MenuFallbackRoots = @($script:MenuFallbackRoots) + @($seamManagerState.Install.InstallRoot)
+        # The resume is recorded against this fixture's own installation, because a resume record names an
+        # install and is revalidated against it, and a record from another installation is correctly refused.
+        $seamStateRoot = Join-Path $menuStateRoot 'resume seam'
+        # The journal records the instance, and the recovery matches the recorded install root against the
+        # one being asked about, so the journal is created with an instance that carries the install.
+        $seamInstance = [pscustomobject]@{ Index = 2; Name = 'seam source'; Install = $seamManagerState.Install }
+        $seamJournal = New-OperationJournal -Root (Join-Path $seamStateRoot 'journals') -Operation 'Root12' -Instance $seamInstance
+        Complete-OperationJournal -Journal $seamJournal -Result (Get-ToolkitResult -Status 'Success' -Message 'recorded' -Data ([pscustomobject]@{
+                    Code        = 'OK'
+                    Step        = 'complete'
+                    SourceIndex = 2
+                    CloneIndex  = 7
+                    CloneName   = 'seam clone'
+                }))
+        $seamMenu = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $seamManagerState.Install -StateRoot $seamStateRoot -Instance $seamInstance
+        Assert-Equal $true $seamMenu.Proceed 'The seam fixture did not record a usable resume.'
+        function Install-Android12Root {
+            param([object]$Instance, [object]$Manifest, [object]$Journal, [bool]$Interactive = $false, [string]$Confirmation = '', [string]$CacheRoot = '', [scriptblock]$Runner = $null, [scriptblock]$Prompt = $null, $ResumeClone = $null, [switch]$RequireCachedAsset)
+            $seamFlow.IndexSeen = [int]$Instance.Index
+            $seamFlow.ResumeSeen = $ResumeClone
+            if ($null -eq $ResumeClone) {
+                $seamFlow.ClonesRequested++
+            }
+            return (Get-ToolkitResult -Status 'Success' -Message 'shadowed root' -Data ([pscustomobject]@{ Code = 'OK'; SourceIndex = [int]$Instance.Index; CloneIndex = 7; CloneName = 'seam clone' }))
+        }
+        # The dispatch is driven with the arguments the loop builds from a declaration, which is the seam
+        # that was dropped before. The host machine has its own installations, so the install is resolved
+        # from the test fixtures rather than from the real registry.
+        $seamResult = Invoke-ToolkitAction -Action 'Root12' -InstallRoot $seamManagerState.Install.InstallRoot -InstanceIndex ([int]$seamMenu.Target.SourceIndex) -AndroidVersion '12.0' -ResumeClone $seamMenu.Target.ResumeClone -StateRoot $seamStateRoot -Runner (New-SafetyManagerRunner -State $seamManagerState.State)
+        Remove-Item -LiteralPath 'function:Install-Android12Root' -ErrorAction SilentlyContinue
+        Assert-Equal 'Success' ([string]$seamResult.Status) "A resumed root action did not complete: $($seamResult.Message)"
+        Assert-Equal 2 $seamFlow.IndexSeen 'The action was handed something other than the source instance.'
+        Assert-Equal 0 $seamFlow.ClonesRequested 'A resumed run asked for another clone.'
+        Assert-True ($null -ne $seamFlow.ResumeSeen) 'The action was not given the recorded clone, so it would have copied the source again.'
+        Assert-Equal 7 ([int](Get-ToolkitRecordValue -Record $seamFlow.ResumeSeen -PropertyNames @('CloneIndex'))) 'The action was given a resume record for the wrong clone.'
         Assert-Equal 'Android 12 clone' $verifiedClone.Data.CloneName 'The recovered clone record has the wrong name.'
         $wrongInstallClone = Get-ToolkitVerifiedClone -StateRoot $menuStateRoot -Install $android15Install.Install -Index 2
         Assert-Equal 'CriticalError' $wrongInstallClone.Status 'A clone record from another installation was accepted.'
@@ -9744,39 +9836,19 @@ function Invoke-MenuTests {
             $declinedPromptState.Answers = @(@($declinedPromptState.Answers) | Select-Object -Skip 1)
             return $answer
         }.GetNewClosure()
-        # The target screen is the unit that turns a source instance into a clone, so it is exercised on
-        # its own. The confirmation is asked before the manager is called, the disclosure says the source
-        # is not written to, and a declined answer leaves the clone unmade.
-        # The disclosure is collected rather than printed, so the test asserts on the wording instead of on
-        # where it landed on a console.
-        $cloneDisclosure = New-Object System.Collections.ArrayList
-        $declinedClone = Invoke-ToolkitMenuTarget -Choice 'CloneKeepInfo' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask $declinedPrompt -Show ({ param($Line) [void]$cloneDisclosure.Add([string]$Line) }).GetNewClosure() -Runner ({ param($Path, $Arguments) throw 'the manager must not be called' }).GetNewClosure()
-        Assert-Equal 1 (Get-ToolkitExitCode $declinedClone.Result) 'An unconfirmed clone did not fail closed.'
-        Assert-True ((@($declinedPromptState.Questions) -join '|') -match 'CONFIRM') 'The target screen did not ask for a confirmation word before cloning.'
-        Assert-True ((@($declinedClone.Lines) -join "`n") -match 'USER_CONFIRMATION_REQUIRED') 'An unconfirmed clone was not reported as a refused confirmation.'
-        Assert-Equal $false $declinedClone.Proceed 'An unconfirmed clone reported that it proceeded.'
-        # The disclosure says what the copy carries, that the source is not written to, and that the source
-        # is shut down first, because a clone that silently stops an instance is a surprise.
-        $cloneDisclosureText = @($cloneDisclosure) -join "`n"
-        Assert-True ($cloneDisclosureText -match 'copying instance 2') 'The clone disclosure does not name the instance it copies.'
-        Assert-True ($cloneDisclosureText -match 'keeps the source android id, mac address and imei') 'The keep-info disclosure does not say what the copy carries.'
-        Assert-True ($cloneDisclosureText -match 'source instance is not written to') 'The clone disclosure does not say that the source is not written to.'
-        Assert-True ($cloneDisclosureText -match 'shut down first') 'The clone disclosure does not say the source is shut down first.'
-        # Each disclosure bullet has to reach the screen as its own line. A comma binds tighter than the
-        # string addition here, so an unparenthesized pair is joined onto one line and the whole disclosure
-        # arrives as a single unreadable string.
-        $cloneBullets = @(@($cloneDisclosure) | Where-Object { [string]$_ -cmatch '^\s+\*' })
-        Assert-True ($cloneBullets.Count -ge 3) "The clone disclosure printed $($cloneBullets.Count) bullets instead of one per line."
-        foreach ($bullet in $cloneBullets) {
-            Assert-True ((@([string]$bullet) -join '').Split('.')[0] -cne [string]$bullet -or ([string]$bullet -cmatch '\.$')) "A disclosure bullet was truncated: $bullet"
-        }
-        $freshDisclosure = New-Object System.Collections.ArrayList
-        $null = Invoke-ToolkitMenuTarget -Choice 'CloneFreshInfo' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask ({ param($Question) 'no' }) -Show ({ param($Line) [void]$freshDisclosure.Add([string]$Line) }).GetNewClosure() -Runner ({ param($Path, $Arguments) throw 'the manager must not be called' }).GetNewClosure()
-        Assert-True ((@($freshDisclosure) -join "`n") -match 'new android id and mac address') 'The fresh-identifier disclosure does not say what is regenerated.'
-
+        # The target screen no longer clones, so it no longer asks for a confirmation word: there is nothing
+        # to confirm until an action makes the clone. The action screen is where the confirmation lives, and
+        # asking it here was the double confirmation the old flow produced.
+        $noConfirmPromptState = @{ Questions = @() }
+        $noConfirm = Invoke-ToolkitMenuTarget -Choice 'CloneKeepInfo' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask ({ param($Question) $noConfirmPromptState.Questions += [string]$Question; 'CONFIRM' }) -ProcessRunner ({ param($Path, $Arguments) throw 'the manager must not be called' }).GetNewClosure()
+        Assert-Equal 0 $noConfirmPromptState.Questions.Count 'The target screen still asks questions, so it is still doing work.'
+        Assert-Equal $true $noConfirm.Proceed 'The target screen did not record the declaration and move on.'
+        Assert-Equal $null $noConfirm.Result 'The target screen reported a result, so it did the work itself.'
+        Assert-Equal 0 $noConfirm.Lines.Count 'The target screen printed output, so it did the work itself.'
+        Assert-Equal 2 ([int]$noConfirm.Target.SourceIndex) 'The target screen did not keep the source index for the action.'
         # Continuing on a clone asks the journal for the clone a previous run verified, and it refuses when
         # there is none rather than making a new clone behind the operator's back.
-        $noClone = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask $clonePrompt -Runner ({ param($Path, $Arguments) throw 'the manager must not be called' }).GetNewClosure()
+        $noClone = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask $clonePrompt
         Assert-Equal 1 (Get-ToolkitExitCode $noClone.Result) 'Continuing with no recorded clone did not fail closed.'
         Assert-Equal $false $noClone.Proceed 'Continuing with no recorded clone reported that it proceeded.'
         Assert-True ((@($noClone.Lines) -join "`n") -match 'CLONE_RECORD_MISSING') 'Continuing with no recorded clone did not name the missing clone record.'
@@ -10840,8 +10912,8 @@ function Invoke-TargetTests {
         $targetPromptState.Questions = @()
         $targetPromptState.Answers = @('Bogus')
         $promptedInvalidMode = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerIdentify.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerIdentify.State)
-        Assert-Equal 'CriticalError' $promptedInvalidMode.Status 'A prompted target run with an unsupported answer was accepted.'
-        Assert-True ((@($targetPromptState.Questions) -join '|') -match 'Identify, Create, or Clone') 'The target action did not ask for a mode.'
+        Assert-Equal 'CriticalError' $promptedInvalidMode.Status "A prompted target run with an unsupported answer was accepted: $($promptedInvalidMode.Message)"
+        Assert-True ((@($targetPromptState.Questions) -join '|') -match 'Identify, Create, or Clone') "The target action did not ask for a mode. $(@($targetPromptState.Questions) -join '|')"
         Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'CONFIRM') 'An unsupported prompted mode asked for a mutation confirmation.'
 
         $targetPromptState.Questions = @()
