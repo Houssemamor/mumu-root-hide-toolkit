@@ -8,6 +8,7 @@ param(
     [string[]]$Packages = @(),
     [string]$Mode = '',
     [object]$StartIndex = $null,
+    [string]$AndroidVersion = '',
     [switch]$Confirmed,
     [switch]$NonInteractive,
     [switch]$SkipToolbar,
@@ -15,8 +16,8 @@ param(
     [switch]$ElevatedChild
 )
 
-$script:ToolkitActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
-$script:ToolkitDispatchedActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+$script:ToolkitActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'FullSetup', 'RemoveAds', 'Restore')
+$script:ToolkitDispatchedActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'FullSetup', 'RemoveAds', 'Restore')
 $script:ToolkitActionDescriptions = @{
     Detect    = 'Discover MuMu installations and instances and report their state.'
     Verify    = 'Collect the read-only status report for the selected instance.'
@@ -24,6 +25,7 @@ $script:ToolkitActionDescriptions = @{
     Root12    = 'Root an Android 12 instance with the pinned Kitsune release on a verified clone.'
     Root15    = 'Enable the built-in Android 15 root on a verified clone.'
     Conceal   = 'Apply the Root concealment template to explicitly selected apps on a verified clone.'
+    FullSetup = 'Root the instance, conceal the selected apps, then suppress the campaign advertisements, stopping at the first step that does not succeed.'
     RemoveAds = 'Suppress the MuMu campaign advertisements for the selected installation.'
     Restore   = 'Restore the MuMu campaign files from the toolkit restore point.'
     Q         = 'Quit the toolkit.'
@@ -35,6 +37,7 @@ $script:ToolkitActionGroups = @{
     Root12    = 'Change'
     Root15    = 'Change'
     Conceal   = 'Change'
+    FullSetup = 'Change'
     RemoveAds = 'Change'
     Restore   = 'Change'
     Q         = 'Exit'
@@ -67,6 +70,7 @@ $script:ToolkitDependencyConsentWord = 'FETCH'
 . (Join-Path $PSScriptRoot 'Root15.ps1')
 . (Join-Path $PSScriptRoot 'Concealment.ps1')
 . (Join-Path $PSScriptRoot 'Target.ps1')
+. (Join-Path $PSScriptRoot 'Menu.ps1')
 
 function Get-ToolkitActionCatalog {
     $catalog = @()
@@ -148,9 +152,12 @@ function Get-ToolkitConsoleColor {
     if ($Line -cmatch '^\[(Success|AlreadyApplied)\]') { return 'Green' }
     if ($Line -cmatch '^\[(Warning|RecoverableError)\]') { return 'Yellow' }
     if ($Line -cmatch '^\[CriticalError\]') { return 'Red' }
-    if ($Line -clike 'Select a number from*') { return 'Yellow' }
+    if ($Line -clike 'Select one of the choices*') { return 'Yellow' }
+    # The title and the rule under it are the screen header, so both are colored together. A rule is
+    # matched by its own shape rather than by its width, because the width is the widest row and changes
+    # with the screen.
     if ($Line -ceq ('  ' + [string]$script:ToolkitMenuTitle)) { return 'Cyan' }
-    if ($Line -ceq ('  ' + ('-' * ([string]$script:ToolkitMenuTitle).Length))) { return 'DarkGray' }
+    if ($Line -cmatch '^  ={10,}$') { return 'DarkGray' }
     if ($Line -ceq ('  ' + [string]$script:ToolkitMenuSummary)) { return 'DarkGray' }
     return ''
 }
@@ -464,6 +471,7 @@ function Invoke-ToolkitTarget {
         [int]$SourceIndex = -1,
         [string]$Mode = '',
         [object]$StartIndex = $null,
+        [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [scriptblock]$Prompt = $null,
         [scriptblock]$Runner = $null
@@ -510,7 +518,7 @@ function Invoke-ToolkitTarget {
     }
 
     $journal = New-ToolkitActionJournal -StateRoot $StateRoot -Operation 'Target' -Instance $Install
-    $result = Select-ToolkitTarget -Install $Install -Journal $journal -Mode $targetMode -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StartIndex $targetStartIndex -Confirmed:$targetConfirmed -Prompt $Prompt -Runner $Runner
+    $result = Select-ToolkitTarget -Install $Install -Journal $journal -Mode $targetMode -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StartIndex $targetStartIndex -AndroidVersion $AndroidVersion -Confirmed:$targetConfirmed -Prompt $Prompt -Runner $Runner
     return (Close-ToolkitActionJournal -Journal $journal -Result $result)
 }
 
@@ -529,6 +537,7 @@ function Invoke-ToolkitActionWithElevation {
         [string[]]$Packages = @(),
         [string]$Mode = '',
         [object]$StartIndex = $null,
+        [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [switch]$FetchDependencies,
         [switch]$ElevatedChild,
@@ -537,7 +546,7 @@ function Invoke-ToolkitActionWithElevation {
         [scriptblock]$ElevationRunner = $null
     )
 
-    $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -Runner $Runner
+    $result = Invoke-ToolkitAction -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -Runner $Runner
     # An elevated child is the one process that must never ask for rights again, and an unarmed seam
     # has no UAC prompt to raise, so both return the in-process outcome unchanged.
     if ($ElevatedChild -or $null -eq $ElevationRunner) {
@@ -578,6 +587,7 @@ function Invoke-ToolkitAction {
         [string[]]$Packages = @(),
         [string]$Mode = '',
         [object]$StartIndex = $null,
+        [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [switch]$FetchDependencies,
         [switch]$ElevatedChild,
@@ -611,7 +621,7 @@ function Invoke-ToolkitAction {
     }
 
     if ($Action -ceq 'Target') {
-        return (Invoke-ToolkitTarget -Install $install.Data -StateRoot $statePath -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -Prompt $Prompt -Runner $Runner)
+        return (Invoke-ToolkitTarget -Install $install.Data -StateRoot $statePath -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed:$Confirmed -Prompt $Prompt -Runner $Runner)
     }
 
     $instance = Resolve-ToolkitInstance -Install $install.Data -InstanceIndex $InstanceIndex -Prompt $Prompt
@@ -678,6 +688,14 @@ function Invoke-ToolkitAction {
         $journal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'Root15' -Instance $selected
         $result = Enable-Android15Root -Instance $selected -Journal $journal -Confirmed
         return (Close-ToolkitActionJournal -Journal $journal -Result $result)
+    }
+
+    if ($Action -ceq 'FullSetup') {
+        $version = [string]$AndroidVersion
+        if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = [string]$selected.AndroidVersion
+        }
+        return Invoke-ToolkitFullSetup -Install $install.Data -StateRoot $statePath -InstanceIndex $selectedIndex -Packages $Packages -AndroidVersion $version -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -Prompt $Prompt -Runner $Runner
     }
 
     if ($Action -ceq 'Conceal') {
@@ -993,6 +1011,7 @@ function Invoke-MenuAction {
         [string[]]$Packages = @(),
         [string]$Mode = '',
         [object]$StartIndex = $null,
+        [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [switch]$FetchDependencies,
         [switch]$ElevatedChild,
@@ -1013,7 +1032,7 @@ function Invoke-MenuAction {
                 $result = & $Runner $Action
             }
             else {
-                $result = Invoke-ToolkitActionWithElevation -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -ElevationRunner $ElevationRunner
+                $result = Invoke-ToolkitActionWithElevation -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -ElevationRunner $ElevationRunner
             }
         }
         catch {
@@ -1060,6 +1079,117 @@ function Invoke-MenuAction {
     return Get-ToolkitResult -Status ([string]$result.Status) -Message ([string]$result.Message) -Data $data
 }
 
+# The full setup is three existing actions in order, not a fourth flow. Each step runs through the same
+# dispatch the menu already uses, so each keeps its own operation journal, its own elevation retry, and
+# its own fail-closed confirmation. The run stops at the first step that does not succeed and says which
+# steps completed, because a chain that failed halfway leaves a mixed instance and an operator who is not
+# told which half is real cannot safely continue.
+function Invoke-ToolkitFullSetup {
+    param(
+        [object]$Install,
+        [string]$StateRoot,
+        [int]$InstanceIndex = -1,
+        [string[]]$Packages = @(),
+        [string]$AndroidVersion = '',
+        [switch]$Confirmed,
+        [switch]$FetchDependencies,
+        [scriptblock]$Prompt = $null,
+        [scriptblock]$Runner = $null,
+        [scriptblock]$ActionRunner = $null
+    )
+
+    # The Android version decides which root implementation is the applicable one, and an instance whose
+    # version is neither 12 nor 15 has no root step this toolkit can claim to perform.
+    $rootAction = ''
+    if ($AndroidVersion -like '12*') {
+        $rootAction = 'Root12'
+    }
+    elseif ($AndroidVersion -like '15*') {
+        $rootAction = 'Root15'
+    }
+    if ([string]::IsNullOrWhiteSpace($rootAction)) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message "The instance Android version is $AndroidVersion, so no root implementation in this toolkit applies and the full setup was refused. Run the Android 12 or Android 15 root action on a 12 or 15 instance. Nothing was changed." -Data (@{ Code = 'FULL_SETUP_VERSION_UNSUPPORTED'; AndroidVersion = Protect-ToolkitText $AndroidVersion })
+    }
+    if (-not $Confirmed) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The full setup changes the instance, so it requires an explicit confirmation. Nothing was changed.' -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
+    }
+    if (@($Packages).Count -eq 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'The full setup conceals explicitly selected apps, so no application package was selected and nothing was changed. Pass -Packages with the exact package names.' -Data (@{ Code = 'PACKAGES_REQUIRED' })
+    }
+
+    $steps = @(
+        [pscustomobject]@{ Name = $rootAction; Packages = @() }
+        [pscustomobject]@{ Name = 'Conceal'; Packages = @($Packages) }
+        [pscustomobject]@{ Name = 'RemoveAds'; Packages = @() }
+    )
+    $completed = @()
+    $stepReports = @()
+    foreach ($step in $steps) {
+        $arguments = @{
+            Action = [string]$step.Name
+            InstallRoot = [string](Get-ToolkitRecordValue -Record $Install -PropertyNames @('InstallRoot'))
+            InstanceIndex = $InstanceIndex
+            StateRoot = $StateRoot
+            Packages = @($step.Packages)
+            Confirmed = $Confirmed
+            FetchDependencies = $FetchDependencies
+            Prompt = $Prompt
+            Runner = $Runner
+            LogPath = ''
+        }
+        # The advertisement step is installation scoped, so handing it an instance index would be a lie
+        # the resolver would have to refuse. It is called with the install root and no instance.
+        if ([string]$step.Name -ceq 'RemoveAds') {
+            $arguments.Remove('InstanceIndex')
+        }
+        $result = $null
+        if ($null -ne $ActionRunner) {
+            $result = & $ActionRunner ([string]$step.Name)
+        }
+        else {
+            $result = Invoke-MenuAction @arguments
+        }
+        $stepReports += [pscustomobject]@{ Name = [string]$step.Name; Status = [string]$result.Status; Message = [string]$result.Message }
+        if ([string]$result.Status -notin @('Success', 'AlreadyApplied')) {
+            $done = if ($completed.Count -eq 0) { 'no step' } else { ($completed -join ', ') }
+            $remaining = @($steps | Where-Object { $completed -cnotcontains [string]$_.Name -and [string]$_.Name -cne [string]$step.Name } | ForEach-Object { [string]$_.Name })
+            return Get-ToolkitResult -Status ([string]$result.Status) -Message "The full setup stopped at $([string]$step.Name). Completed: $done. Not run: $(if ($remaining.Count -eq 0) { 'none' } else { $remaining -join ', ' }). $([string]$result.Message)" -Data ([pscustomobject]@{ Code = 'FULL_SETUP_STOPPED'; Completed = $completed; StoppedAt = [string]$step.Name; Steps = $stepReports })
+        }
+        $completed += [string]$step.Name
+    }
+    # The braces around the index are required because a colon directly after a variable name is read as
+    # a scope modifier, so "$InstanceIndex: x" is a parse error rather than the sentence it looks like.
+    return Get-ToolkitResult -Status 'Success' -Message "The full setup completed every step on the instance at index ${InstanceIndex}: $($completed -join ', ')." -Data ([pscustomobject]@{ Code = 'OK'; Completed = $completed; Steps = $stepReports })
+}
+
+# The dashboard is rebuilt from live discovery on every visit rather than cached, because the person
+# changes the instance set outside this menu (a clone finished, an instance stopped) and a stale table
+# is how the wrong instance gets rooted. The discovery is the same cheap one the Detect action uses.
+function Get-ToolkitDashboardSnapshot {
+    param([scriptblock]$Runner = $null)
+
+    $sources = Get-ToolkitDiscoverySources
+    $installs = @(Find-MuMuInstallations -Edition 'All' -RegistryRoots @($sources.RegistryRoots) -ProcessSnapshot @($sources.ProcessSnapshot) -FallbackRoots @($sources.FallbackRoots) |
+            Where-Object { $null -eq $_.PSObject.Properties['Status'] })
+    if ($installs.Count -eq 0) {
+        return Get-ToolkitResult -Status 'CriticalError' -Message 'No MuMu installation was discovered, so no instance can be listed.' -Data (@{ Code = 'INSTALL_NOT_DISCOVERED' })
+    }
+    # The first discovered installation is the one the dashboard shows. A machine with two installations
+    # is a rare shape, and the existing install picker still resolves the choice for a scripted run.
+    $install = $installs[0]
+    $managerPath = [string](Get-ToolkitFirstProperty -InputObject $install -PropertyNames @('ManagerPath'))
+    $instances = @(Get-MuMuInstances -Install $install -ManagerPath $managerPath -Runner $Runner |
+            Where-Object { $null -eq $_.PSObject.Properties['Status'] })
+    return Get-ToolkitResult -Status 'Success' -Message "$($instances.Count) instance(s) were read." -Data ([pscustomobject]@{
+            Install = $install
+            InstallCount = $installs.Count
+            Instances = $instances
+        })
+}
+
+# The three screens, one loop. The screen is the loop's only state: a name, the instance it is about, and
+# how the target was reached. Every mutating choice still resolves to one dispatched action through
+# Invoke-MenuAction, so nothing here bypasses the journal, the elevation seam, or the confirmation.
 function Invoke-MenuLoop {
     param(
         [scriptblock]$Reader,
@@ -1068,27 +1198,54 @@ function Invoke-MenuLoop {
         [hashtable]$ActionArguments = @{},
         [string]$StateRoot = '',
         [string]$LogPath = '',
-        [switch]$ShowBanner
+        [switch]$ShowBanner,
+        [scriptblock]$Ask = $null,
+        [int]$SeedInstanceIndex = -1,
+        [string]$InstallRoot = ''
     )
 
     $write = $Writer
     if ($null -eq $write) {
         $write = { param($Line) Write-ToolkitConsoleLine $Line }
     }
+    $ask = $Ask
+    if ($null -eq $ask) {
+        $ask = { param($Question) [string](Read-Host $Question) }
+    }
     $exitCode = 0
     $firstPrompt = $true
+    $screen = 'Dashboard'
+    $selected = $null
+    $target = $null
+    $snapshot = $null
+    # An instance named on the command line is the source the operator already chose, so the loop opens on
+    # that instance's action screen instead of making them pick it again from the table. The action still
+    # resolves its own clone, exactly as it does from the target screen, so nothing is written in place.
+    # An instance named on the command line opens that instance's action screen directly. The index is
+    # trusted rather than discovered: the action behind every row resolves and verifies the instance
+    # itself and refuses a bad one, so a seed that is wrong is refused by the action with its own reason
+    # rather than by a table lookup that would silently select a different instance.
+    if ($SeedInstanceIndex -ge 0) {
+        $selected = [pscustomobject]@{ Index = $SeedInstanceIndex; Name = 'instance ' + [string]$SeedInstanceIndex; AndroidVersion = '' }
+        $target = [pscustomobject]@{ Mode = 'Source'; Index = $SeedInstanceIndex; Name = [string]$selected.Name }
+        $screen = 'Actions'
+    }
+
     while ($true) {
-        # The banner is rewritten before every prompt so the choices stay on screen no matter how long the
-        # previous action scrolled, rather than being printed once and left behind.
+        # The dashboard snapshot is read here rather than inside the renderer, so the screen that is
+        # printed and the answer that is resolved are looking at the same list of instances. A renderer
+        # that read its own copy would let a number on screen resolve against a different table.
+        if ($screen -ceq 'Dashboard' -and $null -eq $snapshot) {
+            $snapshot = Get-ToolkitDashboardSnapshot
+        }
         if ($ShowBanner) {
             if (-not $firstPrompt) {
-                # One blank line keeps the previous result block apart from the rewritten menu. The very
-                # first menu is written without it so a fresh session opens at the top of the console.
+                # One blank line keeps the previous result block apart from the rewritten screen.
                 & $write ''
             }
             $firstPrompt = $false
-            foreach ($bannerLine in @(Format-ToolkitMenuBanner)) {
-                & $write $bannerLine
+            foreach ($line in @(Get-ToolkitScreenLines -Screen $screen -Snapshot $snapshot -Instance $selected -Target $target -Writer $write)) {
+                & $write $line
             }
         }
         $read = $null
@@ -1110,27 +1267,164 @@ function Invoke-MenuLoop {
         if ($null -eq $read) {
             return $exitCode
         }
-        $answer = [string]$read
-        $entry = Resolve-ToolkitMenuChoice -Answer $answer
-        if ($null -eq $entry) {
-            if (-not [string]::IsNullOrWhiteSpace($answer.Trim())) {
-                # An answer that matches no printed number is reported against the printed range instead
-                # of being dispatched as an action name, so a mistyped digit never runs something.
-                & $write ('Select a number from 1-' + @(Get-ToolkitActionCatalog).Count + ', or press Enter to see the menu again.')
+        $answer = ([string]$read).Trim()
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            continue
+        }
+        $choice = Resolve-ToolkitScreenChoice -Screen $screen -Answer $answer -Snapshot $snapshot -Instance $selected
+        if ($null -eq $choice) {
+            & $write ('Select one of the choices this screen printed. Press Enter to see it again.')
+            continue
+        }
+        if ([string]$choice.Kind -ceq 'Quit') {
+            return $exitCode
+        }
+        if ([string]$choice.Kind -ceq 'Back') {
+            $screen = 'Dashboard'
+            $selected = $null
+            $target = $null
+            $snapshot = $null
+            continue
+        }
+        if ([string]$choice.Kind -ceq 'Refresh') {
+            $snapshot = $null
+            continue
+        }
+
+        if ([string]$choice.Kind -ceq 'SelectInstance') {
+            $selected = $choice.Instance
+            $screen = 'Target'
+            continue
+        }
+        if ([string]$choice.Kind -ceq 'Target') {
+            # The install is taken from the cached snapshot when the screen was reached from the dashboard,
+            # and read once here when the session arrived with a command line instance index instead.
+            $targetInstall = $null
+            if ($null -ne $snapshot -and $null -ne $snapshot.PSObject -and $null -ne $snapshot.PSObject.Properties['Data']) {
+                $targetInstall = Get-ToolkitRecordValue -Record $snapshot.Data -PropertyNames @('Install')
+            }
+            if ($null -eq $targetInstall) {
+                $freshTarget = Get-ToolkitDashboardSnapshot -InstallRoot $InstallRoot
+                if ($null -ne $freshTarget -and $null -ne $freshTarget.PSObject -and $null -ne $freshTarget.PSObject.Properties['Data']) {
+                    $targetInstall = Get-ToolkitRecordValue -Record $freshTarget.Data -PropertyNames @('Install')
+                }
+            }
+            $built = Invoke-ToolkitMenuTarget -Choice ([string]$choice.Target) -Install $targetInstall -StateRoot $StateRoot -Instance $selected -Ask $ask -Show ({ param($Line) & $write $line }).GetNewClosure() -Runner $Runner -ActionArguments $ActionArguments
+            foreach ($line in @($built.Lines)) {
+                & $write $line
+            }
+            if ($null -ne $built.Result) {
+                $builtResult = $built.Result
+                if ($null -ne $builtResult.PSObject -and $null -ne $builtResult.PSObject.Properties['Status']) {
+                    $code = Get-ToolkitExitCode $builtResult
+                    if ($code -ne 0) {
+                        $exitCode = $code
+                    }
+                }
+            }
+            if ($null -ne $built.PSObject -and $null -ne $built.PSObject.Properties['Proceed'] -and $built.Proceed) {
+                $target = $built.Target
+                $screen = 'Actions'
+            }
+            else {
+                $screen = 'Dashboard'
+            }
+            $snapshot = $null
+            continue
+        }
+        if ([string]$choice.Kind -ceq 'NewInstance') {
+            # The snapshot is read defensively because this screen is also reachable from a seeded session
+            # where the caller supplied the install root and the cache may be empty.
+            $newInstall = $null
+            if ($null -ne $snapshot -and $null -ne $snapshot.PSObject -and $null -ne $snapshot.PSObject.Properties['Data']) {
+                $newInstall = Get-ToolkitRecordValue -Record $snapshot.Data -PropertyNames @('Install')
+            }
+            if ($null -eq $newInstall) {
+                $fresh = Get-ToolkitDashboardSnapshot -InstallRoot $InstallRoot
+                if ($null -eq $fresh -or $null -eq $fresh.PSObject -or $null -eq $fresh.PSObject.Properties['Data']) {
+                    $noInstall = Get-ToolkitResult -Status 'CriticalError' -Message 'The installation could not be read, so no instance was created and nothing was changed.' -Data (@{ Code = 'INSTALL_NOT_DISCOVERED' })
+                    foreach ($line in @(Format-ToolkitResult -Result $noInstall -Interactive)) {
+                        & $write $line
+                    }
+                    $exitCode = Get-ToolkitExitCode $noInstall
+                    $screen = 'Dashboard'
+                    $snapshot = $null
+                    continue
+                }
+                $newInstall = Get-ToolkitRecordValue -Record $fresh.Data -PropertyNames @('Install')
+            }
+            $built = Invoke-ToolkitMenuNewInstance -Install $newInstall -StateRoot $StateRoot -Ask $ask -Runner $Runner -ActionArguments $ActionArguments
+            foreach ($line in @($built.Lines)) {
+                & $write $line
+            }
+            $builtResult = $built.Result
+            if ($null -ne $builtResult -and $null -ne $builtResult.PSObject -and $null -ne $builtResult.PSObject.Properties['Status']) {
+                $code = Get-ToolkitExitCode $builtResult
+                if ($code -ne 0) {
+                    $exitCode = $code
+                }
+            }
+            $snapshot = $null
+            if ($null -ne $built.Instance) {
+                $selected = $built.Instance
+                $target = [pscustomobject]@{ Mode = 'Create'; Index = [int]$built.Index; Name = [string]$built.Name }
+                $screen = 'Actions'
             }
             continue
         }
-        if ([string]$entry.Name -ceq 'Q') {
-            return $exitCode
+        if ([string]$choice.Kind -ceq 'Advertisements') {
+            $arguments = @{}
+            foreach ($key in @($ActionArguments.Keys)) {
+                $arguments[[string]$key] = $ActionArguments[$key]
+            }
+            $arguments['Action'] = [string]$choice.Advertisements
+            $arguments['Runner'] = $Runner
+            $arguments['StateRoot'] = $StateRoot
+            $arguments['LogPath'] = $LogPath
+            $result = $null
+            try {
+                $result = Invoke-MenuAction @arguments
+            }
+            catch {
+                $result = Get-ToolkitResult -Status 'CriticalError' -Message 'The action could not be completed.' -Data (@{ Code = 'ACTION_THREW' })
+            }
+            foreach ($line in @(Format-ToolkitResult -Result $result -Interactive)) {
+                & $write $line
+            }
+            $code = Get-ToolkitExitCode $result
+            if ($code -ne 0) {
+                $exitCode = $code
+            }
+            continue
+        }
+
+        # An action on the chosen target. The disclosure is printed before the confirmation word is asked
+        # for, so the operator reads what will change and then decides, and the row tag is only a summary.
+        $action = [string]$choice.Action
+        if ($ShowBanner -and $action -in @('Root12', 'Root15', 'Conceal', 'FullSetup', 'RemoveAds', 'Restore')) {
+            $disclosureInstance = $selected
+            if ($null -ne $target) {
+                $disclosureInstance = [pscustomobject]@{ Index = [int]$target.Index; Name = [string]$target.Name }
+            }
+            foreach ($line in @(Format-ToolkitDisclosure -Action $action -Instance $disclosureInstance -Packages @())) {
+                & $write $line
+            }
         }
         $arguments = @{}
         foreach ($key in @($ActionArguments.Keys)) {
             $arguments[[string]$key] = $ActionArguments[$key]
         }
-        $arguments['Action'] = [string]$entry.Name
+        $arguments['Action'] = $action
         $arguments['Runner'] = $Runner
         $arguments['StateRoot'] = $StateRoot
         $arguments['LogPath'] = $LogPath
+        if ($null -ne $target) {
+            $arguments['InstanceIndex'] = [int]$target.Index
+            $arguments['AndroidVersion'] = [string]$selected.AndroidVersion
+        }
+        if ($null -eq $Ask) {
+            $arguments['Prompt'] = $ask
+        }
         $result = $null
         try {
             $result = Invoke-MenuAction @arguments
@@ -1145,6 +1439,7 @@ function Invoke-MenuLoop {
         if ($code -ne 0) {
             $exitCode = $code
         }
+        $snapshot = $null
     }
 }
 
@@ -1179,6 +1474,7 @@ function Start-ToolkitController {
         [string[]]$Packages = @(),
         [string]$Mode = '',
         [object]$StartIndex = $null,
+        [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [switch]$NonInteractive,
         [switch]$SkipToolbar,
@@ -1227,7 +1523,7 @@ function Start-ToolkitController {
 
     $read = $Reader
     if ($null -eq $read) {
-        $read = { param() Read-Host ('Select an action (1-' + @(Get-ToolkitActionCatalog).Count + ')') }
+        $read = { param() Read-Host 'Select' }
     }
     $ask = $Prompt
     if ($null -eq $ask) {
@@ -1245,7 +1541,9 @@ function Start-ToolkitController {
             # An explicit -FetchDependencies is the consent, and a cache that already holds both verified
             # pinned assets needs no download, so the question is asked only when it can change the run.
             $fetchDependencies = $FetchDependencies
-            if ($Choice -ceq 'Conceal') {
+            # The full setup conceals apps, so it asks the same package and download questions the conceal
+            # row asks rather than reaching the app list from a different path.
+            if ($Choice -ceq 'Conceal' -or $Choice -ceq 'FullSetup') {
                 if ($selectedPackages.Count -eq 0) {
                     $answer = [string](& $ask 'Comma-separated application package names for the Root template')
                     $selectedPackages = @($answer -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -1258,21 +1556,37 @@ function Start-ToolkitController {
                 }
             }
             $confirmed = $Confirmed
-            if ($Choice -ceq 'Root15' -and -not $confirmed) {
-                $confirmed = ([string](& $ask 'Type CONFIRM to enable the built-in Android 15 root') -ceq 'CONFIRM')
+            if (-not $confirmed -and $Choice -in @('Root12', 'Root15', 'FullSetup')) {
+                $confirmed = ([string](& $ask ('Type CONFIRM to run ' + $Choice + ' on the selected instance')) -ceq 'CONFIRM')
             }
-            $targetMode = ''
-            $targetStartIndex = $null
+            $targetMode = $Mode
+            $targetStartIndex = $StartIndex
             $targetSourceIndex = $SourceIndex
             if ($Choice -ceq 'Target') {
                 $targetMode = $Mode
                 $targetStartIndex = $StartIndex
             }
-            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -Confirmed:$confirmed -FetchDependencies:$fetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
+            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -AndroidVersion $AndroidVersion -Confirmed:$confirmed -FetchDependencies:$fetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
         }.GetNewClosure()
     }
 
-    return (Invoke-MenuLoop -Reader $read -Writer $write -Runner $runner -StateRoot $statePath -LogPath $logPath -ShowBanner:(-not $SkipToolbar))
+    # An instance index given on the command line is the source the operator already chose, so the menu
+    # opens on that instance's action screen. The rows there still resolve to the same dispatched actions
+    # and each one still resolves its own clone, so naming an instance does not write to it in place.
+    $menuArguments = @{
+        Reader     = $read
+        Writer     = $write
+        Runner     = $runner
+        StateRoot  = $statePath
+        LogPath    = $logPath
+        ShowBanner = (-not $SkipToolbar)
+        Ask        = $ask
+    }
+    if ($InstanceIndex -ge 0) {
+        $menuArguments['SeedInstanceIndex'] = $InstanceIndex
+        $menuArguments['InstallRoot'] = $InstallRoot
+    }
+    return (Invoke-MenuLoop @menuArguments)
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
@@ -1283,5 +1597,5 @@ if ($MyInvocation.InvocationName -ne '.') {
     if (-not $ElevatedChild) {
         $elevationRunner = $script:ToolkitProductionElevationRunner
     }
-    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -ElevationRunner $elevationRunner)
+    exit (Start-ToolkitController -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed:$Confirmed -NonInteractive:$NonInteractive -SkipToolbar:$SkipToolbar -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -ElevationRunner $elevationRunner)
 }

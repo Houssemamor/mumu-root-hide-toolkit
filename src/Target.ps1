@@ -95,6 +95,7 @@ function New-MuMuInstance {
         [object]$Journal,
         [int]$Count = 1,
         [object]$StartIndex = $null,
+        [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [scriptblock]$Runner = $null
     )
@@ -167,7 +168,14 @@ function New-MuMuInstance {
         return New-ToolkitInstanceFailure -Journal $Journal -Message "The requested index $requestedIndex is already in use, so no instance was created."
     }
 
-    $create = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('create', '-n', [string]$Count) -Runner $Runner
+    # The engine is named explicitly when the caller asked for one, because the manager otherwise picks
+    # a default and a create aimed at the Android 15 root must not silently land on Android 12.
+    $createArguments = @('create', '-n', [string]$Count)
+    $requestedVersion = ConvertTo-ToolkitAndroidVersion -Value $AndroidVersion
+    if (-not [string]::IsNullOrWhiteSpace($requestedVersion)) {
+        $createArguments += @('-ver', ([string]$requestedVersion -replace '\.0$', ''))
+    }
+    $create = Invoke-CheckedProcess -FilePath $manager -ArgumentList $createArguments -Runner $Runner
     if ($null -eq $create -or $create.ExitCode -ne 0) {
         return New-ToolkitInstanceFailure -Journal $Journal -Message 'The MuMu manager create command failed.'
     }
@@ -253,6 +261,7 @@ function Select-ToolkitTarget {
         [int]$InstanceIndex = -1,
         [int]$SourceIndex = -1,
         [object]$StartIndex = $null,
+        [string]$AndroidVersion = '',
         [switch]$Confirmed,
         [scriptblock]$Prompt = $null,
         [scriptblock]$Runner = $null
@@ -281,7 +290,7 @@ function Select-ToolkitTarget {
     $edition = [string](Get-ToolkitFirstProperty -InputObject $Install -PropertyNames @('Edition'))
 
     if ($Mode -ceq 'Create') {
-        $created = New-MuMuInstance -ManagerPath $managerPath -Install $Install -Journal $Journal -Count 1 -StartIndex $StartIndex -Confirmed -Runner $Runner
+        $created = New-MuMuInstance -ManagerPath $managerPath -Install $Install -Journal $Journal -Count 1 -StartIndex $StartIndex -AndroidVersion $AndroidVersion -Confirmed -Runner $Runner
         if ($created.Status -ne 'Success') {
             return $created
         }

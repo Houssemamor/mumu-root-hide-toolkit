@@ -8371,7 +8371,7 @@ name=Vector
     Assert-Equal 'CriticalError' $negativeIndexResult.Status 'Concealment verification accepted a negative instance index.'
 }
 
-$script:MenuActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'RemoveAds', 'Restore')
+$script:MenuActions = @('Detect', 'Verify', 'Target', 'Root12', 'Root15', 'Conceal', 'FullSetup', 'RemoveAds', 'Restore')
 $script:MenuCampaignJson = '{"version":3,"campaigns":[{"id":"alpha","display":true,"order":1,"image":"a.png"},{"id":"beta","order":2}]}'
 $script:MenuInfoJson12 = '[{"index":"0","name":"Base","is_main":true,"is_process_started":false,"android_version":"12.0"},{"index":"2","name":"Android 12","is_main":false,"is_process_started":true,"android_version":"12.0"}]'
 $script:MenuInfoJson15 = '[{"index":"0","name":"Base","is_main":true,"is_process_started":false,"android_version":"15.0"},{"index":"3","name":"Android 15","is_main":false,"is_process_started":true,"android_version":"15.0"}]'
@@ -8601,39 +8601,263 @@ function Invoke-MenuTests {
         $catalogNumbers = @($catalog | ForEach-Object { [int]$_.Number })
         Assert-Equal ((@(1..$catalog.Count) | ForEach-Object { [string]$_ }) -join ',') ($catalogNumbers -join ',') 'The menu catalog does not number its entries 1..N in order.'
 
-        # The rendered menu is what the operator reads, so each line must lead with the number it accepts.
-        $toolbarState = @{ Lines = @() }
-        $toolbarCode = Start-ToolkitController -StateRoot $menuStateRoot -Reader (New-MenuReader -Answers @('9')) -Writer ({ param($Line) $toolbarState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'menu rendered' }).GetNewClosure()
-        Assert-Equal 0 $toolbarCode 'The numbered menu did not return a zero exit code.'
-        $toolbarText = @($toolbarState.Lines) -join "`n"
-        foreach ($entry in $catalog) {
-            Assert-True ($toolbarText -match ('\s' + [regex]::Escape([string]$entry.Number) + '\s+' + [regex]::Escape([string]$entry.Name) + '\b')) "The menu does not offer $($entry.Number) for $($entry.Name)."
-        }
-        foreach ($group in @('Inspect', 'Prepare', 'Change', 'Exit')) {
-            Assert-True ($toolbarText -match ('(?m)^\s+' + $group + '\b')) "The menu does not group its actions under: $group"
-        }
+        # Every action carries a group, even though the three screens no longer print a single numbered
+        # list of them: the screens group their own rows, and this is what keeps an action from losing
+        # its place in the design when a new screen is added.
         foreach ($entry in $catalog) {
             Assert-True (-not [string]::IsNullOrWhiteSpace([string]$script:ToolkitActionGroups[[string]$entry.Name])) "The menu has no group for the action: $($entry.Name)"
         }
 
-        # The menu has to stay on screen, so it is written before every prompt rather than once at startup.
-        $repeatState = @{ Lines = @() }
-        $repeatCode = Start-ToolkitController -StateRoot $menuStateRoot -Reader (New-MenuReader -Answers @('1', '1', '9')) -Writer ({ param($Line) $repeatState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure()
-        Assert-Equal 0 $repeatCode 'A repeated menu session did not return a zero exit code.'
-        $bannerCount = @(@($repeatState.Lines) | Where-Object { [string]$_ -match 'MuMu Root Hide Toolkit' }).Count
-        Assert-Equal 3 $bannerCount 'The menu banner was not written before every prompt.'
-        $blankSeparatorCount = @(@($repeatState.Lines) | Where-Object { [string]::IsNullOrEmpty([string]$_) }).Count
-        Assert-Equal 2 $blankSeparatorCount 'A result block is not separated from the next menu by exactly one blank line.'
+        # The three screens are rendered by one renderer, so a row, a group and a title look the same
+        # wherever they appear. Each screen is asserted for its own rows, its own groups and the prompt
+        # that names the range it actually prints.
+        $screenInstance = [pscustomobject]@{ Index = 0; Name = 'Roo+3d 12'; AndroidVersion = '12.0'; Running = $false; RootSetting = $false }
+        $screenSnapshot = [pscustomobject]@{
+            Install      = [pscustomobject]@{ Edition = 'Chinese'; InstallRoot = 'D:\MuMu' }
+            InstallCount = 1
+            Instances    = @($screenInstance, [pscustomobject]@{ Index = 1; Name = 'Device-1'; AndroidVersion = '15.0'; Running = $true; RootSetting = $null })
+        }
+
+        $dashboardLines = @(Get-ToolkitScreenLines -Screen 'Dashboard' -Snapshot $screenSnapshot -Instance $null -Target $null)
+        $dashboardText = @($dashboardLines) -join "`n"
+        Assert-True ($dashboardText -match [string]$script:ToolkitMenuTitle) 'The dashboard does not carry the toolkit title.'
+        # The table is the discovery a person acts on, so it names the index, the Android version and both
+        # states. The two number columns are separate because '#' is typed and 'Idx' is what MuMu calls it.
+        Assert-True ($dashboardText -match '(?m)^\s+#\s+Idx\s+Name\s+Android\s+Running\s+Vendor root') 'The dashboard table does not carry both number columns and the state headers.'
+        Assert-True ($dashboardText -match '(?m)^\s+1\s+0\s+Roo\+3d 12\s+12\.0\s+no\s+no\s*$') 'The dashboard table does not show the first instance with its index, version and states.'
+        # A manager that reports no root setting reads as unknown, never as no, because no is a claim
+        # about a measurement that was never taken.
+        Assert-True ($dashboardText -match '(?m)^\s+2\s+1\s+Device-1\s+15\.0\s+yes\s+unknown\s*$') 'An unreadable vendor root setting is rendered as something other than unknown.'
+        Assert-True ($dashboardText -notmatch '(?m)^\s+2\s+1\s+Device-1\s+15\.0\s+yes\s+no\b') 'An unreadable vendor root setting is rendered as no.'
+        Assert-True ($dashboardText -match 'Chinese\s+D:\\MuMu') 'The dashboard does not name the installation it discovered.'
+        foreach ($row in @('New empty instance', 'Remove ads', 'Restore ads', 'Quit')) {
+            Assert-True ($dashboardText -match [regex]::Escape($row)) "The dashboard does not offer: $row"
+        }
+        # A fresh instance carries nothing from a source, so it belongs on the first screen rather than
+        # under a header that names some other instance.
+        Assert-True ($dashboardText -notmatch '(?m)^\s+\d+\s+New empty instance') 'The fresh instance row was given a number as if it selected an instance.'
+        Assert-True ($dashboardText -match 'Select an instance \(1-2\), or N, A, B or Q') 'The dashboard prompt does not name the choices it accepts.'
+        foreach ($group in @('Prepare', 'Other')) {
+            Assert-True ($dashboardText -match ('(?m)^\s+' + $group + '\b')) "The dashboard does not group its rows under: $group"
+        }
+
+        $targetLines = @(Get-ToolkitScreenLines -Screen 'Target' -Snapshot $screenSnapshot -Instance $screenInstance -Target $null)
+        $targetText = @($targetLines) -join "`n"
+        Assert-True ($targetText -match 'Instance 0\s+Roo\+3d 12\s+Android 12\.0') 'The target screen does not name the instance it is about.'
+        foreach ($row in @('Clone, keep device info', 'Clone, fresh identifiers', 'Continue on its clone', 'Back to the instances')) {
+            Assert-True ($targetText -match [regex]::Escape($row)) "The target screen does not offer: $row"
+        }
+        # There is no in-place entry, because every guest change in this toolkit is made on a clone.
+        Assert-True ($targetText -notmatch '(?i)modify in place|edit in place|change this instance directly') 'The target screen offers an in-place change, which the root and concealment actions all refuse.'
+        Assert-True ($targetText -match 'Select a target \(1-4\)') 'The target screen prompt does not name the range it accepts.'
+        foreach ($group in @('Target', 'Back')) {
+            Assert-True ($targetText -match ('(?m)^\s+' + $group + '\b')) "The target screen does not group its rows under: $group"
+        }
+
+        # The action screen is filtered by the Android version, because a 12 instance cannot take the
+        # built-in 15 root and a 15 instance cannot take the Kitsune release.
+        $twelveActions = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $screenSnapshot -Instance $screenInstance -Target $null)
+        $twelveText = @($twelveActions) -join "`n"
+        Assert-True ($twelveText -match 'Root with Kitsune') 'A 12 instance is not offered the Kitsune root.'
+        Assert-True ($twelveText -notmatch 'Built-in root') 'A 12 instance is offered the built-in 15 root, which cannot apply to it.'
+        Assert-True ($twelveText -match 'Select an action \(1-5\)') 'The action screen prompt does not name the range it accepts.'
+        $fifteenActions = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $screenSnapshot -Instance ([pscustomobject]@{ Index = 1; Name = 'Device-1'; AndroidVersion = '15.0' }) -Target $null)
+        $fifteenText = @($fifteenActions) -join "`n"
+        Assert-True ($fifteenText -match 'Built-in root') 'A 15 instance is not offered the built-in root.'
+        Assert-True ($fifteenText -notmatch 'Kitsune') 'A 15 instance is offered the Kitsune root, which cannot apply to it.'
+
+        # A dashboard that cannot discover an installation still has to render, because a machine where
+        # discovery failed has to be told so and given the way out. The screen is written from the same
+        # renderer as a populated one.
+        $emptySnapshot = Get-ToolkitResult -Status 'CriticalError' -Message 'No MuMu installation was discovered, so no instance can be listed.' -Data (@{ Code = 'INSTALL_NOT_DISCOVERED' })
+        $emptyDashboard = @(Get-ToolkitScreenLines -Screen 'Dashboard' -Snapshot $emptySnapshot -Instance $null -Target $null)
+        $emptyText = @($emptyDashboard) -join "`n"
+        Assert-True ($emptyText -match 'INSTALL_NOT_DISCOVERED|No MuMu installation was discovered') 'A dashboard with no installation did not say why it has no rows.'
+        Assert-True ($emptyText -match 'Quit with Q') 'A dashboard with no installation did not offer the way out.'
+        Assert-True ($emptyText -notmatch 'Select an instance \(') 'A dashboard with no installation asked for an instance it does not have.'
+        $screenState = @{ Lines = @() }
+        $screenCode = Start-ToolkitController -StateRoot $menuStateRoot -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) $screenState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure()
+        Assert-Equal 0 $screenCode 'A dashboard session that quit did not return a zero exit code.'
+        # The dashboard is written before the prompt whether or not the discovery found anything, because a
+        # machine with no discovered instance still has to be told why it has no rows and how to leave.
+        $screenText = @($screenState.Lines) -join "`n"
+        Assert-True ($screenText -match [string]$script:ToolkitMenuTitle) 'The dashboard title was not written before the prompt.'
+        Assert-True ($screenText -match '(?m)^Select an instance|^  Quit with Q') 'The dashboard did not print a prompt naming its own choices.'
 
         $skippedState = @{ Lines = @() }
-        $skippedCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('9')) -Writer ({ param($Line) $skippedState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure()
-        Assert-Equal 0 $skippedCode 'A suppressed menu did not return a zero exit code.'
-        Assert-Equal 0 @(@($skippedState.Lines) | Where-Object { [string]$_ -match 'MuMu Root Hide Toolkit' }).Count 'SkipToolbar still printed the menu banner.'
+        $skippedCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) $skippedState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure()
+        Assert-Equal 0 $skippedCode 'A suppressed screen did not return a zero exit code.'
+        Assert-Equal 0 $skippedState.Lines.Count 'SkipToolbar still printed a screen.'
 
-        # Read-Host supplies the trailing colon, so a prompt that carries one renders a doubled colon.
-        $promptState = @{ Questions = @() }
-        $null = Get-ToolkitMenuChoice -Label 'Select the MuMu instance' -Count 3 -Prompt ({ param($Question) $promptState.Questions += $Question; '2' }).GetNewClosure()
-        Assert-Equal 'Select the MuMu instance (1-3)' @($promptState.Questions)[0] 'The instance prompt carries its own colon and renders a doubled one.'
+        # An answer that matches nothing on the current screen is refused rather than guessed at, so a
+        # mistyped number can never select a different instance or start a different action.
+        $refusedChoice = Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer '9' -Snapshot $screenSnapshot -Instance $null
+        Assert-Equal $null $refusedChoice 'An out of range dashboard answer was accepted.'
+        $refusedTarget = Resolve-ToolkitScreenChoice -Screen 'Target' -Answer '5' -Snapshot $screenSnapshot -Instance $screenInstance
+        Assert-Equal $null $refusedTarget 'An out of range target answer was accepted.'
+        $refusedAction = Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '9' -Snapshot $screenSnapshot -Instance $screenInstance
+        Assert-Equal $null $refusedAction 'An out of range action answer was accepted.'
+        Assert-Equal 'Quit' ([string](Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer 'q' -Snapshot $screenSnapshot -Instance $null).Kind) 'Quit is not accepted on any screen.'
+        Assert-Equal 'RemoveAds' ([string](Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer 'A' -Snapshot $screenSnapshot -Instance $null).Advertisements) 'The advertisement suppression row does not resolve.'
+        Assert-Equal 'Restore' ([string](Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer 'B' -Snapshot $screenSnapshot -Instance $null).Advertisements) 'The advertisement restore row does not resolve.'
+        Assert-Equal 'NewInstance' ([string](Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer 'N' -Snapshot $screenSnapshot -Instance $null).Kind) 'The fresh instance row does not resolve.'
+        # The number the operator types is the position in the table, and it selects that row's instance.
+        $picked = Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer '2' -Snapshot $screenSnapshot -Instance $null
+        Assert-Equal 1 ([int]$picked.Instance.Index) 'The second table row did not select the instance on that row.'
+        Assert-Equal 'FullSetup' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '4' -Snapshot $screenSnapshot -Instance $screenInstance).Action) 'The full setup row does not resolve to the full setup.'
+        Assert-Equal 'Root12' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '2' -Snapshot $screenSnapshot -Instance $screenInstance).Action) 'The root row on a 12 instance does not resolve to the Kitsune root.'
+        Assert-Equal 'Root15' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '2' -Snapshot $screenSnapshot -Instance ([pscustomobject]@{ Index = 1; AndroidVersion = '15.0' })).Action) 'The root row on a 15 instance does not resolve to the built-in root.'
+
+        # The disclosure is the warning a one line tag cannot carry, so it names the instance, the apps,
+        # and what the change means for an app that probes for su.
+        $concealDisclosure = @(Format-ToolkitDisclosure -Action 'Conceal' -Instance $screenInstance -Packages @('com.a', 'com.b'))
+        $concealText = @($concealDisclosure) -join "`n"
+        Assert-True ($concealText -match 'instance 0 \(Roo\+3d 12\)') 'The disclosure does not name the instance it will change.'
+        Assert-True ($concealText -match '2 app\(s\) join the Root template: com\.a, com\.b') 'The disclosure does not name the apps and the count.'
+        Assert-True ($concealText -match 'probing for su') 'The disclosure does not state what the change means for an app that looks for su.'
+        $setupDisclosure = @(Format-ToolkitDisclosure -Action 'FullSetup' -Instance $screenInstance)
+        $setupText = @($setupDisclosure) -join "`n"
+        Assert-True ($setupText -match 'root that applies to this Android version') 'The full setup disclosure does not say which root it applies.'
+        Assert-True ($setupText -match 'campaign advertisement files') 'The full setup disclosure does not name the advertisement change.'
+
+        # The keep-info choice is only worth offering if it is verified, so both branches are asserted on
+        # what the manager reports back. A read that fails, a clone that matches nothing, and a fresh write
+        # that changes nothing all have to be refused rather than reported as a success.
+        $identifierState = @{ Values = @{} }
+        $identifierRead = {
+            param($Path, $Arguments)
+            # The arguments arrive as a single object when a switch parameter is bound alongside them, so
+            # they are flattened into a list before they are indexed by position.
+            $words = @($Arguments) | ForEach-Object { [string]$_ }
+            $key = [string]$words[4]
+            $index = [int]$words[2]
+            $value = [string]$identifierState.Values["$index|$key"]
+            return [pscustomobject]@{ ExitCode = 0; Text = ('{' + '"' + $key + '": "' + $value + '"' + '}') }
+        }.GetNewClosure()
+        $identifierState.Values['0|android_id'] = 'aaaa1111'
+        $identifierState.Values['0|mac_address'] = '00:11:22:33:44:55'
+        $identifierState.Values['0|imei'] = '111111111111111'
+        $identifierState.Values['3|android_id'] = 'aaaa1111'
+        $identifierState.Values['3|mac_address'] = '00:11:22:33:44:55'
+        $identifierState.Values['3|imei'] = '111111111111111'
+        $keptIdentifiers = Resolve-ToolkitCloneIdentifiers -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -SourceIndex 0 -CloneIndex 3 -Runner $identifierRead
+        Assert-Equal 'Success' $keptIdentifiers.Status "A clone that kept the device info was not verified: $($keptIdentifiers.Message)"
+        Assert-Equal $true $keptIdentifiers.Data.Kept 'A verified clone did not record that the device info was kept.'
+
+        $identifierState.Values['4|android_id'] = 'bbbb2222'
+        $identifierState.Values['4|mac_address'] = '02:AA:BB:CC:DD:EE'
+        $identifierState.Values['4|imei'] = '111111111111111'
+        $freshIdentifiers = Resolve-ToolkitCloneIdentifiers -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -SourceIndex 0 -CloneIndex 4 -Fresh -Runner $identifierRead
+        Assert-Equal 'Success' $freshIdentifiers.Status "A clone with fresh identifiers was not verified: $($freshIdentifiers.Message)"
+        Assert-Equal $false $freshIdentifiers.Data.Kept 'A clone with fresh identifiers claimed the device info was kept.'
+        Assert-True ((@($freshIdentifiers.Data.Changed) -join ',') -match 'android_id') 'A fresh android id was not reported as changed.'
+
+        # A clone that reports nothing matching the source has not kept the device info, and saying so is
+        # the whole point of reading the identifiers back.
+        $identifierState.Values['5|android_id'] = 'cccc3333'
+        $identifierState.Values['5|mac_address'] = '02:11:22:33:44:55'
+        $identifierState.Values['5|imei'] = '999999999999999'
+        $unkept = Resolve-ToolkitCloneIdentifiers -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -SourceIndex 0 -CloneIndex 5 -Runner $identifierRead
+        Assert-Equal 'CriticalError' $unkept.Status 'A clone that matched no source identifier claimed the device info was kept.'
+        Assert-Equal 'IDENTIFIER_KEEP_UNVERIFIED' $unkept.Data.Code 'An unverifiable keep did not report its own code.'
+
+        # A fresh write the manager did not accept is a failure, not a success with a caveat.
+        $refusingWrite = Resolve-ToolkitCloneIdentifiers -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -SourceIndex 0 -CloneIndex 6 -Fresh -Runner ({
+                param($Path, $Arguments)
+                $words = @(@($Arguments) | ForEach-Object { [string]$_ })
+                # A write carries a value after the key, so six words means the manager was asked to set
+                # something and a refusal is a real refusal rather than a read.
+                if ($words.Count -ge 6) {
+                    return [pscustomobject]@{ ExitCode = 1; Text = '{"errcode": -12}' }
+                }
+                return [pscustomobject]@{ ExitCode = 0; Text = '{"android_id": "aaaa1111"}' }
+            }).GetNewClosure()
+        Assert-Equal 'CriticalError' $refusingWrite.Status 'A manager that rejected a fresh identifier was reported as a success.'
+        Assert-Equal 'IDENTIFIER_WRITE_FAILED' $refusingWrite.Data.Code 'A rejected identifier write did not report its own code.'
+
+        # An unreadable identifier claims nothing in either direction, because a value that could not be
+        # read is not evidence that it is absent.
+        $unreadable = Get-MuMuInstanceIdentifiers -ManagerPath 'C:\MuMu\shell\MuMuManager.exe' -Index 0 -Runner ({ param($Path, $Arguments) [pscustomobject]@{ ExitCode = 1; Text = '' } }).GetNewClosure()
+        Assert-Equal 'CriticalError' $unreadable.Status 'An unreadable identifier was reported as read.'
+        Assert-Equal 'IDENTIFIER_UNREADABLE' $unreadable.Data.Code 'An unreadable identifier did not report its own code.'
+
+        # A generated value has to look like the thing it replaces: an android id is a hex identifier and a
+        # mac is a locally administered unicast address, not a random number in either shape.
+        $generatedId = New-ToolkitFreshIdentifier -Key 'android_id' -Source 'aaaa1111'
+        Assert-True ($generatedId -cmatch '^[0-9a-f]{32}$') "A generated android id is not a 32 character hex value: $generatedId"
+        $generatedMac = New-ToolkitFreshIdentifier -Key 'mac_address' -Source '00:11:22:33:44:55'
+        Assert-True ($generatedMac -cmatch '^([0-9A-F]{2}:){5}[0-9A-F]{2}$') "A generated mac address is not six colon separated octets: $generatedMac"
+        $firstOctet = [Convert]::ToInt32(($generatedMac -split ':')[0], 16)
+        Assert-True (($firstOctet -band 0x02) -eq 0x02) 'A generated mac address does not have the locally administered bit set.'
+        Assert-True (($firstOctet -band 0x01) -eq 0x00) 'A generated mac address has the multicast bit set.'
+        $secondId = New-ToolkitFreshIdentifier -Key 'android_id' -Source 'aaaa1111'
+        Assert-True ($secondId -cne $generatedId) 'A generated android id repeats itself, so it is not fresh.'
+
+        # The full setup is three existing actions in order, and it stops at the first step that does not
+        # succeed. A run that failed halfway leaves a mixed instance, so the message has to name which
+        # steps completed and which never ran rather than only reporting the failure.
+        $setupState = @{ Calls = @() }
+        $setupComplete = Invoke-ToolkitFullSetup -Install $screenSnapshot.Install -StateRoot $menuStateRoot -InstanceIndex 0 -Packages @('com.example.app') -AndroidVersion '12.0' -Confirmed -ActionRunner ({
+                param($Choice)
+                $setupState.Calls += $Choice
+                return (Get-ToolkitResult -Status 'Success' -Message ('step ' + $Choice + ' ran'))
+            }).GetNewClosure()
+        Assert-Equal 'Success' $setupComplete.Status "A full setup with three good steps failed: $($setupComplete.Message)"
+        Assert-Equal 'Root12,Conceal,RemoveAds' ($setupState.Calls -join ',') 'The full setup did not run root, then conceal, then the advertisements.'
+        Assert-True ($setupComplete.Message -match 'Root12, Conceal, RemoveAds') 'A complete full setup did not name the steps it ran.'
+
+        $stopState = @{ Calls = @() }
+        $stoppedSetup = Invoke-ToolkitFullSetup -Install $screenSnapshot.Install -StateRoot $menuStateRoot -InstanceIndex 0 -Packages @('com.example.app') -AndroidVersion '12.0' -Confirmed -ActionRunner ({
+                param($Choice)
+                $stopState.Calls += $Choice
+                if ($Choice -ceq 'Conceal') {
+                    return (Get-ToolkitResult -Status 'CriticalError' -Message 'the concealment step refused' -Data (@{ Code = 'CLONE_RECORD_MISSING' }))
+                }
+                return (Get-ToolkitResult -Status 'Success' -Message ('step ' + $Choice + ' ran'))
+            }).GetNewClosure()
+        Assert-Equal 'CriticalError' $stoppedSetup.Status 'A full setup that failed midway reported success.'
+        Assert-Equal 'Root12,Conceal' ($stopState.Calls -join ',') 'A full setup kept running after a step failed.'
+        Assert-Equal 'FULL_SETUP_STOPPED' $stoppedSetup.Data.Code 'A stopped full setup did not report its own code.'
+        Assert-Equal 'Conceal' ([string]$stoppedSetup.Data.StoppedAt) 'A stopped full setup did not name the step it stopped at.'
+        Assert-True ($stoppedSetup.Message -match 'Completed: Root12') "A stopped full setup did not report what completed: $($stoppedSetup.Message)"
+        Assert-True ($stoppedSetup.Message -match 'Not run: RemoveAds') "A stopped full setup did not report what never ran: $($stoppedSetup.Message)"
+        Assert-True ($stoppedSetup.Message -match 'the concealment step refused') 'A stopped full setup lost the reason the step refused.'
+
+        # An instance whose version neither root supports has no root step, so the whole run is refused
+        # before anything is written rather than silently rooting the wrong thing.
+        $unsupported = Invoke-ToolkitFullSetup -Install $screenSnapshot.Install -StateRoot $menuStateRoot -InstanceIndex 0 -Packages @('com.example.app') -AndroidVersion '11.0' -Confirmed -ActionRunner ({ param($Choice) throw 'must not run' }).GetNewClosure()
+        Assert-Equal 'CriticalError' $unsupported.Status 'A full setup on an unsupported Android version ran.'
+        Assert-Equal 'FULL_SETUP_VERSION_UNSUPPORTED' $unsupported.Data.Code 'An unsupported full setup did not report its own code.'
+
+        # The run needs the app list and the confirmation, so it refuses without them rather than concealing
+        # nothing and reporting a success.
+        $unconfirmed = Invoke-ToolkitFullSetup -Install $screenSnapshot.Install -StateRoot $menuStateRoot -InstanceIndex 0 -Packages @('com.example.app') -AndroidVersion '12.0' -ActionRunner ({ param($Choice) throw 'must not run' }).GetNewClosure()
+        Assert-Equal 'USER_CONFIRMATION_REQUIRED' ([string]$unconfirmed.Data.Code) 'An unconfirmed full setup did not ask for a confirmation.'
+        $noPackages = Invoke-ToolkitFullSetup -Install $screenSnapshot.Install -StateRoot $menuStateRoot -InstanceIndex 0 -AndroidVersion '12.0' -Confirmed -ActionRunner ({ param($Choice) throw 'must not run' }).GetNewClosure()
+        Assert-Equal 'PACKAGES_REQUIRED' ([string]$noPackages.Data.Code) 'A full setup with no app list did not ask for one.'
+
+        # A tag that writes is red and a tag that reaches the network is yellow, so the consequence is
+        # visible in the row itself and not only in the disclosure behind it.
+        Assert-Equal 'Red' (Get-ToolkitTagColor -Tag 'changes guest') 'A guest change is not marked red.'
+        Assert-Equal 'Red' (Get-ToolkitTagColor -Tag 'changes installation') 'An installation change is not marked red.'
+        # A tag that both downloads and writes is colored by the writing part, because that is the part a
+        # person must not misread, and a download on its own is the softer yellow.
+        Assert-Equal 'Red' (Get-ToolkitTagColor -Tag 'downloads + changes guest') 'A combined download and write tag is not colored by the write.'
+        Assert-Equal 'Yellow' (Get-ToolkitTagColor -Tag 'downloads') 'A download on its own is not marked yellow.'
+        Assert-Equal 'Cyan' (Get-ToolkitTagColor -Tag 'new instance') 'A new instance is not marked cyan.'
+        Assert-Equal '' (Get-ToolkitTagColor -Tag 'read-only') 'A read-only tag is not plain.'
+        # Every tag is carried by at least one row on one of the three screens, so a tag can never exist
+        # in the vocabulary without a row that shows it.
+        $allRows = @(Get-ToolkitDashboardRows) + @(Get-ToolkitTargetRows) + @(Get-ToolkitActionRows -AndroidVersion '12.0') + @(Get-ToolkitActionRows -AndroidVersion '15.0')
+        foreach ($tagged in @(@{ Tag = 'read-only' }, @{ Tag = 'changes guest' }, @{ Tag = 'downloads + changes guest' }, @{ Tag = 'changes installation' }, @{ Tag = 'restores' }, @{ Tag = 'new instance' })) {
+            Assert-True ((@($allRows | Where-Object { [string]$_.Tag -ceq $tagged.Tag }).Count -ge 1)) "No row on any screen carries the tag: $($tagged.Tag)"
+        }
+        # Every non-blank tag is a word the reader sees spelled out, and none of them is a color-only hint.
+        foreach ($row in $allRows) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.Tag)) {
+                Assert-True ([string]$row.Tag -cmatch '^[a-z][a-z +-]*$') "A tag is not plain readable text: $($row.Tag)"
+            }
+        }
 
         # Color marks status and the menu header only, so a detail line stays plain, and a non-empty
         # NO_COLOR turns every color off for the whole console.
@@ -8642,10 +8866,10 @@ function Invoke-MenuTests {
         Assert-Equal 'Yellow' (Get-ToolkitConsoleColor -Line '[Warning] ran') 'A warning line is not yellow.'
         Assert-Equal 'Yellow' (Get-ToolkitConsoleColor -Line '[RecoverableError] ran') 'A recoverable error line is not yellow.'
         Assert-Equal 'Red' (Get-ToolkitConsoleColor -Line '[CriticalError] ran') 'A critical error line is not red.'
-        Assert-Equal 'Yellow' (Get-ToolkitConsoleColor -Line 'Select a number from 1-9, or press Enter to see the menu again.') 'The invalid-answer hint is not yellow.'
-        Assert-Equal 'Cyan' (Get-ToolkitConsoleColor -Line ('  ' + [string]$script:ToolkitMenuTitle)) 'The menu title is not cyan.'
-        Assert-Equal 'DarkGray' (Get-ToolkitConsoleColor -Line ('  ' + ('-' * ([string]$script:ToolkitMenuTitle).Length))) 'The menu rule is not dimmed.'
-        Assert-Equal 'DarkGray' (Get-ToolkitConsoleColor -Line ('  ' + [string]$script:ToolkitMenuSummary)) 'The menu safety line is not dimmed.'
+        Assert-Equal 'Yellow' (Get-ToolkitConsoleColor -Line 'Select one of the choices this screen printed. Press Enter to see it again.') 'The invalid-answer hint is not yellow.'
+        Assert-Equal 'Cyan' (Get-ToolkitConsoleColor -Line ('  ' + [string]$script:ToolkitMenuTitle)) 'The screen title is not cyan.'
+        Assert-Equal 'DarkGray' (Get-ToolkitConsoleColor -Line ('  ' + ('=' * 20))) 'The screen rule is not dimmed.'
+        Assert-Equal 'DarkGray' (Get-ToolkitConsoleColor -Line ('  ' + [string]$script:ToolkitMenuSummary)) 'The screen safety line is not dimmed.'
         Assert-Equal '' (Get-ToolkitConsoleColor -Line '  Selected: 0 | Roo+3d 12 | Android 12.0 | Running no | Vendor root no') 'A result detail line is colored instead of plain.'
         $savedNoColor = $env:NO_COLOR
         $env:NO_COLOR = '1'
@@ -8994,21 +9218,29 @@ function Invoke-MenuTests {
         Assert-True ($menuLogAfterActions -notmatch 'menu_runner_secret') 'The menu log persisted a raw secret.'
         Assert-True ($menuLogAfterActions -match 'Root12') 'The menu log did not record the failed action.'
 
+        # The loop is driven through the screens, so an action is reached by answering the dashboard.
+        # The advertisement rows are used because they dispatch straight through the injected action
+        # runner, which is the seam this failure is injected through. The loop is given a scripted ask
+        # so a screen that asks a question cannot fall through to Read-Host and block a test run.
         $loopState = @{ Calls = @() ; Lines = @() }
-        $loopCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Root12', 'Q')) -Writer ({ param($Line) $loopState.Lines += $Line }).GetNewClosure() -Runner ({ param($Action) $loopState.Calls += $Action; throw 'injected loop failure' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        $loopAsk = { param($Question) 'CONFIRM' }.GetNewClosure()
+        $loopCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('A', 'Q')) -Writer ({ param($Line) $loopState.Lines += $Line }).GetNewClosure() -Ask $loopAsk -ShowBanner -Runner ({ param($Action) $loopState.Calls += $Action; throw 'injected loop failure' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 1 $loopCode 'A critical error did not return a nonzero exit code.'
         Assert-Equal 1 $loopState.Calls.Count 'A critical error ran the next action.'
         Assert-True ((@($loopState.Lines) -join "`n") -match '\[CriticalError\]') 'A critical error was not displayed.'
         Assert-True ((@($loopState.Lines) -join "`n") -match 'Log:') 'A critical error was displayed without a log path.'
         Assert-True ((@($loopState.Lines) -join "`n") -match '(?i)recovery') 'A critical error was displayed without recovery guidance.'
-        Assert-True ((@($loopState.Lines) -join "`n") -match '\[CriticalError\].*Root12|.*Root12') 'A critical error did not name the failed action.'
+        Assert-True ((@($loopState.Lines) -join "`n") -match 'RemoveAds') 'A critical error did not name the failed action.'
+        # The screen is rewritten after a failure rather than the loop closing, so the choices are still
+        # on screen after a critical error.
+        Assert-Equal 2 @(@($loopState.Lines) | Where-Object { [string]$_ -match 'Select an instance' }).Count 'The dashboard was not rewritten after a critical error.'
 
         $recoverableState = @{ Calls = @() }
-        $recoverableLoopCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Verify', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $recoverableState.Calls += $Action; Get-ToolkitResult -Status 'RecoverableError' -Message 'injected recoverable failure' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        $recoverableLoopCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('A', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Ask $loopAsk -Runner ({ param($Action) $recoverableState.Calls += $Action; Get-ToolkitResult -Status 'RecoverableError' -Message 'injected recoverable failure' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 2 $recoverableLoopCode 'A recoverable error did not return exit code 2.'
         Assert-Equal 1 $recoverableState.Calls.Count 'A recoverable error did not return to the menu.'
         $recoverableLogText = [IO.File]::ReadAllText($menuLogPath)
-        Assert-True ($recoverableLogText -match '\[Warning\] Action Verify returned RecoverableError') 'A recoverable error was not logged on the Warning branch.'
+        Assert-True ($recoverableLogText -match '\[Warning\] Action RemoveAds returned RecoverableError') 'A recoverable error was not logged on the Warning branch.'
 
         $quitState = @{ Calls = @() }
         $quitCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $quitState.Calls += $Action }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
@@ -9018,25 +9250,23 @@ function Invoke-MenuTests {
         $blankCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('   ', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 0 $blankCode 'A blank menu answer did not return normally.'
 
-        # The menu is numbered so the operator presses a digit instead of typing an action name, and the
-        # number is the only thing the prompt has to offer.
-        $numberState = @{ Calls = @() }
-        $numberCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('2', ' 4 ', '9')) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $numberState.Calls += $Action; Get-ToolkitResult -Status 'Success' -Message 'numbered selection' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
-        Assert-Equal 0 $numberCode 'A numbered menu selection did not return a zero exit code.'
-        Assert-Equal 'Verify,Root12' ($numberState.Calls -join ',') 'A menu number did not dispatch the action the catalog lists at that position.'
-
-        $numberQuitState = @{ Calls = @() }
-        $numberQuitCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @([string]$catalog.Count)) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) $numberQuitState.Calls += $Action }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
-        Assert-Equal 0 $numberQuitCode 'The last menu number did not quit.'
-        Assert-Equal 0 $numberQuitState.Calls.Count 'The last menu number ran an action instead of quitting.'
+        # The dashboard is typed rather than arrow-driven, and it takes a digit to pick a table row or a
+        # letter for the installation level choices. Surrounding whitespace is not a different answer.
+        $numberState = @{ Lines = @() }
+        $numberCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @(' A ', '  B ', 'Q')) -Writer ({ param($Line) $numberState.Lines += $Line }).GetNewClosure() -Ask $loopAsk -Runner ({ param($Action) $numberState.Lines += ('RAN:' + $Action); Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        Assert-Equal 0 $numberCode 'A dashboard letter selection did not return a zero exit code.'
+        Assert-True ((@($numberState.Lines) -join "`n") -match 'RAN:RemoveAds') 'A padded dashboard letter did not reach the advertisement action.'
+        Assert-True ((@($numberState.Lines) -join "`n") -match 'RAN:Restore') 'A padded dashboard letter did not reach the advertisement restore.'
 
         $outOfRangeState = @{ Lines = @() }
-        $outOfRangeCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('0', '99', 'Verify', 'Q')) -Writer ({ param($Line) $outOfRangeState.Lines += $Line }).GetNewClosure() -Runner ({ param($Action) $outOfRangeState.Lines += ('RAN:' + $Action); Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
+        $outOfRangeCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @('0', '99', 'A', 'Q')) -Writer ({ param($Line) $outOfRangeState.Lines += $Line }).GetNewClosure() -Ask $loopAsk -Runner ({ param($Action) $outOfRangeState.Lines += ('RAN:' + $Action); Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 0 $outOfRangeCode 'An out-of-range menu number did not return normally.'
         $outOfRangeText = @($outOfRangeState.Lines) -join "`n"
         Assert-Equal 1 ([regex]::Matches($outOfRangeText, 'RAN:')).Count 'An out-of-range menu number reached the dispatcher.'
-        Assert-True ($outOfRangeText -match 'RAN:Verify') 'An out-of-range menu number displaced the action that follows it.'
-        Assert-True ($outOfRangeText -match ('1-' + $catalog.Count)) 'An out-of-range menu number did not report the range the operator can press.'
+        Assert-True ($outOfRangeText -match 'RAN:RemoveAds') 'An out-of-range menu number displaced the answer that follows it.'
+        # A refused answer reports against the choices the screen printed, so the hint cannot name a range
+        # the screen does not offer.
+        Assert-True ($outOfRangeText -match 'Select one of the choices this screen printed') 'An out-of-range answer did not report the choices the screen printed.'
 
         $eofCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @()) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 0 $eofCode 'An exhausted menu input did not return normally.'
@@ -9374,15 +9604,30 @@ function Invoke-MenuTests {
         $toolbarCode = Start-ToolkitController -StateRoot $controllerStateRoot -Reader (New-MenuReader -Answers @('   ', 'Q')) -Writer $toolbarWriter -Prompt $toolbarPrompt -ActionRunner $toolbarRunner
         Assert-Equal 0 $toolbarCode 'The menu did not exit normally after a blank answer and Q.'
         Assert-Equal 0 $toolbarState.Calls.Count 'A blank answer or Q ran an action.'
-        Assert-True ((@($toolbarState.Lines) -join "`n") -match 'MuMu Root Hide Toolkit') 'The interactive toolbar was not printed.'
-        foreach ($catalogName in @($catalogNames)) {
-            Assert-True ((@($toolbarState.Lines) -join "`n") -match ('\b' + [regex]::Escape($catalogName) + '\b')) "The toolbar does not list an action: $catalogName"
-        }
+        Assert-True ((@($toolbarState.Lines) -join "`n") -match 'MuMu Root Hide Toolkit') 'The interactive screen was not printed.'
         $toolbarText = @($toolbarState.Lines) -join "`n"
-        # The menu is a compact legend so it can be rewritten before every prompt, which is why the
-        # safety disclosures it used to carry are asserted in the README instead of on screen.
-        $menuBannerLines = @(Format-ToolkitMenuBanner)
-        Assert-True ($menuBannerLines.Count -le 8) "The menu banner is not compact: it is $($menuBannerLines.Count) lines and is rewritten before every prompt."
+        # A screen is a bounded block because it is rewritten before every prompt, so a screen that grows
+        # without limit is a screen that pushes the choices off the top of the console.
+        foreach ($screenCase in @(
+                @{ Screen = 'Dashboard'; Snapshot = $screenSnapshot; Instance = $null }
+                @{ Screen = 'Target'; Snapshot = $screenSnapshot; Instance = $screenInstance }
+                @{ Screen = 'Actions'; Snapshot = $screenSnapshot; Instance = $screenInstance }
+            )) {
+            $screenBlock = @(Get-ToolkitScreenLines -Screen $screenCase.Screen -Snapshot $screenCase.Snapshot -Instance $screenCase.Instance -Target $null)
+            Assert-True ($screenBlock.Count -le 24) "The $($screenCase.Screen) screen is not bounded: it is $($screenBlock.Count) lines and is rewritten before every prompt."
+        }
+        # Every action is still reachable from the screens, even though no single screen lists all of them:
+        # the root and concealment actions live on the instance action screen and the advertisement
+        # actions on the dashboard, so the catalog is checked against the whole set of screens.
+        $reachableText = @(@(Get-ToolkitDashboardRows) | ForEach-Object { [string]$_.Name }) -join ' '
+        $reachableText += ' ' + (@(@(Get-ToolkitTargetRows) | ForEach-Object { [string]$_.Name }) -join ' ')
+        # Both root rows are checked, because the action screen shows the one that applies to the instance
+        # Android version and a screen that only ever offered the 12 row would strand every 15 instance.
+        $reachableText += ' ' + (@(@(Get-ToolkitActionRows -AndroidVersion '12.0') | ForEach-Object { [string]$_.Name }) -join ' ')
+        $reachableText += ' ' + (@(@(Get-ToolkitActionRows -AndroidVersion '15.0') | ForEach-Object { [string]$_.Name }) -join ' ')
+        foreach ($catalogName in @(@('Status', 'Root with Kitsune', 'Built-in root', 'Conceal apps', 'Full setup', 'Remove ads', 'Restore ads'))) {
+            Assert-True ($reachableText -match [regex]::Escape($catalogName)) "No screen offers: $catalogName"
+        }
         $menuReadme = (Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw) -replace "`r`n", "`n"
         foreach ($disclosure in @(
                 @{ Pattern = '(?i)creates and verifies a clone'; Message = 'The README does not state the clone-first requirement.' }
@@ -9406,13 +9651,13 @@ function Invoke-MenuTests {
             $loopControllerState.Calls += $Choice
             throw 'injected controller failure token=controller_runner_secret'
         }.GetNewClosure()
-        $criticalControllerCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Root12', 'Q')) -Writer ({ param($Line) $loopControllerState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner $criticalControllerRunner
+        $criticalControllerCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('A', 'Q')) -Writer ({ param($Line) $loopControllerState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner $criticalControllerRunner
         Assert-Equal 1 $criticalControllerCode 'A critical error did not return a nonzero controller exit code.'
         Assert-Equal 1 $loopControllerState.Calls.Count 'A critical error ran the next action.'
         Assert-True ((@($loopControllerState.Lines) -join "`n") -notmatch 'controller_runner_secret') 'The controller printed a raw secret.'
 
         $recoverableControllerState = @{ Lines = @(); Calls = @() }
-        $recoverableControllerCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('Verify', 'Q')) -Writer ({ param($Line) $recoverableControllerState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner ({
+        $recoverableControllerCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('A', 'Q')) -Writer ({ param($Line) $recoverableControllerState.Lines += [string]$Line }).GetNewClosure() -Prompt $toolbarPrompt -ActionRunner ({
                 param($Choice)
                 $recoverableControllerState.Calls += $Choice
                 return (Get-ToolkitResult -Status 'RecoverableError' -Message 'injected recoverable failure')
@@ -9429,7 +9674,13 @@ function Invoke-MenuTests {
             $confirmState.Answers = @(@($confirmState.Answers) | Select-Object -Skip 1)
             return $answer
         }.GetNewClosure()
-        $root15Controller = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -Reader (New-MenuReader -Answers @('Root15', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $confirmPrompt
+        # The answer is taken from the row the screen actually prints rather than from a fixed position,
+        # because the root rows are filtered by the Android version and a hardcoded digit would start
+        # selecting the wrong action as soon as a row is added or removed. A command line instance index
+        # carries no version, so that screen offers both root rows and the action refuses the wrong one.
+        $rootRow = [string](@(Get-ToolkitActionRows -AndroidVersion 'unknown' | Where-Object { [string]$_.Action -ceq 'Root15' })[0].Number)
+        Assert-Equal '3' $rootRow 'The built-in root row is not the row a session with no Android version prints for it.'
+        $root15Controller = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -Reader (New-MenuReader -Answers @($rootRow, 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $confirmPrompt
         Assert-Equal 0 $root15Controller 'The menu did not exit normally after the Android 15 action.'
         Assert-True ((@($confirmState.Questions) -join '|') -match 'CONFIRM') 'The interactive Android 15 action did not ask for an explicit confirmation.'
         Assert-Equal 1 @($flowState.Calls | Where-Object { $_ -ceq 'Root15' }).Count 'The interactive Android 15 action did not reach the flow exactly once.'
@@ -9446,7 +9697,7 @@ function Invoke-MenuTests {
         }.GetNewClosure()
         $flowState.Confirmed = $null
         $flowState.Calls = @()
-        $root15Refused = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -Reader (New-MenuReader -Answers @('Root15', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $refusePrompt
+        $root15Refused = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -Reader (New-MenuReader -Answers @($rootRow, 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $refusePrompt
         Assert-Equal 1 $root15Refused 'A refused Android 15 action did not keep its failure exit code through the menu.'
         Assert-True ((@($refuseState.Questions) -join '|') -match 'CONFIRM') 'The refused Android 15 action did not ask for a confirmation.'
         Assert-Equal $null $flowState.Confirmed 'A refused Android 15 action reached the flow.'
@@ -9463,13 +9714,72 @@ function Invoke-MenuTests {
             $targetMenuState.Answers = @(@($targetMenuState.Answers) | Select-Object -Skip 1)
             return $answer
         }.GetNewClosure()
-        $targetMenuCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -Reader (New-MenuReader -Answers @('Target', 'Q')) -Writer ({ param($Line) $targetMenuState.Lines += [string]$Line }).GetNewClosure() -Prompt $targetMenuPrompt
-        Assert-Equal 0 $targetMenuCode "The menu did not exit normally after the target action. $(@($targetMenuState.Lines) -join ' ')"
-        Assert-True ((@($targetMenuState.Questions) -join '|') -match 'Identify, Create, or Clone') 'The menu did not ask the operator for a target mode.'
-        Assert-True ((@($targetMenuState.Questions) -join '|') -notmatch 'CONFIRM') 'A menu Identify target run asked for a mutation confirmation.'
-        Assert-True ((@($targetMenuState.Lines) -join "`n") -match '\[Success\]') "The menu did not report the selected target: $(@($targetMenuState.Lines) -join ' ')"
-        Assert-True ((@($targetMenuState.Lines) -join "`n") -match 'index 2') "The menu did not report the selected target index: $(@($targetMenuState.Lines) -join ' ')"
-        Assert-Equal 0 $flowState.Calls.Count "A menu target run started a root or concealment flow: $($flowState.Calls -join '|')"
+        # A fresh instance is created from the dashboard, where it has no source instance, so the only
+        # question it asks is the engine. An answer that is neither 12 nor 15 is refused before the
+        # manager is called, so a mistyped version never creates an instance.
+        $newInstanceCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -Reader (New-MenuReader -Answers @('N', 'Q')) -Writer ({ param($Line) $targetMenuState.Lines += [string]$Line }).GetNewClosure() -Prompt $targetMenuPrompt
+        Assert-Equal 1 $newInstanceCode "A refused Android version did not fail closed. $(@($targetMenuState.Lines) -join ' ')"
+        Assert-True ((@($targetMenuState.Questions) -join '|') -match '12 or 15') 'The fresh instance row did not ask which engine to create.'
+        Assert-True ((@($targetMenuState.Lines) -join "`n") -match 'TARGET_VERSION_INVALID') "A refused Android version created something: $(@($targetMenuState.Lines) -join ' ')"
+        Assert-True ((@($targetMenuState.Lines) -join "`n") -notmatch 'Create players|index \d+ is the selected target') 'A refused Android version reached the manager.'
+        Assert-Equal 0 $flowState.Calls.Count "A refused fresh instance started a root or concealment flow: $($flowState.Calls -join '|')"
+
+        # The target screen is where a source instance becomes a clone, so it asks for its confirmation word
+        # before the clone is made, and the disclosure it prints says the source is not written to.
+        $clonePromptState = @{ Questions = @(); Answers = @('CONFIRM') }
+        $clonePrompt = {
+            param($Question)
+            $clonePromptState.Questions += [string]$Question
+            if ($clonePromptState.Answers.Count -eq 0) { return '' }
+            $answer = $clonePromptState.Answers[0]
+            $clonePromptState.Answers = @(@($clonePromptState.Answers) | Select-Object -Skip 1)
+            return $answer
+        }.GetNewClosure()
+        $declinedPromptState = @{ Questions = @(); Answers = @('no') }
+        $declinedPrompt = {
+            param($Question)
+            $declinedPromptState.Questions += [string]$Question
+            if ($declinedPromptState.Answers.Count -eq 0) { return '' }
+            $answer = $declinedPromptState.Answers[0]
+            $declinedPromptState.Answers = @(@($declinedPromptState.Answers) | Select-Object -Skip 1)
+            return $answer
+        }.GetNewClosure()
+        # The target screen is the unit that turns a source instance into a clone, so it is exercised on
+        # its own. The confirmation is asked before the manager is called, the disclosure says the source
+        # is not written to, and a declined answer leaves the clone unmade.
+        # The disclosure is collected rather than printed, so the test asserts on the wording instead of on
+        # where it landed on a console.
+        $cloneDisclosure = New-Object System.Collections.ArrayList
+        $declinedClone = Invoke-ToolkitMenuTarget -Choice 'CloneKeepInfo' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask $declinedPrompt -Show ({ param($Line) [void]$cloneDisclosure.Add([string]$Line) }).GetNewClosure() -Runner ({ param($Path, $Arguments) throw 'the manager must not be called' }).GetNewClosure()
+        Assert-Equal 1 (Get-ToolkitExitCode $declinedClone.Result) 'An unconfirmed clone did not fail closed.'
+        Assert-True ((@($declinedPromptState.Questions) -join '|') -match 'CONFIRM') 'The target screen did not ask for a confirmation word before cloning.'
+        Assert-True ((@($declinedClone.Lines) -join "`n") -match 'USER_CONFIRMATION_REQUIRED') 'An unconfirmed clone was not reported as a refused confirmation.'
+        Assert-Equal $false $declinedClone.Proceed 'An unconfirmed clone reported that it proceeded.'
+        # The disclosure says what the copy carries, that the source is not written to, and that the source
+        # is shut down first, because a clone that silently stops an instance is a surprise.
+        $cloneDisclosureText = @($cloneDisclosure) -join "`n"
+        Assert-True ($cloneDisclosureText -match 'copying instance 2') 'The clone disclosure does not name the instance it copies.'
+        Assert-True ($cloneDisclosureText -match 'keeps the source android id, mac address and imei') 'The keep-info disclosure does not say what the copy carries.'
+        Assert-True ($cloneDisclosureText -match 'source instance is not written to') 'The clone disclosure does not say that the source is not written to.'
+        Assert-True ($cloneDisclosureText -match 'shut down first') 'The clone disclosure does not say the source is shut down first.'
+        # Each disclosure bullet has to reach the screen as its own line. A comma binds tighter than the
+        # string addition here, so an unparenthesized pair is joined onto one line and the whole disclosure
+        # arrives as a single unreadable string.
+        $cloneBullets = @(@($cloneDisclosure) | Where-Object { [string]$_ -cmatch '^\s+\*' })
+        Assert-True ($cloneBullets.Count -ge 3) "The clone disclosure printed $($cloneBullets.Count) bullets instead of one per line."
+        foreach ($bullet in $cloneBullets) {
+            Assert-True ((@([string]$bullet) -join '').Split('.')[0] -cne [string]$bullet -or ([string]$bullet -cmatch '\.$')) "A disclosure bullet was truncated: $bullet"
+        }
+        $freshDisclosure = New-Object System.Collections.ArrayList
+        $null = Invoke-ToolkitMenuTarget -Choice 'CloneFreshInfo' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask ({ param($Question) 'no' }) -Show ({ param($Line) [void]$freshDisclosure.Add([string]$Line) }).GetNewClosure() -Runner ({ param($Path, $Arguments) throw 'the manager must not be called' }).GetNewClosure()
+        Assert-True ((@($freshDisclosure) -join "`n") -match 'new android id and mac address') 'The fresh-identifier disclosure does not say what is regenerated.'
+
+        # Continuing on a clone asks the journal for the clone a previous run verified, and it refuses when
+        # there is none rather than making a new clone behind the operator's back.
+        $noClone = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $reportInstall.Install -StateRoot $controllerStateRoot -Instance ([pscustomobject]@{ Index = 2; Name = 'source' }) -Ask $clonePrompt -Runner ({ param($Path, $Arguments) throw 'the manager must not be called' }).GetNewClosure()
+        Assert-Equal 1 (Get-ToolkitExitCode $noClone.Result) 'Continuing with no recorded clone did not fail closed.'
+        Assert-Equal $false $noClone.Proceed 'Continuing with no recorded clone reported that it proceeded.'
+        Assert-True ((@($noClone.Lines) -join "`n") -match 'CLONE_RECORD_MISSING') 'Continuing with no recorded clone did not name the missing clone record.'
 
         $targetParameterState = @{ Lines = @() }
         $targetParameterCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -Mode 'Create' -StartIndex '9' -Reader (New-MenuReader -Answers @('Detect', 'Q')) -Writer ({ param($Line) $targetParameterState.Lines += [string]$Line }).GetNewClosure() -Prompt $targetMenuPrompt
@@ -9486,8 +9796,12 @@ function Invoke-MenuTests {
             return $answer
         }.GetNewClosure()
         $flowState.Packages = @()
-        $concealController = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $packagePrompt
-        Assert-Equal 0 $concealController 'The menu did not exit normally after the concealment action.'
+        # The concealment row number is read from the row list the same way, so adding the second root row
+        # for a session with no Android version did not silently move the concealment row under the test.
+        $concealRow = [string](@(Get-ToolkitActionRows -AndroidVersion 'unknown' | Where-Object { [string]$_.Action -ceq 'Conceal' })[0].Number)
+        $concealLines = New-Object System.Collections.ArrayList
+        $concealController = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @($concealRow, 'Q')) -Writer ({ param($Line) [void]$concealLines.Add([string]$Line) }).GetNewClosure() -Prompt $packagePrompt
+        Assert-Equal 0 $concealController "The menu did not exit normally after the concealment action. $(@($concealLines) -join ' ')"
         Assert-True ((@($packageState.Questions) -join '|') -match '(?i)package') 'The interactive concealment action did not ask for the selected applications.'
         Assert-Equal (@('jp.pokemon.pokemontcgp', 'com.example.other') -join '|') ($flowState.Packages -join '|') 'The interactive concealment action did not pass the trimmed package selection.'
 
@@ -9546,7 +9860,7 @@ function Invoke-MenuTests {
         $consentState.Answers = @('jp.pokemon.pokemontcgp', 'FETCH')
         $flowState.Calls = @()
         $flowState.Fetches = @()
-        $consentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        $consentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @($concealRow, 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
         Assert-Equal 0 $consentCode 'The menu did not exit normally after the dependency consent question.'
         Assert-True ((@($consentState.Questions) -join '|') -match 'FETCH') 'The interactive concealment action did not ask for the pinned dependency consent.'
         Assert-Equal 'hma|vector' ($flowState.Fetches -join '|') 'The menu consent did not reach the pinned dependency acquisition.'
@@ -9554,7 +9868,7 @@ function Invoke-MenuTests {
         $consentState.Answers = @('jp.pokemon.pokemontcgp', 'no')
         $flowState.Calls = @()
         $flowState.Fetches = @()
-        $declinedConsentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        $declinedConsentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @($concealRow, 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
         Assert-Equal 0 $declinedConsentCode 'The menu did not exit normally after a declined dependency consent.'
         Assert-Equal 0 $flowState.Fetches.Count 'A declined menu consent still reached the network for a dependency.'
 
@@ -9566,7 +9880,7 @@ function Invoke-MenuTests {
         $flowState.Fetches = @()
         $flowState.FetchModes = @()
         $flowState.AssetsVerified = $false
-        $commandLineConsentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -FetchDependencies -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        $commandLineConsentCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -FetchDependencies -Reader (New-MenuReader -Answers @($concealRow, 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
         Assert-Equal 0 $commandLineConsentCode 'The menu did not exit normally after an explicit command line dependency opt-in.'
         Assert-True ((@($consentState.Questions) -join '|') -notmatch 'FETCH') 'The menu asked for a dependency consent the command line already gave.'
         Assert-Equal 'hma|vector' ($flowState.Fetches -join '|') 'The command line opt-in did not reach the pinned dependency acquisition.'
@@ -9580,7 +9894,7 @@ function Invoke-MenuTests {
         $flowState.Fetches = @()
         $flowState.FetchModes = @()
         $flowState.AssetsVerified = $true
-        $hotCacheCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @('Conceal', 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
+        $hotCacheCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -InstanceIndex 2 -Reader (New-MenuReader -Answers @($concealRow, 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $consentPrompt
         Assert-Equal 0 $hotCacheCode 'The menu did not exit normally on a cache that needs no download.'
         Assert-True ((@($consentState.Questions) -join '|') -notmatch 'FETCH') 'The menu asked for a download consent on a cache that needs no download.'
         $flowState.AssetsVerified = $false

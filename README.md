@@ -107,48 +107,141 @@ eligible, the action stops with `INSTANCE_SELECTION_REQUIRED` rather than pickin
 
 ### The interactive menu
 
-Double-click `Run-MumuToolkit.bat`. The menu is numbered and grouped, and it is written again before
-every prompt so the choices never scroll out of reach. Answer with the number it shows:
+Double-click `Run-MumuToolkit.bat`. The menu is three screens in one design, and every screen is written
+again before each prompt so the choices never scroll out of reach.
+
+**1. The dashboard.** It runs the read-only discovery on start, so you see the machines you are about to
+change instead of being asked to trust a menu. Two number columns, because they are not the same thing:
+`#` is what you type, `Idx` is the index MuMu itself uses.
 
 ```text
+      #  Idx  Name                Android Running  Vendor root
+      1  0    Roo+3d 12           12.0    no       no
+      2  1    Roo+3d 15           15.0    yes      no
+      3  2    Roo+3d 12-Houssem  12.0    no       unknown
+  Installation Chinese  D:\Program Files\Netease\MuMuPlayer
+
   MuMu Root Hide Toolkit
-  ----------------------
-  Inspect   1 Detect     2 Verify
-  Prepare   3 Target
-  Change    4 Root12     5 Root15     6 Conceal    7 RemoveAds  8 Restore
-  Exit      9 Q
-  Detect and Verify change nothing. Everything else works on a verified clone and needs an explicit
-  confirmation. Administrator rights are asked for only if an action is denied them.
-Select an action (1-9):
+  ===================================================================
+  Prepare    N New empty instance              new instance
+  Other      A Remove ads                      changes installation
+  Other      B Restore ads                     restores
+  Other      Q Quit
+  Vendor root is the MuMu setting. The guest root is reported by Status.
+
+Select an instance (1-3), or N, A, B or Q:
 ```
+
+`Vendor root` is the **MuMu setting**, not the guest. It reads `unknown` when the manager reports no value
+at all, because `no` would claim a measurement that was never taken. The real guest root, and which
+implementation provides it, is reported by `Status` on the selected instance.
+
+**2. The target screen.** Every guest change in this toolkit is made on a clone, so the source instance is
+never written to. There is no in-place option because `Root12`, `Root15` and `Conceal` all refuse one.
+
+```text
+  Instance 0  Roo+3d 12  Android 12.0
+  ============================================================
+  Target     1 Clone, keep device info         new instance
+  Other      2 Clone, fresh identifiers        new instance
+  Other      3 Continue on its clone           changes guest
+  Back       4 Back to the instances
+  Every guest change is made on a clone, so the source instance is never written.
+
+Select a target (1-4):
+```
+
+**Keep device info** is the same choice the MuMu GUI offers, and it is verified rather than assumed. The
+manager's own `clone` subcommand has no such flag, so rows 1 and 2 both clone and then read the simulated
+`android_id`, `mac_address` and `imei` back: row 1 compares them against the source and claims the device
+info was kept only if they match, row 2 writes fresh values and claims they differ only if the read-back
+confirms it. A run where neither is true reports `IDENTIFIER_KEEP_UNVERIFIED` or
+`IDENTIFIER_FRESH_UNVERIFIED` instead of a success. Row 3 continues on the clone a previous run already
+verified, and refuses when there is no such record.
+
+**3. The action screen.** The rows are filtered by the instance's Android version, so an entry that cannot
+work is never offered:
+
+```text
+  Instance 0  Roo+3d 12  Android 12.0
+  ========================================================================
+  Inspect    1 Status                          read-only
+  Change     2 Root with Kitsune               downloads + changes guest
+  Other      3 Conceal apps                    changes guest
+  Other      4 Full setup                      downloads + changes guest
+  Back       5 Back to the instances
+  Anything that writes prints what it will change and asks for CONFIRM.
+```
+
+The tag on each row is the shortest true statement of what it costs: `read-only` changes nothing,
+`new instance` adds a MuMu instance, `changes guest` writes inside the Android guest, `changes
+installation` writes the campaign files, `restores` puts files back from a restore point, and `downloads`
+reaches the network for a pinned artifact. Anything that writes prints a disclosure first and asks for
+`CONFIRM` after, so you read the consequence and then decide:
+
+```text
+  This will change instance 3 (Roo+3d 12-clone).
+  * 4 app(s) join the Root template: com.a, com.b, com.c, com.d
+  * The vendor root is off on the clone, so an app probing for su sees nothing.
+Type CONFIRM to continue:
+```
+
+`Full setup` runs root, then conceal, then the advertisement suppression, in that order. It stops at the
+first step that does not succeed and states which steps completed and which did not run, because a chain
+that failed halfway leaves a mixed instance. Each step keeps its own operation journal, so a partial run is
+resumable rather than mysterious.
 
 Because the menu stays on screen it is a legend rather than a description. What each action does is in
 [Actions](#actions) below, and what it is allowed to change is in
 [How the safety rules work](#how-the-safety-rules-work).
 
-Here is a real session, captured: `Detect` on the Chinese installation, then quit.
+Here is a real session, captured: `Status` on instance 0 of the Chinese installation, then quit.
 
 ```text
+      #  Idx  Name                Android Running  Vendor root
+      1  0    Roo+3d 12           12.0    no       no
+      2  1    Android Device-1    12.0    no       no
+      3  2    Roo+3d 12-Houssem  12.0    no       no
+  Installation Chinese  D:\Program Files\Netease\MuMuPlayer
+
   MuMu Root Hide Toolkit
-  ----------------------
-  Inspect   1 Detect     2 Verify
-  Prepare   3 Target
-  Change    4 Root12     5 Root15     6 Conceal    7 RemoveAds  8 Restore
-  Exit      9 Q
-  Detect and Verify change nothing. Everything else works on a verified clone and needs an explicit confirmation. Administrator rights are asked for only if an action is denied them.
-Select an action (1-9): 1
-[Success] Discovered Chinese installation D:\Program Files\Netease\MuMuPlayer with 3 instance(s).
-  Installation: Chinese  D:\Program Files\Netease\MuMuPlayer
-  Selected: 0 | Roo+3d 12 | Android 12.0 | Running no | Vendor root no
+  ===================================================================
+  Prepare    N New empty instance              new instance
+  Other      A Remove ads                      changes installation
+  Other      B Restore ads                     restores
+  Other      Q Quit
+  Vendor root is the MuMu setting. The guest root is reported by Status.
+
+Select an instance (1-3), or N, A, B or Q: 1
+
+  Instance 0  Roo+3d 12  Android 12.0
+  ========================================================================
+  Inspect    1 Status                          read-only
+  Change     2 Root with Kitsune               downloads + changes guest
+  Other      3 Conceal apps                    changes guest
+  Other      4 Full setup                      downloads + changes guest
+  Back       5 Back to the instances
+  Anything that writes prints what it will change and asks for CONFIRM.
+
+Select an action (1-5): 1
+[Success] The read-only report for the instance at index 0 is collected. Root state: ...
+  Install.Edition = Chinese
+  Instances:
+    Instance 0 | Roo+3d 12 | Android 12.0 | Running no | RootSetting no
+  Guest.Root = Unrooted
+  Guest.Kitsune = none
+  Guest.KernelSU = none
+  Failures: none
 ```
 
-An action name is still accepted if you prefer to type it. Every mutating action asks for its
-confirmation in the menu, and the menu never closes itself when an action fails.
+Every mutating action asks for its confirmation in the menu, and the menu never closes itself when an
+action fails. `Q` quits from any screen.
 
 Result lines are colored in the console: green for `Success` and `AlreadyApplied`, yellow for
-`Warning`, `RecoverableError`, and the invalid-answer hint, red for `CriticalError`. The menu title
-is cyan and its rule and safety line are dimmed. Set the `NO_COLOR` environment variable to any
-non-empty value to turn all of the colors off.
+`Warning`, `RecoverableError`, and the invalid-answer hint, red for `CriticalError`. A row tag that
+writes is red and a tag that only downloads is yellow, the screen title is cyan, and its rule and safety
+line are dimmed. Set the `NO_COLOR` environment variable to any non-empty value to turn all of the
+colors off.
 
 Interactive output is written for a person: a discovery is a summary line and the instance it settled
 on, rather than a field dump. **`-NonInteractive` output is unchanged and stays in the `Field = Value`
@@ -164,8 +257,14 @@ form**, because that is what a script reads.
 | `Root12` | the verified clone of an Android 12 instance | menu only; `-Action Root12 -NonInteractive` always returns `USER_CONFIRMATION_REQUIRED` |
 | `Root15` | the verified clone of an Android 15 instance | `Run-MumuToolkit.bat -Action Root15 -Confirmed -NonInteractive` |
 | `Conceal` | root visibility for explicitly selected apps on the verified clone | `Run-MumuToolkit.bat -Action Conceal -Packages com.example.app -NonInteractive` |
+| `FullSetup` | root, then concealment, then the advertisement suppression, stopping at the first step that does not succeed | `Run-MumuToolkit.bat -Action FullSetup -Packages com.example.app -Confirmed -NonInteractive` |
 | `RemoveAds` | MuMu campaign display flags inside the selected installation | `Run-MumuToolkit.bat -Action RemoveAds -NonInteractive` |
 | `Restore` | the MuMu campaign files, from the toolkit restore point | `Run-MumuToolkit.bat -Action Restore -NonInteractive` |
+
+`FullSetup` picks the root by the instance's Android version, so it needs `-Packages` and `-Confirmed`.
+Its command-line form takes the instance from `-InstanceIndex`; the menu asks for the apps and the
+confirmation itself. It is a composition of the three actions above rather than a fourth flow: each step
+runs through the same dispatch, keeps its own journal, and the run reports which steps completed.
 
 `Root12` is menu-only. A noninteractive run resolves the installation and the instance and then
 returns `USER_CONFIRMATION_REQUIRED` without creating a clone, without changing anything in MuMu, and
