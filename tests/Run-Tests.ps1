@@ -10861,13 +10861,55 @@ function Invoke-TargetTests {
         Assert-True ((@($targetPromptState.Questions) -join '|') -match 'CONFIRM') 'The create target mode did not ask for an explicit confirmation.'
         Assert-Equal $createMutationsBefore @(Get-TargetMutatingCommands -State $controllerCreate.State).Count 'A refused create target run reached a mutating manager command.'
 
+        # A blank answer takes the next free index the prompt offered, so pressing Enter is a decision
+        # rather than a refusal. The index is read from the manager, and the prompt names it, so the
+        # default the operator accepts is the one that was verified. Each create gets its own fixture
+        # because the manager fixture creates an instance once and a second run would find nothing new.
+        $defaultIndexFixture = New-TargetFixture -Name 'controller create default index'
+        $defaultIndexFixture.State.CreateIndexes = @('5')
+        # The fixture has to be discoverable, because the action resolves the installation from the
+        # fallback roots before it reaches the create.
+        $script:TargetFallbackRoots = @($script:TargetFallbackRoots) + @($defaultIndexFixture.Install.InstallRoot)
+        $freeIndex = Get-ToolkitNextFreeInstanceIndex -Install $defaultIndexFixture.Install -Runner (New-SafetyManagerRunner -State $defaultIndexFixture.State)
+        Assert-True ($freeIndex -ge 0) "The next free instance index was not read from the manager: $freeIndex"
         $targetPromptState.Questions = @()
-        $targetPromptState.Answers = @('Create', 'blank')
+        $targetPromptState.Answers = @('Create', '', 'CONFIRM')
+        $defaultIndexCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $defaultIndexFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $defaultIndexFixture.State)
+        Assert-Equal 'Success' $defaultIndexCreate.Status "A prompted create with a blank index did not take the default: $($defaultIndexCreate.Message)"
+        Assert-Equal $freeIndex $defaultIndexCreate.Data.RequestedIndex 'A blank free instance index did not take the next free index the prompt offered.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -match ([regex]::Escape([string]$freeIndex) + ' is the next free one')) 'The free index prompt did not name the default it offers.'
+
+        # An answer that is not a number is still refused, because a mistyped index is not a request for the
+        # next free one, and the refusal names the default so the operator can see what they could have had.
+        $targetPromptState.Questions = @()
+        $targetPromptState.Answers = @('Create', 'not a number')
         $createMutationsBefore = @(Get-TargetMutatingCommands -State $controllerCreate.State).Count
         $blankIndexCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreate.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $controllerCreate.State)
-        Assert-Equal 'TARGET_START_INDEX_INVALID' $blankIndexCreate.Data.Code 'A prompted create with a blank free instance index was accepted.'
-        Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'CONFIRM') 'A blank free instance index asked for a mutation confirmation.'
-        Assert-Equal $createMutationsBefore @(Get-TargetMutatingCommands -State $controllerCreate.State).Count 'A blank free instance index reached a mutating manager command.'
+        Assert-Equal 'TARGET_START_INDEX_INVALID' $blankIndexCreate.Data.Code 'A prompted create with an unusable free instance index was accepted.'
+        Assert-Equal $freeIndex $blankIndexCreate.Data.Suggested 'A refused free index did not report the default it could have taken.'
+        Assert-True ($blankIndexCreate.Message -match 'Press Enter to use the next free index') 'A refused free index did not tell the operator about the default.'
+        Assert-True ((@($targetPromptState.Questions) -join '|') -notmatch 'CONFIRM') 'An unusable free instance index asked for a mutation confirmation.'
+        Assert-Equal $createMutationsBefore @(Get-TargetMutatingCommands -State $controllerCreate.State).Count 'An unusable free instance index reached a mutating manager command.'
+
+        # The default is asked once. A prompt asked twice would consume the next answer in a scripted run,
+        # so the question is counted rather than assumed.
+        $singleAskFixture = New-TargetFixture -Name 'controller create single ask'
+        $singleAskFixture.State.CreateIndexes = @('5')
+        $script:TargetFallbackRoots = @($script:TargetFallbackRoots) + @($singleAskFixture.Install.InstallRoot)
+        $targetPromptState.Questions = @()
+        $targetPromptState.Answers = @('Create', '', 'CONFIRM')
+        $null = Invoke-ToolkitAction -Action 'Target' -InstallRoot $singleAskFixture.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner (New-SafetyManagerRunner -State $singleAskFixture.State)
+        $indexQuestions = @(@($targetPromptState.Questions) | Where-Object { [string]$_ -match 'Free instance index' }).Count
+        Assert-Equal 1 $indexQuestions "The free index prompt was asked $indexQuestions times instead of once."
+
+        # A manager that reports no instance state has no verifiable free index, so the prompt offers none
+        # and the run is refused rather than guessing an index nobody verified.
+        $unreadableFree = Get-ToolkitNextFreeInstanceIndex -Install $controllerCreate.Install -Runner ({ param($Path, $Arguments) [pscustomobject]@{ ExitCode = 1; Text = '' } }).GetNewClosure()
+        Assert-Equal -1 $unreadableFree 'An unreadable manager produced a free instance index.'
+        $targetPromptState.Questions = @()
+        $targetPromptState.Answers = @('Create')
+        $unreadableCreate = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerCreate.Install.InstallRoot -StateRoot $controllerStateRoot -Prompt $targetPrompt -Runner ({ param($Path, $Arguments) [pscustomobject]@{ ExitCode = 1; Text = '' } }).GetNewClosure()
+        Assert-Equal 'START_INDEX_UNREADABLE' ([string]$unreadableCreate.Data.Code) 'An unreadable manager did not refuse the create.'
 
         $targetPromptState.Questions = @()
         $targetPromptState.Answers = @('Create', '6', 'CONFIRM')

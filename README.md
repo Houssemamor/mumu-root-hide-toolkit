@@ -470,6 +470,11 @@ or a menu choice.
 | --- | --- | --- |
 | `Identify` | nothing in MuMu; lists every discovered instance with its index, name, Android version, running state, and eligibility, then names the selected target | not required, because it is read-only |
 | `Create` | adds exactly one new instance, at the index MuMu actually assigns | required: the menu asks for a free index to insist on and then for `CONFIRM`; the command line requires `-StartIndex` and `-Confirmed` |
+
+In the menu, the free index prompt names the next free index it found and **pressing Enter takes it**, so a
+blank answer is a decision rather than a refusal. The suggested index is read from the manager and fills the
+lowest gap, so a machine whose indexes are `0, 1, 3` is offered `2`. An answer that is not a number is still
+refused with `TARGET_START_INDEX_INVALID`, and the refusal carries the offered default in `Suggested`.
 | `Clone` | adds exactly one clone of a source instance, after stopping that source instance | required: the menu asks for `CONFIRM` once the source is known; the command line requires `-Confirmed` |
 
 The menu asks for the mode with the words `Identify`, `Create`, or `Clone`, and asks which instance
@@ -490,7 +495,8 @@ refusal changes nothing and reports a code:
 | `TARGET_MODE_REQUIRED` | a noninteractive run supplied no `-Mode` |
 | `TARGET_MODE_INVALID` | the supplied mode is not `Identify`, `Create`, or `Clone` |
 | `TARGET_START_INDEX_REQUIRED` | a noninteractive `Create` supplied no usable `-StartIndex` |
-| `TARGET_START_INDEX_INVALID` | the free instance index answered in the menu is not a non-negative integer |
+| `TARGET_START_INDEX_INVALID` | the free instance index answered in the menu is not a non-negative integer; the answer carries the offered default in `Suggested` |
+| `START_INDEX_UNREADABLE` | the manager reported no instance state, so no free index could be offered; pass `-StartIndex` |
 | `TARGET_PARAMETER_MISUSE` | `-Mode`, `-StartIndex`, or `-SourceIndex` was supplied to another action |
 
 `Target Clone` refuses a source instance that is a base instance, has an unsupported Android version,

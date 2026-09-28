@@ -463,6 +463,40 @@ function Get-ToolkitTargetParameterRefusal {
     return $null
 }
 
+# The next instance index nothing is using yet, which is the default the create prompt offers. MuMu assigns
+# an index itself, so this is not required to create an instance; it is the answer to the question the
+# prompt asks, and it is read from the manager rather than guessed so a gap in the existing indexes is
+# filled rather than landing on an index that is already taken. A manager that cannot be read returns -1
+# rather than a guess, because offering an index nobody has verified is worse than offering none.
+function Get-ToolkitNextFreeInstanceIndex {
+    param(
+        [object]$Install,
+        [scriptblock]$Runner = $null
+    )
+
+    $managerPath = [string](Get-ToolkitFirstProperty -InputObject $Install -PropertyNames @('ManagerPath'))
+    if ([string]::IsNullOrWhiteSpace($managerPath)) {
+        return -1
+    }
+    $records = @(Get-MuMuInstanceRecord -ManagerPath $managerPath -VersionArgument 'all' -Runner $Runner)
+    if ($records.Count -eq 0) {
+        return -1
+    }
+    $used = @{}
+    foreach ($record in $records) {
+        $index = 0
+        $property = $record.PSObject.Properties['index']
+        if ($null -ne $property -and [int]::TryParse([string]$property.Value, [ref]$index) -and $index -ge 0) {
+            $used[$index] = $true
+        }
+    }
+    $candidate = 0
+    while ($used.ContainsKey($candidate)) {
+        $candidate++
+    }
+    return $candidate
+}
+
 function Invoke-ToolkitTarget {
     param(
         [object]$Install,
@@ -497,10 +531,28 @@ function Invoke-ToolkitTarget {
         if ($null -eq $Prompt) {
             return Get-ToolkitResult -Status 'CriticalError' -Message 'A noninteractive create target run requires an explicit -StartIndex that is a non-negative integer. No instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_REQUIRED' })
         }
-        $targetStartIndex = ConvertTo-ToolkitInstanceIndex -Value ([string](& $Prompt 'Free instance index for the new instance'))
-        if ($null -eq $targetStartIndex) {
-            return Get-ToolkitResult -Status 'CriticalError' -Message 'The free instance index must be a non-negative integer, so no instance was created.' -Data (@{ Code = 'TARGET_START_INDEX_INVALID' })
+        # The next free index is offered as the default, so a blank answer means the obvious choice and an
+        # operator who just pressed Enter does not have to be told a refusal for the thing they agreed to.
+        $suggested = Get-ToolkitNextFreeInstanceIndex -Install $Install -Runner $Runner
+        if ($suggested -lt 0) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The next free instance index could not be read from the MuMu manager, so no index is offered and no instance was created. Pass an explicit -StartIndex.' -Data (@{ Code = 'START_INDEX_UNREADABLE' })
         }
+        $question = 'Free instance index for the new instance (' + [string]$suggested + ' is the next free one, Enter to use it)'
+        # The prompt is asked exactly once, because asking twice on a blank answer would consume the next
+        # answer in a scripted run and answer a question nobody was looking at.
+        $rawAnswer = ([string](& $Prompt $question)).Trim()
+        $answered = ConvertTo-ToolkitInstanceIndex -Value $rawAnswer
+        if ($null -eq $answered) {
+            # A blank answer takes the default. Anything else that is not a non-negative integer is still
+            # refused, because a mistyped index is not a request for the next free one.
+            if ([string]::IsNullOrWhiteSpace($rawAnswer)) {
+                $answered = $suggested
+            }
+            else {
+                return Get-ToolkitResult -Status 'CriticalError' -Message "The free instance index must be a non-negative integer, so no instance was created. Press Enter to use the next free index, $suggested." -Data (@{ Code = 'TARGET_START_INDEX_INVALID'; Suggested = $suggested })
+            }
+        }
+        $targetStartIndex = $answered
     }
 
     $targetSourceIndex = $SourceIndex
