@@ -8622,6 +8622,8 @@ function Invoke-MenuTests {
         Assert-Equal 0 $repeatCode 'A repeated menu session did not return a zero exit code.'
         $bannerCount = @(@($repeatState.Lines) | Where-Object { [string]$_ -match 'MuMu Root Hide Toolkit' }).Count
         Assert-Equal 3 $bannerCount 'The menu banner was not written before every prompt.'
+        $blankSeparatorCount = @(@($repeatState.Lines) | Where-Object { [string]::IsNullOrEmpty([string]$_) }).Count
+        Assert-Equal 2 $blankSeparatorCount 'A result block is not separated from the next menu by exactly one blank line.'
 
         $skippedState = @{ Lines = @() }
         $skippedCode = Start-ToolkitController -StateRoot $menuStateRoot -SkipToolbar -Reader (New-MenuReader -Answers @('9')) -Writer ({ param($Line) $skippedState.Lines += $Line }).GetNewClosure() -ActionRunner ({ param($Choice) Get-ToolkitResult -Status 'Success' -Message 'ran' }).GetNewClosure()
@@ -8632,6 +8634,32 @@ function Invoke-MenuTests {
         $promptState = @{ Questions = @() }
         $null = Get-ToolkitMenuChoice -Label 'Select the MuMu instance' -Count 3 -Prompt ({ param($Question) $promptState.Questions += $Question; '2' }).GetNewClosure()
         Assert-Equal 'Select the MuMu instance (1-3)' @($promptState.Questions)[0] 'The instance prompt carries its own colon and renders a doubled one.'
+
+        # Color marks status and the menu header only, so a detail line stays plain, and a non-empty
+        # NO_COLOR turns every color off for the whole console.
+        Assert-Equal 'Green' (Get-ToolkitConsoleColor -Line '[Success] ran') 'A success line is not green.'
+        Assert-Equal 'Green' (Get-ToolkitConsoleColor -Line '[AlreadyApplied] ran') 'An already-applied line is not green.'
+        Assert-Equal 'Yellow' (Get-ToolkitConsoleColor -Line '[Warning] ran') 'A warning line is not yellow.'
+        Assert-Equal 'Yellow' (Get-ToolkitConsoleColor -Line '[RecoverableError] ran') 'A recoverable error line is not yellow.'
+        Assert-Equal 'Red' (Get-ToolkitConsoleColor -Line '[CriticalError] ran') 'A critical error line is not red.'
+        Assert-Equal 'Yellow' (Get-ToolkitConsoleColor -Line 'Select a number from 1-9, or press Enter to see the menu again.') 'The invalid-answer hint is not yellow.'
+        Assert-Equal 'Cyan' (Get-ToolkitConsoleColor -Line ('  ' + [string]$script:ToolkitMenuTitle)) 'The menu title is not cyan.'
+        Assert-Equal 'DarkGray' (Get-ToolkitConsoleColor -Line ('  ' + ('-' * ([string]$script:ToolkitMenuTitle).Length))) 'The menu rule is not dimmed.'
+        Assert-Equal 'DarkGray' (Get-ToolkitConsoleColor -Line ('  ' + [string]$script:ToolkitMenuSummary)) 'The menu safety line is not dimmed.'
+        Assert-Equal '' (Get-ToolkitConsoleColor -Line '  Selected: 0 | Roo+3d 12 | Android 12.0 | Running no | Vendor root no') 'A result detail line is colored instead of plain.'
+        $savedNoColor = $env:NO_COLOR
+        $env:NO_COLOR = '1'
+        try {
+            Assert-Equal '' (Get-ToolkitConsoleColor -Line '[CriticalError] ran') 'A non-empty NO_COLOR did not switch the colors off.'
+        }
+        finally {
+            if ([string]::IsNullOrEmpty($savedNoColor)) {
+                Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
+            }
+            else {
+                $env:NO_COLOR = $savedNoColor
+            }
+        }
 
         # Interactive output is for a person, so a discovery is a summary and an instance list rather than
         # a field dump. The noninteractive renderer keeps the field form because scripts parse it.

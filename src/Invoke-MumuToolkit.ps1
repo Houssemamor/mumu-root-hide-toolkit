@@ -135,6 +135,40 @@ function Format-ToolkitMenuBanner {
     return $lines
 }
 
+# The console color for one rendered line, or an empty string for plain text. Color marks the status
+# and the menu header only, per the Command Line Interface Guidelines: when everything is colored,
+# color means nothing. A non-empty NO_COLOR environment variable switches every color off
+# (https://no-color.org), and a redirected console shows plain text regardless.
+function Get-ToolkitConsoleColor {
+    param([string]$Line)
+
+    if (-not [string]::IsNullOrEmpty($env:NO_COLOR)) {
+        return ''
+    }
+    if ($Line -cmatch '^\[(Success|AlreadyApplied)\]') { return 'Green' }
+    if ($Line -cmatch '^\[(Warning|RecoverableError)\]') { return 'Yellow' }
+    if ($Line -cmatch '^\[CriticalError\]') { return 'Red' }
+    if ($Line -clike 'Select a number from*') { return 'Yellow' }
+    if ($Line -ceq ('  ' + [string]$script:ToolkitMenuTitle)) { return 'Cyan' }
+    if ($Line -ceq ('  ' + ('-' * ([string]$script:ToolkitMenuTitle).Length))) { return 'DarkGray' }
+    if ($Line -ceq ('  ' + [string]$script:ToolkitMenuSummary)) { return 'DarkGray' }
+    return ''
+}
+
+# The default console writer. The color is decided per line here, so an injected writer is untouched
+# and the redirected noninteractive child prints the same text it always did.
+function Write-ToolkitConsoleLine {
+    param([string]$Line)
+
+    $color = Get-ToolkitConsoleColor -Line $Line
+    if ([string]::IsNullOrWhiteSpace($color)) {
+        Write-Host $Line
+    }
+    else {
+        Write-Host $Line -ForegroundColor $color
+    }
+}
+
 function Get-ToolkitDiscoverySources {
     $registryRoots = @()
     foreach ($root in $script:ToolkitRegistryRoots) {
@@ -1039,13 +1073,20 @@ function Invoke-MenuLoop {
 
     $write = $Writer
     if ($null -eq $write) {
-        $write = { param($Line) Write-Host $Line }
+        $write = { param($Line) Write-ToolkitConsoleLine $Line }
     }
     $exitCode = 0
+    $firstPrompt = $true
     while ($true) {
         # The banner is rewritten before every prompt so the choices stay on screen no matter how long the
         # previous action scrolled, rather than being printed once and left behind.
         if ($ShowBanner) {
+            if (-not $firstPrompt) {
+                # One blank line keeps the previous result block apart from the rewritten menu. The very
+                # first menu is written without it so a fresh session opens at the top of the console.
+                & $write ''
+            }
+            $firstPrompt = $false
             foreach ($bannerLine in @(Format-ToolkitMenuBanner)) {
                 & $write $bannerLine
             }
@@ -1166,7 +1207,7 @@ function Start-ToolkitController {
     $Packages = ConvertTo-ToolkitPackageSelection -Packages $Packages
     $write = $Writer
     if ($null -eq $write) {
-        $write = { param($Line) Write-Host $Line }
+        $write = { param($Line) Write-ToolkitConsoleLine $Line }
     }
 
     if ($NonInteractive) {

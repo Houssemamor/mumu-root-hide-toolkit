@@ -145,6 +145,11 @@ Select an action (1-9): 1
 An action name is still accepted if you prefer to type it. Every mutating action asks for its
 confirmation in the menu, and the menu never closes itself when an action fails.
 
+Result lines are colored in the console: green for `Success` and `AlreadyApplied`, yellow for
+`Warning`, `RecoverableError`, and the invalid-answer hint, red for `CriticalError`. The menu title
+is cyan and its rule and safety line are dimmed. Set the `NO_COLOR` environment variable to any
+non-empty value to turn all of the colors off.
+
 Interactive output is written for a person: a discovery is a summary line and the instance it settled
 on, rather than a field dump. **`-NonInteractive` output is unchanged and stays in the `Field = Value`
 form**, because that is what a script reads.
