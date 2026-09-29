@@ -11261,14 +11261,84 @@ function Invoke-DocsTests {
     }
     Assert-True ($verifySection.Value -notmatch '(?i)no live (qualification|run|test)') 'The Verify report section reintroduces a negative live-status claim.'
 
-    # The Verify sample must be labelled illustrative unless it is a real capture, and it must not be
-    # dressed up with an edition and a clone index no live run produced.
+    # The Verify sample is a real capture now, so it must say so and must name the installation, the
+    # instances and the edition that the live run actually produced. Guarding it as illustrative is what
+    # stopped it being read as a capture while it was composed; the guard now requires the opposite.
     $verifySectionText = $verifySection.Value
-    Assert-True ($verifySectionText -match '(?i)illustrative') 'The Verify sample is not labelled as illustrative, so it reads as a captured run.'
-    Assert-True ($verifySectionText -notmatch 'C:\\Program Files\\Netease\\MuMu Global') 'The Verify sample is presented as captured output but names the Global edition, which is fixture tested only.'
+    Assert-True ($verifySectionText -match '(?i)captured') 'The Verify sample is not labelled as a captured run, so it reads as composed output.'
+    Assert-True ($verifySectionText -notmatch '(?i)illustrative') 'The Verify sample is still labelled illustrative even though it is now a real capture.'
+    Assert-True ($verifySectionText -notmatch 'C:\\Program Files\\Netease\\MuMu Global') 'The Verify sample names the Global edition, which is fixture tested only.'
     Assert-True ($verifySectionText -notmatch '(?m)^\s*Backups\.CloneIndex = 7\s*$') 'The Verify sample claims a captured clone 7 that no live run produced.'
     Assert-True ($verifySectionText -match '(?i)Chinese') 'The Verify sample does not name the edition the live run actually used.'
+    # The capture is only worth trusting if it names the machine it came from and reports the stopped
+    # guest honestly rather than showing a healthy state nobody observed.
+    Assert-True ($verifySectionText -match 'Roo\+3d 12 Shad') 'The Verify capture does not name an instance the live run reported.'
+    Assert-True ($verifySectionText -match '(?m)^\s*Guest\.Code = ADB_FAILED\s*$') 'The Verify capture does not report the ADB failure the live run recorded.'
+    Assert-True ($verifySectionText -match '(?m)^\s*JournalState = None\s*$') 'The Verify capture does not report the absent journal state the live run recorded.'
 
+
+    # The captured screens in the README are the renderer's output, so a change to the renderer has to
+    # change the documentation too. Each block below is a line the renderer actually produced.
+    $menuSection = [regex]::Match($readme, '(?ms)^### The interactive menu$.*?(?=^### |^## )')
+    Assert-True $menuSection.Success 'README has no interactive menu section.'
+    $menuText = $menuSection.Value
+    $menuScreen = [pscustomobject]@{
+        Index = 0; Name = 'Roo+3d 12 Shad'; AndroidVersion = '12.0'; Running = $false; RootSetting = $false
+    }
+    $menuSnapshot = [pscustomobject]@{
+        Install      = [pscustomobject]@{ Edition = 'Chinese'; InstallRoot = 'D:\Program Files\Netease\MuMuPlayer' }
+        InstallCount = 1
+        Instances    = @($menuScreen)
+    }
+    # The dashboard, the target screen and the action screen, each rendered by the same code an operator
+    # runs. A line in the README that the renderer no longer produces fails here rather than misleading.
+    $dashboardExample = @(Get-ToolkitScreenLines -Screen 'Dashboard' -Snapshot $menuSnapshot -Instance $null -Target $null)
+    foreach ($line in $dashboardExample) {
+        if ($line -match '^\s*(#|Installation|MuMu Root|Select)') { continue }
+        Assert-True ($menuText -match [regex]::Escape($line)) "The captured dashboard does not contain a line the renderer produces: $line"
+    }
+    $targetExample = @(Get-ToolkitScreenLines -Screen 'Target' -Snapshot $menuSnapshot -Instance $menuScreen -Target $null)
+    foreach ($line in $targetExample) {
+        if ($line -match '^\s*(MuMu Root|Instance 0|Select|=|Target\s|Other\s|Back\s|Every guest)') { continue }
+        Assert-True ($menuText -match [regex]::Escape($line)) "The captured target screen does not contain a line the renderer produces: $line"
+    }
+    $actionExample = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $menuSnapshot -Instance $menuScreen -Target ([pscustomobject]@{ Mode = 'Clone'; SourceIndex = 0; SourceName = 'Roo+3d 12 Shad'; CloneIndex = -1; CloneName = ''; FreshIdentifiers = $false }))
+    foreach ($line in $actionExample) {
+        if ($line -match '^\s*(MuMu Root|Instance 0|Select|=|Inspect\s|Change\s|Other\s|Back\s|Anything|The action)') { continue }
+        Assert-True ($menuText -match [regex]::Escape($line)) "The captured action screen does not contain a line the renderer produces: $line"
+    }
+    # The captured advertisement results are the real ones, so the codes they claim are the codes the
+    # renderer writes for those statuses.
+    Assert-True ($menuText -match '\[AlreadyApplied\] No MuMu campaign file is present\.') 'The captured Remove ads result is not the one the renderer writes.'
+    Assert-True ($menuText -match 'Code = CAMPAIGN_RESTORE_POINT_MISSING') 'The captured Restore ads result is not the one the renderer writes.'
+    Assert-True ($menuText -match 'Code = USER_CONFIRMATION_REQUIRED') 'The captured declined setup does not report the authorization code.'
+    # The disclosure in the documentation is the one the renderer produces, including the line that
+    # replaced the "0 app(s)" claim once the app list is not known yet.
+    $capturedDisclosure = @(Format-ToolkitDisclosure -Action 'FullSetup' -Instance $menuScreen)
+    foreach ($line in $capturedDisclosure) {
+        Assert-True ($menuText -match [regex]::Escape($line)) "The captured disclosure does not contain a line the renderer produces: $line"
+    }
+    Assert-True ($menuText -notmatch '(?m)^\s*\* 0 app\(s\)') 'The captured disclosure still claims that zero apps join the template.'
+
+    # The captured noninteractive output is the field form a script reads, so the documented form has to
+    # be the one the machine renderer still produces. The headline carries the action's own message, so
+    # only the field lines below it are compared.
+    $machineDiscovery = Get-ToolkitResult -Status 'Success' -Message 'Discovered Chinese installation D:\Program Files\Netease\MuMuPlayer with 2 instance(s).' -Data ([ordered]@{
+            Edition       = 'Chinese'
+            InstallRoot   = 'D:\Program Files\Netease\MuMuPlayer'
+            ManagerPath   = 'D:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe'
+            InstanceCount = 2
+            InstanceIndex = 0
+            InstanceName  = 'Roo+3d 12 Shad'
+            AndroidVersion = '12.0'
+            RootSetting   = $false
+            Running       = $false
+        })
+    $machineLines = @(Format-ToolkitResult -Result $machineDiscovery)
+    Assert-True ($menuText -match [regex]::Escape($machineLines[0])) 'The captured noninteractive headline is not the one the machine renderer produces.'
+    foreach ($line in @($machineLines | Select-Object -Skip 1)) {
+        Assert-True ($menuText -match [regex]::Escape($line)) "The captured noninteractive output does not contain a line the machine renderer produces: $line"
+    }
 
     $concealmentSection = [regex]::Match($readme, '(?ms)^## Concealment scope$.*?(?=^## )')
     Assert-True $concealmentSection.Success 'README has no Concealment scope section.'

@@ -110,15 +110,19 @@ eligible, the action stops with `INSTANCE_SELECTION_REQUIRED` rather than pickin
 Double-click `Run-MumuToolkit.bat`. The menu is three screens in one design, and every screen is written
 again before each prompt so the choices never scroll out of reach.
 
+Every block below is **captured output from a real run** on this repository's own test host, not a mock
+up. The status colors are not visible in the text capture; the console shows green for `Success` and
+`AlreadyApplied`, yellow for `Warning`, `RecoverableError` and the invalid-answer hint, red for
+`CriticalError`, cyan for the screen title, and dim gray for the rule and safety line.
+
 **1. The dashboard.** It runs the read-only discovery on start, so you see the machines you are about to
 change instead of being asked to trust a menu. Two number columns, because they are not the same thing:
 `#` is what you type, `Idx` is the index MuMu itself uses.
 
 ```text
       #  Idx  Name                Android Running  Vendor root
-      1  0    Roo+3d 12           12.0    no       no
-      2  1    Roo+3d 15           15.0    yes      no
-      3  2    Roo+3d 12-Houssem  12.0    no       unknown
+      1  0    Roo+3d 12 Shad      12.0    no       no
+      2  2    Roo+3d 12-Houssem   12.0    yes      no
   Installation Chinese  D:\Program Files\Netease\MuMuPlayer
 
   MuMu Root Hide Toolkit
@@ -129,20 +133,21 @@ change instead of being asked to trust a menu. Two number columns, because they 
   Other      Q Quit
   Vendor root is the MuMu setting. The guest root is reported by Status.
 
-Select an instance (1-3), or N, A, B or Q:
+Select an instance (1-2), or N, A, B or Q:
 ```
 
 `Vendor root` is the **MuMu setting**, not the guest. It reads `unknown` when the manager reports no value
 at all, because `no` would claim a measurement that was never taken. The real guest root, and which
 implementation provides it, is reported by `Status` on the selected instance.
 
-**2. The target screen.** It decides, it does not perform. Every guest change in this toolkit is made on a
-clone, and the action that makes the change is the only thing that makes the clone, so this screen records
-the choice and asks for no confirmation. The action asks for the confirmation that covers the clone it is
-about to make.
+**2 and 3. The target screen, then the action screen.** The target screen decides, it does not perform.
+Every guest change in this toolkit is made on a clone, and the action that makes the change is the only
+thing that makes the clone, so the target screen records the choice and asks for no confirmation. The
+action asks for the confirmation that covers the clone it is about to make. Both screens, captured in one
+walk:
 
 ```text
-  Instance 0  Roo+3d 12  Android 12.0
+  Instance 0  Roo+3d 12 Shad  Android 12.0
   ============================================================
   Target     1 Clone, keep device info         new instance
   Other      2 Clone, fresh identifiers        new instance
@@ -151,6 +156,19 @@ about to make.
   Every guest change is made on a clone, so the source instance is never written.
 
 Select a target (1-4):
+
+  Instance 0  Roo+3d 12 Shad  Android 12.0
+  ========================================================================
+  Inspect    1 Status                          read-only
+  Change     2 Root with Kitsune               downloads + changes guest
+  Change     3 Conceal apps                    changes guest
+  Other      4 Full setup                      downloads + changes guest
+  Back       5 Back to the instances
+  Anything that writes prints what it will change and asks for CONFIRM.
+
+  The action will work on a clone of instance 0 (Roo+3d 12 Shad).
+
+Select an action (1-5):
 ```
 
 Rows 1 and 2 are declarations, not clones. The action receives the **source** instance and makes exactly
@@ -175,28 +193,24 @@ rather than making a new clone behind your back.
 work is never offered:
 
 ```text
-  Instance 0  Roo+3d 12  Android 12.0
+  Instance 0  Roo+3d 12 Shad  Android 12.0
   ========================================================================
   Inspect    1 Status                          read-only
   Change     2 Root with Kitsune               downloads + changes guest
-  Other      3 Conceal apps                    changes guest
+  Change     3 Conceal apps                    changes guest
   Other      4 Full setup                      downloads + changes guest
   Back       5 Back to the instances
   Anything that writes prints what it will change and asks for CONFIRM.
+
+  The action will work on a clone of instance 0 (Roo+3d 12 Shad).
 ```
 
 The tag on each row is the shortest true statement of what it costs: `read-only` changes nothing,
 `new instance` adds a MuMu instance, `changes guest` writes inside the Android guest, `changes
 installation` writes the campaign files, `restores` puts files back from a restore point, and `downloads`
 reaches the network for a pinned artifact. Anything that writes prints a disclosure first and asks for
-`CONFIRM` after, so you read the consequence and then decide:
-
-```text
-  This will change instance 3 (Roo+3d 12-clone).
-  * 4 app(s) join the Root template: com.a, com.b, com.c, com.d
-  * The vendor root is off on the clone, so an app probing for su sees nothing.
-Type CONFIRM to continue:
-```
+`CONFIRM` after, so you read the consequence and then decide. The disclosure is captured further down,
+after the `Status` report, because it is part of a real run rather than a diagram.
 
 `Full setup` runs root, then conceal, then the advertisement suppression, in that order. It stops at the
 first step that does not succeed and states which steps completed and which did not run, because a chain
@@ -207,43 +221,56 @@ Because the menu stays on screen it is a legend rather than a description. What 
 [Actions](#actions) below, and what it is allowed to change is in
 [How the safety rules work](#how-the-safety-rules-work).
 
-Here is a real session, captured: `Status` on instance 0 of the Chinese installation, then quit.
+Here is a real `Status` run on instance 0, captured. The screens above it are omitted so the report is
+readable; the run printed them on the way. The report itself is reproduced in full in
+[the Verify report section](#verify-report). Notice that it is a **`Warning`**, not a `Success`: the
+guest is stopped, so the ADB probe could not run and the report says `Unverified` rather than claiming a
+root state it never measured.
 
 ```text
-      #  Idx  Name                Android Running  Vendor root
-      1  0    Roo+3d 12           12.0    no       no
-      2  1    Android Device-1    12.0    no       no
-      3  2    Roo+3d 12-Houssem  12.0    no       no
-  Installation Chinese  D:\Program Files\Netease\MuMuPlayer
-
-  MuMu Root Hide Toolkit
-  ===================================================================
-  Prepare    N New empty instance              new instance
-  Other      A Remove ads                      changes installation
-  Other      B Restore ads                     restores
-  Other      Q Quit
-  Vendor root is the MuMu setting. The guest root is reported by Status.
-
-Select an instance (1-3), or N, A, B or Q: 1
-
-  Instance 0  Roo+3d 12  Android 12.0
-  ========================================================================
-  Inspect    1 Status                          read-only
-  Change     2 Root with Kitsune               downloads + changes guest
-  Other      3 Conceal apps                    changes guest
-  Other      4 Full setup                      downloads + changes guest
-  Back       5 Back to the instances
-  Anything that writes prints what it will change and asks for CONFIRM.
-
-Select an action (1-5): 1
-[Success] The read-only report for the instance at index 0 is collected. Root state: ...
+[Warning] The read-only report for the instance at index 0 is collected. Root state: Unverified. Concealment: CLONE_UNVERIFIED. Chinese installation D:\Program Files\Netease\MuMuPlayer.
+  Log: <state dir>\logs\mumu-root-hide-toolkit.log
   Install.Edition = Chinese
-  Instances:
-    Instance 0 | Roo+3d 12 | Android 12.0 | Running no | RootSetting no
-  Guest.Root = Unrooted
+  ...
+  Guest.Root = Unverified
+  Guest.Code = ADB_FAILED
   Guest.Kitsune = none
   Guest.KernelSU = none
-  Failures: none
+  Failures:
+    Failure 1 = The Kitsune package query failed. The installed package list could not be read.
+```
+
+Anything that writes prints a disclosure first, so you read the consequence and then decide. Here is the
+real `Full setup` row with the confirmation declined:
+
+```text
+  This will change instance 0 (Roo+3d 12 Shad).
+  * The root that applies to this Android version is applied to a clone of this instance.
+  * The apps you name next join the Root template on that clone.
+  * The campaign advertisement files for this installation are suppressed.
+[CriticalError] The full setup changes the instance, so it requires an explicit confirmation. Nothing was changed.
+  Code = USER_CONFIRMATION_REQUIRED
+  Log: <state dir>\logs\mumu-root-hide-toolkit.log
+  Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.
+```
+
+Note what did **not** happen: no clone, no download, no cache write. The authorization is checked before
+the copy is made, so declining costs nothing.
+
+The two advertisement rows, also captured. This installation has no campaign file present, so suppression
+is already satisfied and restore has nothing to restore:
+
+```text
+[AlreadyApplied] No MuMu campaign file is present.
+  Changed = 0
+  Skipped = 0
+```
+
+```text
+[CriticalError] The toolkit holds no advertisement restore point for the selected installation, so no advertisement file is changed.
+  Code = CAMPAIGN_RESTORE_POINT_MISSING
+  Log: <state dir>\logs\mumu-root-hide-toolkit.log
+  Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.
 ```
 
 Every mutating action asks for its confirmation in the menu, and the menu never closes itself when an
@@ -257,7 +284,21 @@ colors off.
 
 Interactive output is written for a person: a discovery is a summary line and the instance it settled
 on, rather than a field dump. **`-NonInteractive` output is unchanged and stays in the `Field = Value`
-form**, because that is what a script reads.
+form**, because that is what a script reads. Captured, on the same host:
+
+```text
+PS> Run-MumuToolkit.bat -Action Detect -NonInteractive -InstanceIndex 0
+[Success] Discovered Chinese installation D:\Program Files\Netease\MuMuPlayer with 2 instance(s).
+  AndroidVersion = 12.0
+  Edition = Chinese
+  InstallRoot = D:\Program Files\Netease\MuMuPlayer
+  InstanceCount = 2
+  InstanceIndex = 0
+  InstanceName = Roo+3d 12 Shad
+  ManagerPath = D:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe
+  RootSetting = False
+  Running = False
+```
 
 ## Actions
 
@@ -384,21 +425,24 @@ execution policy permanently, and never takes ownership of files or weakens an a
 invisible to you. The report is plain text with one field per line, so it can be read directly or
 searched for a single field.
 
-The block below is an **illustrative** sample, not a captured run. The live runs this repository
-records used the Chinese edition, not the Global edition, and the instance list in this sample was
-composed for illustration; see [Limitations](#limitations) for what was actually captured.
+A captured report is reproduced here in full. The screens that produced it are in
+[the interactive menu section](#the-interactive-menu). The fields fall into four groups: the
+installation and the manager (`Install.*`, `ManagerVersion`), every instance the manager reports
+(`Instances`), the guest itself (`Guest.*`), and what the toolkit has on record (`Ads`, `Backups`,
+`Concealment`, `Journal*`), ending with the failures that explain anything unreadable.
 
 ```text
-[Warning] The read-only report for the instance at index 2 is collected. Root state: Unverified. Chinese installation C:\Program Files\Netease\MuMuPlayer.
+[Warning] The read-only report for the instance at index 0 is collected. Root state: Unverified. Concealment: CLONE_UNVERIFIED. Chinese installation D:\Program Files\Netease\MuMuPlayer.
+  Log: <state dir>\logs\mumu-root-hide-toolkit.log
   Install.Edition = Chinese
-  Install.InstallRoot = C:\Program Files\Netease\MuMuPlayer
-  Install.VmsPath = C:\Program Files\Netease\MuMuPlayer\vms
-  Install.ManagerPath = C:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe
+  Install.InstallRoot = D:\Program Files\Netease\MuMuPlayer
+  Install.VmsPath = D:\Program Files\Netease\MuMuPlayer\vms
+  Install.ManagerPath = D:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe
   Install.Source = Registry
   ManagerVersion = Unknown
   Instances:
-    Instance 0 | Roo+3d 12 | Android 12.0 | Running True | RootSetting False
-    Instance 1 | Roo+3d 15 | Android 15.0 | Running False | RootSetting True
+    Instance 0 | Roo+3d 12 Shad | Android 12.0 | Running False | RootSetting False
+    Instance 2 | Roo+3d 12-Houssem | Android 12.0 | Running True | RootSetting False
   Virtualization = Enabled
   Guest.Root = Unverified
   Guest.Code = ADB_FAILED
@@ -406,44 +450,53 @@ composed for illustration; see [Limitations](#limitations) for what was actually
   Guest.Kitsune = none
   Guest.KernelSU = none
   Guest.DaemonCount = not-detected
-  Guest.HmaInstalled = True
-  Guest.VectorModuleInstalled = not-detected
+  Guest.HmaInstalled = not-detected
+  Guest.VectorModuleInstalled = False
   Ads.RestorePoint = Missing
-  Backups.CloneIndex = 4
-  Backups.CloneName = Android Device-3-1
-  Concealment.Target = 4
-  Concealment.Status = Warning
-  Concealment.Code = KERNELSU_ABSENT
-  Concealment.Packages = 1: "jp.pokemon.pokemontcgp"
-  Concealment.InScope = 1: "jp.pokemon.pokemontcgp"
+  Backups.CloneIndex = not-detected
+  Backups.CloneName = none
+  Concealment.Target = none
+  Concealment.Status = NotVerified
+  Concealment.Code = CLONE_UNVERIFIED
+  Concealment.Packages = none
+  Concealment.InScope = none
   Concealment.OutOfScope = none
-  Concealment.TemplateFound = True
+  Concealment.TemplateFound = False
   Concealment.IsWhitelist = False
-  Concealment.HmaConfigVersion = 93
+  Concealment.HmaConfigVersion = not-detected
   Concealment.KernelSUInstalled = False
   Concealment.AllowlistPresent = False
-  JournalState = Completed
-  JournalOperation = Root12
-  JournalId = 8fd6a6a800534e6c8b643490f7bb26df
+  JournalState = None
+  JournalOperation = none
+  JournalId = none
   Failures:
-    Failure 1 = Concealment evidence on the verified clone is KERNELSU_ABSENT, not a verified scope. The HMA scope ...
+    Failure 1 = The Kitsune package query failed. The installed package list could not be read.
 ```
 
-Two things to know about that block. The last line is elided here, because a real `Failure` entry is a
-full sentence. And the `Concealment` lines show what the block looks like when an app really is in
-scope; on the live clone 4 the opposite happened, because the app was refused before any scope was
-written, so that run reports `PACKAGE_NOT_INSTALLED` and no package under test. The sample is here
-to show the shape of a report, not to promise that state.
+Two details are worth reading rather than skimming:
 
-The sample is also a guest that did not answer: `Guest.Root = Unverified` with `ADB_FAILED` is what a
-stopped or unreachable instance looks like. A healthy run shows `Guest.Root = Verified`.
+- A field that could not be measured reads `not-detected`, and a value that is genuinely absent reads
+  `none`. Neither is ever turned into a measurement that was not taken.
+- A report on a **stopped** instance comes back as `[Warning]` with `Guest.Code = ADB_FAILED`, because
+  the guest could not be reached. That is the report being honest, not the report being broken. Start
+  the instance and run it again to get a real root state.
 
-**Two instance indexes appear in one report, and they are not the same instance.** The `Install.*` and
-`Guest.*` lines describe the instance you selected. The `Backups.*` and `Concealment.*` lines
-describe that instance's verified clone, which is the one the toolkit changed. In the sample the
-report is for index 2 and its clone is index 4, which is why the header and `Backups.CloneIndex`
-disagree. `Backups.CloneIndex` is where you read back which instance is actually rooted; a root
-action's own result reports the same number as `CloneIndex`.
+Two things to know about that report. A real `Failure` entry is a full sentence rather than a short code,
+and the `Concealment` block is the widest part of the report because concealment is a per-app claim: it
+carries the packages in scope and out of scope, the Hide My Applist configuration version, and whether
+the KernelSU package is installed. A run where an app was refused before any scope was written reports
+`PACKAGE_NOT_INSTALLED` with no package under test, which is the honest result for a run that changed
+nothing.
+
+`Guest.Root = Unverified` with `Guest.Code = ADB_FAILED` is what a **stopped or unreachable** instance
+looks like. A healthy, running guest shows `Guest.Root = Verified`.
+
+**Two instance indexes appear in one report, and they are not the same instance.** The `Install.*`,
+`Instances` and `Guest.*` lines describe the instance you selected. The `Backups.*` and `Concealment.*`
+lines describe that instance's verified clone, which is the one the toolkit changed. In a report for a
+rooted instance the header and `Backups.CloneIndex` therefore name different indexes, and
+`Backups.CloneIndex` is where you read back which instance is actually rooted. A root action's own
+result reports the same number as `CloneIndex`.
 
 The report names the installation identity, every discovered instance with its index, Android
 version, and vendor root setting, the virtualization state, the guest root and root daemon
