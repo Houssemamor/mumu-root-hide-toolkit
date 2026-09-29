@@ -8707,22 +8707,35 @@ function Invoke-MenuTests {
         # under a header that names some other instance.
         Assert-True ($dashboardText -notmatch '(?m)^\s+\d+\s+New empty instance') 'The fresh instance row was given a number as if it selected an instance.'
         Assert-True ($dashboardText -match 'Select an instance \(1-2\), or N, A, B or Q') 'The dashboard prompt does not name the choices it accepts.'
-        foreach ($group in @('Prepare', 'Other')) {
+        foreach ($group in @('Create', 'Advertise')) {
             Assert-True ($dashboardText -match ('(?m)^\s+' + $group + '\b')) "The dashboard does not group its rows under: $group"
         }
+        # A row that continues the group above it prints a blank group column. It used to print the word
+        # "Other" there, which read as a category the operator could select but that nothing accepted.
+        Assert-True ($dashboardText -notmatch '(?m)^\s+Other\s') 'The dashboard prints a group named Other, which is not a choice it accepts.'
 
         $targetLines = @(Get-ToolkitScreenLines -Screen 'Target' -Snapshot $screenSnapshot -Instance $screenInstance -Target $null)
         $targetText = @($targetLines) -join "`n"
         Assert-True ($targetText -match 'Instance 0\s+Roo\+3d 12\s+Android 12\.0') 'The target screen does not name the instance it is about.'
-        foreach ($row in @('Clone, keep device info', 'Clone, fresh identifiers', 'Continue on its clone', 'Back to the instances')) {
+        foreach ($row in @('Status', 'Clone, keep device info', 'Clone, fresh identifiers', 'Continue on its clone', 'Back to the instances')) {
             Assert-True ($targetText -match [regex]::Escape($row)) "The target screen does not offer: $row"
         }
         # There is no in-place entry, because every guest change in this toolkit is made on a clone.
         Assert-True ($targetText -notmatch '(?i)modify in place|edit in place|change this instance directly') 'The target screen offers an in-place change, which the root and concealment actions all refuse.'
-        Assert-True ($targetText -match 'Select a target \(1-4\)') 'The target screen prompt does not name the range it accepts.'
-        foreach ($group in @('Target', 'Back')) {
+        Assert-True ($targetText -match 'Select what to do \(1-5\)') 'The target screen prompt does not name the range it accepts.'
+        Assert-True ($targetText -notmatch '(?m)^\s+Other\s') 'The target screen prints a group named Other, which is not a choice it accepts.'
+        foreach ($group in @('Inspect', 'Target', 'Back')) {
             Assert-True ($targetText -match ('(?m)^\s+' + $group + '\b')) "The target screen does not group its rows under: $group"
         }
+        # Status reads the guest and changes nothing, so it is reached from the screen that names the
+        # instance rather than from the screen that plans a clone. Reaching it through the action screen
+        # made an operator choose a clone just to look at the instance they had already named.
+        $statusChoice = Resolve-ToolkitScreenChoice -Screen 'Target' -Answer '1' -Snapshot $screenSnapshot -Instance $screenInstance
+        Assert-Equal 'Action' ([string]$statusChoice.Kind) 'The Status row on the target screen does not dispatch an action.'
+        Assert-Equal 'Verify' ([string]$statusChoice.Action) 'The Status row on the target screen does not dispatch the read-only report.'
+        # The property is probed through PSObject because reading a missing one on a strict-mode object throws
+        # rather than returning null, so a direct read would fail the suite instead of this assertion.
+        Assert-True ($null -eq $statusChoice.PSObject.Properties['Target']) 'The Status row on the target screen declared a clone target it does not need.'
 
         # The action screen is filtered by the Android version, because a 12 instance cannot take the
         # built-in 15 root and a 15 instance cannot take the Kitsune release.
@@ -8730,7 +8743,11 @@ function Invoke-MenuTests {
         $twelveText = @($twelveActions) -join "`n"
         Assert-True ($twelveText -match 'Root with Kitsune') 'A 12 instance is not offered the Kitsune root.'
         Assert-True ($twelveText -notmatch 'Built-in root') 'A 12 instance is offered the built-in 15 root, which cannot apply to it.'
-        Assert-True ($twelveText -match 'Select an action \(1-5\)') 'The action screen prompt does not name the range it accepts.'
+        Assert-True ($twelveText -match 'Select an action \(1-4\)') 'The action screen prompt does not name the range it accepts.'
+        # Every row on the action screen writes, which is why Status is not one of them: a read-only row
+        # here would be the one row on a screen of changes that quietly writes nothing.
+        Assert-True ($twelveText -notmatch '(?m)^\s+\d+\s+Status\b') 'The action screen still offers Status, which reads a guest and is reached from the target screen instead.'
+        Assert-True ($twelveText -notmatch '(?m)^\s+Other\s') 'The action screen prints a group named Other, which is not a choice it accepts.'
         $fifteenActions = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $screenSnapshot -Instance ([pscustomobject]@{ Index = 1; Name = 'Device-1'; AndroidVersion = '15.0' }) -Target $null)
         $fifteenText = @($fifteenActions) -join "`n"
         Assert-True ($fifteenText -match 'Built-in root') 'A 15 instance is not offered the built-in root.'
@@ -8763,7 +8780,7 @@ function Invoke-MenuTests {
         # mistyped number can never select a different instance or start a different action.
         $refusedChoice = Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer '9' -Snapshot $screenSnapshot -Instance $null
         Assert-Equal $null $refusedChoice 'An out of range dashboard answer was accepted.'
-        $refusedTarget = Resolve-ToolkitScreenChoice -Screen 'Target' -Answer '5' -Snapshot $screenSnapshot -Instance $screenInstance
+        $refusedTarget = Resolve-ToolkitScreenChoice -Screen 'Target' -Answer '6' -Snapshot $screenSnapshot -Instance $screenInstance
         Assert-Equal $null $refusedTarget 'An out of range target answer was accepted.'
         $refusedAction = Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '9' -Snapshot $screenSnapshot -Instance $screenInstance
         Assert-Equal $null $refusedAction 'An out of range action answer was accepted.'
@@ -8774,9 +8791,10 @@ function Invoke-MenuTests {
         # The number the operator types is the position in the table, and it selects that row's instance.
         $picked = Resolve-ToolkitScreenChoice -Screen 'Dashboard' -Answer '2' -Snapshot $screenSnapshot -Instance $null
         Assert-Equal 1 ([int]$picked.Instance.Index) 'The second table row did not select the instance on that row.'
-        Assert-Equal 'FullSetup' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '4' -Snapshot $screenSnapshot -Instance $screenInstance).Action) 'The full setup row does not resolve to the full setup.'
-        Assert-Equal 'Root12' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '2' -Snapshot $screenSnapshot -Instance $screenInstance).Action) 'The root row on a 12 instance does not resolve to the Kitsune root.'
-        Assert-Equal 'Root15' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '2' -Snapshot $screenSnapshot -Instance ([pscustomobject]@{ Index = 1; AndroidVersion = '15.0' })).Action) 'The root row on a 15 instance does not resolve to the built-in root.'
+        # Status moved to the target screen, so the action screen now starts at the first row that writes.
+        Assert-Equal 'FullSetup' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '3' -Snapshot $screenSnapshot -Instance $screenInstance).Action) 'The full setup row does not resolve to the full setup.'
+        Assert-Equal 'Root12' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '1' -Snapshot $screenSnapshot -Instance $screenInstance).Action) 'The root row on a 12 instance does not resolve to the Kitsune root.'
+        Assert-Equal 'Root15' ([string](Resolve-ToolkitScreenChoice -Screen 'Actions' -Answer '1' -Snapshot $screenSnapshot -Instance ([pscustomobject]@{ Index = 1; AndroidVersion = '15.0' })).Action) 'The root row on a 15 instance does not resolve to the built-in root.'
 
         # The disclosure is the warning a one line tag cannot carry, so it names the instance, the apps,
         # and what the change means for an app that probes for su.
@@ -9448,7 +9466,10 @@ function Invoke-MenuTests {
         Assert-True ($outOfRangeText -match 'RAN:RemoveAds') 'An out-of-range menu number displaced the answer that follows it.'
         # A refused answer reports against the choices the screen printed, so the hint cannot name a range
         # the screen does not offer.
-        Assert-True ($outOfRangeText -match 'Select one of the choices this screen printed') 'An out-of-range answer did not report the choices the screen printed.'
+        Assert-True ($outOfRangeText -match 'Not one of the choices this screen printed') 'An out-of-range answer did not report the choices the screen printed.'
+        # The screen is reprinted by itself after a refused answer, so telling the operator to press Enter
+        # to see it again described a keypress that was never needed and produced a second redraw.
+        Assert-True ($outOfRangeText -notmatch 'Press Enter to see it again') 'The refused answer still tells the operator to press Enter to see the screen, which already comes back by itself.'
 
         $eofCode = Invoke-MenuLoop -Reader (New-MenuReader -Answers @()) -Writer ({ param($Line) }).GetNewClosure() -Runner ({ param($Action) }).GetNewClosure() -StateRoot $menuStateRoot -LogPath $menuLogPath
         Assert-Equal 0 $eofCode 'An exhausted menu input did not return normally.'
@@ -9616,17 +9637,28 @@ function Invoke-MenuTests {
         [IO.File]::WriteAllText($adsVictimPath, 'victim fixture')
         $adsOriginalCampaign = $script:MenuCampaignJson
 
-        $removeResult = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        # The advertisement actions rewrite files every instance in the installation shares, so they are
+        # gated on the same word as the guest changes. They used to rewrite those files from the keypress
+        # that chose the menu row, which is a mutation a new user can trigger without meaning to.
+        $unconfirmedRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        Assert-Equal 'CriticalError' $unconfirmedRemove.Status 'RemoveAds rewrote the advertisement files without a confirmation.'
+        Assert-Equal 'USER_CONFIRMATION_REQUIRED' ([string]$unconfirmedRemove.Data.Code) 'An unconfirmed RemoveAds did not report the confirmation code.'
+        Assert-Equal $script:MenuCampaignJson ([IO.File]::ReadAllText($adsInstall.CampaignPath)) 'A refused RemoveAds changed the campaign file.'
+        $unconfirmedRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsOtherInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        Assert-Equal 'CriticalError' $unconfirmedRestore.Status 'Restore rewrote the advertisement files without a confirmation.'
+        Assert-Equal 'victim fixture' ([IO.File]::ReadAllText($adsVictimPath)) 'A refused Restore wrote a file outside the boundary.'
+
+        $removeResult = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot -Confirmed
         Assert-Equal 'Success' $removeResult.Status "RemoveAds failed: $($removeResult.Message)"
         $suppressedCampaign = [IO.File]::ReadAllText($adsInstall.CampaignPath)
         Assert-Equal $false ($suppressedCampaign | ConvertFrom-Json).campaigns[0].display 'The first RemoveAds did not suppress the campaign file.'
         Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $adsStateRoot 'campaigns') -Recurse -Filter 'restore-point.json' -File).Count -eq 1) 'The first RemoveAds did not write exactly one restore point.'
-        $secondRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        $secondRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot -Confirmed
         Assert-Equal 'Success' $secondRemove.Status "A repeated RemoveAds failed: $($secondRemove.Message)"
         $repeatedCampaign = [IO.File]::ReadAllText($adsInstall.CampaignPath)
         Assert-Equal $suppressedCampaign $repeatedCampaign 'A repeated RemoveAds did not leave the campaign file suppressed.'
 
-        $wrongBoundary = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsOtherInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        $wrongBoundary = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsOtherInstall.Install.InstallRoot -StateRoot $adsStateRoot -Confirmed
         Assert-Equal 'CriticalError' $wrongBoundary.Status 'A campaign restore for an installation without its own restore point was accepted.'
         Assert-True ($wrongBoundary.Message -match '(?i)restore point|boundary') "A restore for an installation without its own restore point did not explain itself: $($wrongBoundary.Message)"
         Assert-Equal $repeatedCampaign ([IO.File]::ReadAllText($adsInstall.CampaignPath)) 'A refused cross-installation restore changed the campaign file.'
@@ -9640,16 +9672,21 @@ function Invoke-MenuTests {
         $unresolvedDelta = @(Get-MenuSnapshotDelta -Before $adsSnapshotBefore -After (New-MenuSnapshot -Root $adsInstall.Install.InstallRoot) | Where-Object { [IO.Path]::GetFileName($_) -ne 'args.log' })
         Assert-Equal 0 $unresolvedDelta.Count "A refused advertisement action changed files: $($unresolvedDelta -join '|')"
 
-        $restoreResult = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot
+        $restoreResult = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $adsStateRoot -Confirmed
         Assert-Equal 'Success' $restoreResult.Status "Restore failed: $($restoreResult.Message)"
         Assert-Equal $adsOriginalCampaign ([IO.File]::ReadAllText($adsInstall.CampaignPath)) 'The campaign restore did not restore the original campaign file.'
         Assert-Equal 'victim fixture' ([IO.File]::ReadAllText($adsVictimPath)) 'The campaign restore wrote a file outside the boundary.'
+        # A machine that never removed the ads has nothing to put back. That is a precondition, not a
+        # fault, so it is a warning with a success exit code: a critical error made the launcher stop and
+        # wait for a keypress on a fresh installation that had done nothing wrong.
         $emptyStateRoot = Join-Path $testRoot 'menu ads empty state'
-        $unpreparedRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $emptyStateRoot
-        Assert-Equal 'CriticalError' $unpreparedRestore.Status 'A campaign restore without a restore point was accepted.'
+        $unpreparedRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $adsInstall.Install.InstallRoot -StateRoot $emptyStateRoot -Confirmed
+        Assert-Equal 'Warning' $unpreparedRestore.Status 'A campaign restore without a restore point was not reported as a precondition.'
+        Assert-Equal 'CAMPAIGN_RESTORE_POINT_MISSING' ([string]$unpreparedRestore.Data.Code) 'A restore without a restore point did not report its code.'
+        Assert-True ($unpreparedRestore.Message -match '(?i)remove ads first') 'A restore without a restore point does not say what to do about it.'
 
         $plainStateRoot = Join-Path $testRoot 'menu ads plain state'
-        $plainResult = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsPlainInstall.Install.InstallRoot -StateRoot $plainStateRoot
+        $plainResult = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $adsPlainInstall.Install.InstallRoot -StateRoot $plainStateRoot -Confirmed
         Assert-Equal 'AlreadyApplied' $plainResult.Status "An advertisement suppression without a campaign file was not reported: $($plainResult.Message)"
         $plainJournals = @(Get-ToolkitJournalRecords -StateRoot $plainStateRoot | Where-Object { [string]$_.Operation -ceq 'RemoveAds' })
         Assert-Equal 1 $plainJournals.Count 'The advertisement action did not keep exactly one operation journal.'
@@ -9662,31 +9699,31 @@ function Invoke-MenuTests {
         $script:MenuFallbackRoots = @($scopeGlobal.Install.InstallRoot, $scopeChinese.Install.InstallRoot)
         $scopeOriginal = $script:MenuCampaignJson
 
-        $scopeGlobalRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        $scopeGlobalRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot -Confirmed
         Assert-Equal 'Success' $scopeGlobalRemove.Status "The Global suppression failed: $($scopeGlobalRemove.Message)"
         $scopeGlobalReport = Get-ToolkitReport -Install $scopeGlobal.Install -Instance ([pscustomobject]@{ Index = 2 }) -StateRoot $scopeStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
         Assert-Equal 'Present' $scopeGlobalReport.Ads.RestorePoint 'The report did not find the restore point of the suppressed installation.'
         $scopeChineseReport = Get-ToolkitReport -Install $scopeChinese.Install -Instance ([pscustomobject]@{ Index = 2 }) -StateRoot $scopeStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
         Assert-Equal 'Missing' $scopeChineseReport.Ads.RestorePoint 'The report reported another edition restore point for the selected installation.'
 
-        $scopeChineseRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeChinese.Install.InstallRoot -StateRoot $scopeStateRoot
+        $scopeChineseRemove = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeChinese.Install.InstallRoot -StateRoot $scopeStateRoot -Confirmed
         Assert-Equal 'Success' $scopeChineseRemove.Status "The Chinese suppression failed: $($scopeChineseRemove.Message)"
         Assert-Equal 2 @(Get-ChildItem -LiteralPath (Join-Path $scopeStateRoot 'campaigns') -Recurse -Filter 'restore-point.json' -File).Count 'The two editions did not keep one restore point each.'
 
-        $scopeChineseRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeChinese.Install.InstallRoot -StateRoot $scopeStateRoot
+        $scopeChineseRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeChinese.Install.InstallRoot -StateRoot $scopeStateRoot -Confirmed
         Assert-Equal 'Success' $scopeChineseRestore.Status "The Chinese restore failed: $($scopeChineseRestore.Message)"
         Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeChinese.CampaignPath)) 'The Chinese restore did not restore the Chinese campaign file.'
         Assert-Equal $false (([IO.File]::ReadAllText($scopeGlobal.CampaignPath) | ConvertFrom-Json).campaigns[0].display) 'The Chinese restore restored another edition campaign file.'
 
-        $scopeGlobalRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        $scopeGlobalRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot -Confirmed
         Assert-Equal 'Success' $scopeGlobalRestore.Status "The Global restore failed: $($scopeGlobalRestore.Message)"
         Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeGlobal.CampaignPath)) 'The Global restore did not restore the Global campaign file.'
         Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeChinese.CampaignPath)) 'The Global restore changed the Chinese campaign file.'
 
-        $scopeRepeat = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        $scopeRepeat = Invoke-ToolkitAction -Action 'RemoveAds' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot -Confirmed
         Assert-Equal 'Success' $scopeRepeat.Status "A repeated suppression after a restore was not recoverable: $($scopeRepeat.Message)"
         Assert-Equal $false (([IO.File]::ReadAllText($scopeGlobal.CampaignPath) | ConvertFrom-Json).campaigns[0].display) 'A repeated suppression did not suppress the campaign file again.'
-        $scopeRepeatRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot
+        $scopeRepeatRestore = Invoke-ToolkitAction -Action 'Restore' -InstallRoot $scopeGlobal.Install.InstallRoot -StateRoot $scopeStateRoot -Confirmed
         Assert-Equal 'Success' $scopeRepeatRestore.Status "A repeated restore was not recoverable: $($scopeRepeatRestore.Message)"
         Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeGlobal.CampaignPath)) 'A repeated restore did not restore the campaign file again.'
         Assert-Equal $scopeOriginal ([IO.File]::ReadAllText($scopeChinese.CampaignPath)) 'A repeated restore changed the other edition campaign file.'
@@ -9860,8 +9897,10 @@ function Invoke-MenuTests {
         # because the root rows are filtered by the Android version and a hardcoded digit would start
         # selecting the wrong action as soon as a row is added or removed. A command line instance index
         # carries no version, so that screen offers both root rows and the action refuses the wrong one.
+        # The action screen no longer carries the read-only Status row, so both root rows are offered first
+        # to a session that carries no version, and the action still refuses the one that cannot apply.
         $rootRow = [string](@(Get-ToolkitActionRows -AndroidVersion 'unknown' | Where-Object { [string]$_.Action -ceq 'Root15' })[0].Number)
-        Assert-Equal '3' $rootRow 'The built-in root row is not the row a session with no Android version prints for it.'
+        Assert-Equal '2' $rootRow 'The built-in root row is not the row a session with no Android version prints for it.'
         $root15Controller = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $android15Install.Install.InstallRoot -InstanceIndex 3 -Reader (New-MenuReader -Answers @($rootRow, 'Q')) -Writer ({ param($Line) }).GetNewClosure() -Prompt $confirmPrompt
         Assert-Equal 0 $root15Controller 'The menu did not exit normally after the Android 15 action.'
         Assert-True ((@($confirmState.Questions) -join '|') -match 'CONFIRM') 'The interactive Android 15 action did not ask for an explicit confirmation.'
@@ -9896,12 +9935,40 @@ function Invoke-MenuTests {
             $targetMenuState.Answers = @(@($targetMenuState.Answers) | Select-Object -Skip 1)
             return $answer
         }.GetNewClosure()
-        # A fresh instance is created from the dashboard, where it has no source instance, so the only
-        # question it asks is the engine. An answer that is neither 12 nor 15 is refused before the
-        # manager is called, so a mistyped version never creates an instance.
+        # A fresh instance is created from the dashboard, where it has no source instance, so the questions
+        # it asks are the confirmation and the engine. An answer that is neither 12 nor 15 is refused before
+        # the manager is called, so a mistyped version never creates an instance.
+        $targetMenuState.Answers = @('CONFIRM', 'Q')
         $newInstanceCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -Reader (New-MenuReader -Answers @('N', 'Q')) -Writer ({ param($Line) $targetMenuState.Lines += [string]$Line }).GetNewClosure() -Prompt $targetMenuPrompt
         Assert-Equal 1 $newInstanceCode "A refused Android version did not fail closed. $(@($targetMenuState.Lines) -join ' ')"
         Assert-True ((@($targetMenuState.Questions) -join '|') -match '12 or 15') 'The fresh instance row did not ask which engine to create.'
+        Assert-True ((@($targetMenuState.Questions) -join ' ') -match '(?i)CONFIRM to create a new instance') 'Creating an instance did not ask for its confirmation word.'
+
+        # The disclosure is suppressed with the toolbar on purpose, because a suppressed run is the one a
+        # script reads and the disclosure is prose, but the question is still asked: a run that changes
+        # the machine must never be the run that prints nothing before it does.
+        $bannerState = @{ Lines = @() }
+        $bannerPromptState = @{ Answers = @('no') }
+        $bannerPrompt = {
+            param($Question)
+            if ($bannerPromptState.Answers.Count -eq 0) { return '' }
+            $answer = $bannerPromptState.Answers[0]
+            $bannerPromptState.Answers = @(@($bannerPromptState.Answers) | Select-Object -Skip 1)
+            return $answer
+        }.GetNewClosure()
+        Start-ToolkitController -StateRoot $controllerStateRoot -InstallRoot $reportInstall.Install.InstallRoot -Reader (New-MenuReader -Answers @('N', 'Q')) -Writer ({ param($Line) $bannerState.Lines += [string]$Line }).GetNewClosure() -Prompt $bannerPrompt | Out-Null
+        $bannerText = @($bannerState.Lines) -join ' '
+        Assert-True ($bannerText -match 'takes real disk space') 'Creating an instance did not disclose that it spends disk before asking.'
+        Assert-True ($bannerText -match 'USER_CONFIRMATION_REQUIRED') 'A declined instance creation did not report that it was declined.'
+
+        # The confirmation is asked before the engine, so a declined answer costs nothing at all: no version
+        # question, no manager call, and a non-zero exit code so a caller is not told the run succeeded.
+        $targetMenuState.Questions = @()
+        $targetMenuState.Answers = @('no')
+        $declinedCreateCode = Start-ToolkitController -StateRoot $controllerStateRoot -SkipToolbar -InstallRoot $reportInstall.Install.InstallRoot -Reader (New-MenuReader -Answers @('N', 'Q')) -Writer ({ param($Line) $targetMenuState.Lines += [string]$Line }).GetNewClosure() -Prompt $targetMenuPrompt
+        Assert-Equal 1 $declinedCreateCode 'A declined instance creation did not fail closed.'
+        Assert-Equal 1 @($targetMenuState.Questions).Count 'A declined instance creation still asked the engine question.'
+        Assert-True ((@($targetMenuState.Lines) -join ' ') -match 'USER_CONFIRMATION_REQUIRED') 'A declined instance creation did not report that it was declined.'
         Assert-True ((@($targetMenuState.Lines) -join "`n") -match 'TARGET_VERSION_INVALID') "A refused Android version created something: $(@($targetMenuState.Lines) -join ' ')"
         Assert-True ((@($targetMenuState.Lines) -join "`n") -notmatch 'Create players|index \d+ is the selected target') 'A refused Android version reached the manager.'
         Assert-Equal 0 $flowState.Calls.Count "A refused fresh instance started a root or concealment flow: $($flowState.Calls -join '|')"

@@ -127,10 +127,10 @@ change instead of being asked to trust a menu. Two number columns, because they 
 
   MuMu Root Hide Toolkit
   ===================================================================
-  Prepare    N New empty instance              new instance
-  Other      A Remove ads                      changes installation
-  Other      B Restore ads                     restores
-  Other      Q Quit
+  Create     N New empty instance              new instance
+  Advertise  A Remove ads                      changes installation
+             B Restore ads                     restores
+             Q Quit
   Vendor root is the MuMu setting. The guest root is reported by Status.
 
 Select an instance (1-2), or N, A, B or Q:
@@ -139,6 +139,11 @@ Select an instance (1-2), or N, A, B or Q:
 `Vendor root` is the **MuMu setting**, not the guest. It reads `unknown` when the manager reports no value
 at all, because `no` would claim a measurement that was never taken. The real guest root, and which
 implementation provides it, is reported by `Status` on the selected instance.
+
+`N`, `A` and `B` each print what they will change and ask for the word `CONFIRM` before doing it. They used
+to run from the keypress that chose them, which meant one stray key could spend real disk on a new instance
+or rewrite the advertisement files that every instance in the installation shares. The test suite now
+asserts that an unconfirmed `RemoveAds`, `Restore` and instance creation each change nothing.
 
 **2 and 3. The target screen, then the action screen.** The target screen decides, it does not perform.
 Every guest change in this toolkit is made on a clone, and the action that makes the change is the only
@@ -149,32 +154,37 @@ walk:
 ```text
   Instance 0  Roo+3d 12 Shad  Android 12.0
   ============================================================
-  Target     1 Clone, keep device info         new instance
-  Other      2 Clone, fresh identifiers        new instance
-  Other      3 Continue on its clone           changes guest
-  Back       4 Back to the instances
-  Every guest change is made on a clone, so the source instance is never written.
+  Inspect    1 Status                          read-only
+  Target     2 Clone, keep device info         new instance
+             3 Clone, fresh identifiers        new instance
+             4 Continue on its clone           changes guest
+  Back       5 Back to the instances
+  Status reads this instance and changes nothing. Every other choice works on a clone.
+  The source instance is never written.
 
-Select a target (1-4):
+Select what to do (1-5):
 
   Instance 0  Roo+3d 12 Shad  Android 12.0
-  ========================================================================
-  Inspect    1 Status                          read-only
-  Change     2 Root with Kitsune               downloads + changes guest
-  Change     3 Conceal apps                    changes guest
-  Other      4 Full setup                      downloads + changes guest
-  Back       5 Back to the instances
+  ===========================================================
+  Change     1 Root with Kitsune               downloads + changes guest
+  Change     2 Conceal apps                    changes guest
+             3 Full setup                      downloads + changes guest
+  Back       4 Back to the instances
   Anything that writes prints what it will change and asks for CONFIRM.
 
   The action will work on a clone of instance 0 (Roo+3d 12 Shad).
 
-Select an action (1-5):
+Select an action (1-4):
 ```
 
-Rows 1 and 2 are declarations, not clones. The action receives the **source** instance and makes exactly
-one clone. An earlier version had this screen clone and the root action clone that clone, which spent a
-second full instance on every root run; the test suite now asserts the action is handed the source and that
-a resumed run asks for no clone at all.
+`Status` sits on the target screen because it reads a guest and changes nothing. It used to sit on the
+action screen, which made answering it mean choosing a clone first: you committed to a copy just to look
+at the instance you had already named, and the report came back for the source rather than the clone.
+
+Rows 2, 3 and 4 on the target screen are declarations, not clones. The action receives the **source**
+instance and makes exactly one clone. An earlier version had this screen clone and the root action clone
+that clone, which spent a second full instance on every root run; the test suite now asserts the action is
+handed the source and that a resumed run asks for no clone at all.
 
 **Keep device info** is the same choice the MuMu GUI offers, and it is verified rather than assumed. The
 manager's own `clone` subcommand has no such flag, so the identifiers are read and compared around the clone
@@ -189,17 +199,17 @@ journal, and the action resumes it rather than copying again. It reads the journ
 is available before anything is started, and it refuses with `CLONE_RECORD_MISSING` when there is no record
 rather than making a new clone behind your back.
 
-**3. The action screen.** The rows are filtered by the instance's Android version, so an entry that cannot
-work is never offered:
+**3. The action screen.** Every row here writes, which is why the read-only `Status` is on the target
+screen instead. The rows are filtered by the instance's Android version, so an entry that cannot work is
+never offered:
 
 ```text
   Instance 0  Roo+3d 12 Shad  Android 12.0
-  ========================================================================
-  Inspect    1 Status                          read-only
-  Change     2 Root with Kitsune               downloads + changes guest
-  Change     3 Conceal apps                    changes guest
-  Other      4 Full setup                      downloads + changes guest
-  Back       5 Back to the instances
+  ===========================================================
+  Change     1 Root with Kitsune               downloads + changes guest
+  Change     2 Conceal apps                    changes guest
+             3 Full setup                      downloads + changes guest
+  Back       4 Back to the instances
   Anything that writes prints what it will change and asks for CONFIRM.
 
   The action will work on a clone of instance 0 (Roo+3d 12 Shad).
@@ -244,7 +254,8 @@ Anything that writes prints a disclosure first, so you read the consequence and 
 real `Full setup` row with the confirmation declined:
 
 ```text
-  This will change instance 0 (Roo+3d 12 Shad).
+  This will not change instance 0 (Roo+3d 12 Shad) itself.
+  It works on a new clone of that instance, so the source is left as it is.
   * The root that applies to this Android version is applied to a clone of this instance.
   * The apps you name next join the Root template on that clone.
   * The campaign advertisement files for this installation are suppressed.
@@ -254,11 +265,28 @@ real `Full setup` row with the confirmation declined:
   Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.
 ```
 
+The headline used to read `This will change instance 0 (Roo+3d 12 Shad).` while the bullets underneath it
+spoke of *the clone*, so the same sentence both promised and denied that the instance you had just selected
+was the thing being written to. It now names the source and the clone separately. The advertisement rows
+get a different headline again, because they change the installation and touch no instance at all.
+
 Note what did **not** happen: no clone, no download, no cache write. The authorization is checked before
 the copy is made, so declining costs nothing.
 
-The two advertisement rows, also captured. This installation has no campaign file present, so suppression
-is already satisfied and restore has nothing to restore:
+The two advertisement rows, captured with the confirmation declined. `Remove ads` rewrites files that
+every instance in the installation shares, so it discloses and asks for `CONFIRM` like the guest changes do:
+
+```text
+  This will change the advertisement files of this installation. No instance is touched.
+  * The campaign advertisement files for this installation are suppressed.
+
+[CriticalError] USER_CONFIRMATION_REQUIRED: RemoveAds rewrites advertisement files shared by every instance, so it must be confirmed first. No advertisement file was changed.
+  Code = USER_CONFIRMATION_REQUIRED
+  Log: <state dir>\logs\mumu-root-hide-toolkit.log
+  Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.
+```
+
+Confirmed on a machine with no campaign file present, suppression has nothing to do and says so:
 
 ```text
 [AlreadyApplied] No MuMu campaign file is present.
@@ -266,12 +294,18 @@ is already satisfied and restore has nothing to restore:
   Skipped = 0
 ```
 
+`Restore` on a machine that never removed the ads is a **precondition, not a fault**, and reports a
+`Warning` with a success exit code rather than a `CriticalError` that made the launcher stop and wait for a
+keypress on a fresh installation:
+
 ```text
-[CriticalError] The toolkit holds no advertisement restore point for the selected installation, so no advertisement file is changed.
+[Warning] There is no advertisement restore point for this installation yet, so nothing was restored. Run Remove ads first if you want one.
   Code = CAMPAIGN_RESTORE_POINT_MISSING
-  Log: <state dir>\logs\mumu-root-hide-toolkit.log
-  Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.
 ```
+
+A restore pointed at an installation that is *not* the one the restore point belongs to is a different
+thing, and stays a `CriticalError`: returning a success code for a restore that touched nothing would be
+worse than a loud refusal.
 
 Every mutating action asks for its confirmation in the menu, and the menu never closes itself when an
 action fails. `Q` quits from any screen.

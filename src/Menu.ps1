@@ -91,9 +91,12 @@ function Format-ToolkitScreen {
 function Format-ToolkitRowText {
     param([object]$Row)
 
+    # A row that continues the group above it carries no group of its own, and it prints a blank group
+    # column. It used to print the word "Other" there, which read as a fourth category the operator could
+    # select even though nothing accepted it.
     $group = [string]$Row.Group
     if ([string]::IsNullOrWhiteSpace($group)) {
-        $group = 'Other'
+        $group = ''
     }
     $label = ([string]$row.Number) + ' ' + ([string]$row.Name)
     $text = '  ' + $group.PadRight(9) + '  ' + $label.PadRight(32)
@@ -139,23 +142,27 @@ function Format-ToolkitInstanceTable {
 # putting it under a header that names another instance would be a false description of the choice.
 function Get-ToolkitDashboardRows {
     $rows = @()
-    $rows += [pscustomobject]@{ Number = 'N'; Name = 'New empty instance'; Tag = [string]$script:ToolkitMenuTags['NewInstance']; Group = 'Prepare' }
-    $rows += [pscustomobject]@{ Number = 'A'; Name = 'Remove ads'; Tag = [string]$script:ToolkitMenuTags['RemoveAds']; Group = 'Other' }
+    $rows += [pscustomobject]@{ Number = 'N'; Name = 'New empty instance'; Tag = [string]$script:ToolkitMenuTags['NewInstance']; Group = 'Create' }
+    $rows += [pscustomobject]@{ Number = 'A'; Name = 'Remove ads'; Tag = [string]$script:ToolkitMenuTags['RemoveAds']; Group = 'Advertise' }
     $rows += [pscustomobject]@{ Number = 'B'; Name = 'Restore ads'; Tag = [string]$script:ToolkitMenuTags['Restore']; Group = '' }
     $rows += [pscustomobject]@{ Number = 'Q'; Name = 'Quit'; Tag = ''; Group = '' }
     return $rows
 }
 
-# The target screen for one instance. Every guest change in this toolkit is clone-then-mutate, so the
-# only choices are to copy the instance, to copy it with fresh identifiers, or to continue on the copy a
-# previous run already made. There is no in-place row, because Root12, Root15 and Conceal all refuse to
-# write to a source instance.
+# The target screen for one instance. The read-only Status sits here rather than on the action screen,
+# because a status check needs no clone: reaching it through the action screen made an operator pick a
+# clone to look at a guest, which both implied a change they had not asked for and reported on the
+# source rather than the clone. Every guest change in this toolkit is clone-then-mutate, so the only
+# change choices are to copy the instance, to copy it with fresh identifiers, or to continue on the copy
+# a previous run already made. There is no in-place row, because Root12, Root15 and Conceal all refuse
+# to write to a source instance.
 function Get-ToolkitTargetRows {
     $rows = @()
-    $rows += [pscustomobject]@{ Number = 1; Name = 'Clone, keep device info'; Target = 'CloneKeepInfo'; Tag = [string]$script:ToolkitMenuTags['CloneKeepInfo']; Group = 'Target' }
-    $rows += [pscustomobject]@{ Number = 2; Name = 'Clone, fresh identifiers'; Target = 'CloneFreshInfo'; Tag = [string]$script:ToolkitMenuTags['CloneFreshInfo']; Group = '' }
-    $rows += [pscustomobject]@{ Number = 3; Name = 'Continue on its clone'; Target = 'ContinueClone'; Tag = [string]$script:ToolkitMenuTags['ContinueClone']; Group = '' }
-    $rows += [pscustomobject]@{ Number = 4; Name = 'Back to the instances'; Target = 'Back'; Tag = ''; Group = 'Back' }
+    $rows += [pscustomobject]@{ Number = 1; Name = 'Status'; Action = 'Verify'; Tag = [string]$script:ToolkitMenuTags['Verify']; Group = 'Inspect' }
+    $rows += [pscustomobject]@{ Number = 2; Name = 'Clone, keep device info'; Target = 'CloneKeepInfo'; Tag = [string]$script:ToolkitMenuTags['CloneKeepInfo']; Group = 'Target' }
+    $rows += [pscustomobject]@{ Number = 3; Name = 'Clone, fresh identifiers'; Target = 'CloneFreshInfo'; Tag = [string]$script:ToolkitMenuTags['CloneFreshInfo']; Group = '' }
+    $rows += [pscustomobject]@{ Number = 4; Name = 'Continue on its clone'; Target = 'ContinueClone'; Tag = [string]$script:ToolkitMenuTags['ContinueClone']; Group = '' }
+    $rows += [pscustomobject]@{ Number = 5; Name = 'Back to the instances'; Target = 'Back'; Tag = ''; Group = 'Back' }
     return $rows
 }
 
@@ -167,11 +174,10 @@ function Get-ToolkitActionRows {
 
     $rows = @()
     $next = 1
-    $rows += [pscustomobject]@{ Number = $next; Name = 'Status'; Action = 'Verify'; Tag = [string]$script:ToolkitMenuTags['Verify']; Group = 'Inspect' }
-    $next++
     # The root rows are filtered by the instance Android version, because a 12 instance cannot take the
     # built-in 15 root and a 15 instance cannot take the Kitsune release. Each row carries the action it
-    # dispatches, so the number the operator reads cannot drift from the work that is done.
+    # dispatches, so the number the operator reads cannot drift from the work that is done. Every row here
+    # writes, which is why the read-only Status is not one of them.
     if ($AndroidVersion -like '12*') {
         $rows += [pscustomobject]@{ Number = $next; Name = 'Root with Kitsune'; Action = 'Root12'; Tag = [string]$script:ToolkitMenuTags['Root12']; Group = 'Change' }
         $next++
@@ -212,7 +218,20 @@ function Format-ToolkitDisclosure {
     $index = [string](Get-ToolkitRecordValue -Record $Instance -PropertyNames @('Index'))
     $name = [string](Get-ToolkitRecordValue -Record $Instance -PropertyNames @('Name'))
     $lines = @()
-    $lines += '  This will change instance ' + $index + ' (' + $name + ').'
+    # The headline names the thing that actually changes. It used to name the source instance for every
+    # action, which contradicted the bullets underneath it: they spoke of "the clone" while the headline
+    # said the source would change, and the advertisement actions change the installation and touch no
+    # instance at all.
+    if ($Action -ceq 'RemoveAds' -or $Action -ceq 'Restore') {
+        $lines += '  This will change the advertisement files of this installation. No instance is touched.'
+    }
+    elseif ($Action -ceq 'NewInstance') {
+        $lines += '  This will create a new MuMu instance, which takes real disk space.'
+    }
+    else {
+        $lines += '  This will not change instance ' + $index + ' (' + $name + ') itself.'
+        $lines += '  It works on a new clone of that instance, so the source is left as it is.'
+    }
     if ($Action -ceq 'Conceal') {
         # The app list is collected by the action after this disclosure, so naming a count here would print
         # a number nobody has chosen yet. The disclosure says where the list comes from instead.
@@ -240,7 +259,7 @@ function Format-ToolkitDisclosure {
         $lines += '  * The campaign advertisement files for this installation are suppressed.'
     }
     elseif ($Action -ceq 'Restore') {
-        $lines += '  * The campaign files are put back from the toolkit restore point.'
+        $lines += '  * The campaign files are put back, but only if a restore point exists for this installation.'
     }
     if (-not [string]::IsNullOrWhiteSpace($RestorePoint)) {
         $lines += '  * Restore point: ' + $RestorePoint
@@ -526,9 +545,12 @@ function Get-ToolkitScreenLines {
     $title = 'Instance ' + $index + '  ' + $name + '  Android ' + $version
 
     if ($Screen -ceq 'Target') {
-        $lines = @(Format-ToolkitScreen -Title $title -Rows @(Get-ToolkitTargetRows) -Notes @('Every guest change is made on a clone, so the source instance is never written.'))
+        $lines = @(Format-ToolkitScreen -Title $title -Rows @(Get-ToolkitTargetRows) -Notes @(
+                'Status reads this instance and changes nothing. Every other choice works on a clone.'
+                'The source instance is never written.'
+            ))
         $lines += ''
-        $lines += 'Select a target (1-4):'
+        $lines += 'Select what to do (1-5):'
         return $lines
     }
 
@@ -540,7 +562,8 @@ function Get-ToolkitScreenLines {
         $version = 'unknown'
     }
 
-    $lines = @(Format-ToolkitScreen -Title $title -Rows @(Get-ToolkitActionRows -AndroidVersion $version) -Notes @('Anything that writes prints what it will change and asks for CONFIRM.'))
+    $actionRows = @(Get-ToolkitActionRows -AndroidVersion $version)
+    $lines = @(Format-ToolkitScreen -Title $title -Rows $actionRows -Notes @('Anything that writes prints what it will change and asks for CONFIRM.'))
     if ($null -ne $Target) {
         $lines += ''
         # Before an action runs there is no clone yet, so the line names the source and says the action will
@@ -554,7 +577,9 @@ function Get-ToolkitScreenLines {
         }
     }
     $lines += ''
-    $lines += 'Select an action (1-5):'
+    # The range is counted from the rows this screen actually printed, because the row count depends on
+    # the Android version and a hardcoded range goes stale the moment a row moves.
+    $lines += ('Select an action (1-' + [string]$actionRows.Count + '):')
     return $lines
 }
 
@@ -621,6 +646,12 @@ function Resolve-ToolkitScreenChoice {
         }
         if ([string]$row.Name -ceq 'Back to the instances') {
             return [pscustomobject]@{ Kind = 'Back' }
+        }
+        # A read-only row carries an action instead of a target, because it needs no clone. It is
+        # dispatched against the instance this screen is showing, so Status is one keystroke from the
+        # instance list instead of three.
+        if (-not [string]::IsNullOrWhiteSpace([string]$row.Action)) {
+            return [pscustomobject]@{ Kind = 'Action'; Action = [string]$row.Action }
         }
         if ($null -ne $Snapshot -and $null -ne $Snapshot.PSObject) {
             return [pscustomobject]@{ Kind = 'Target'; Target = [string]$row.Target }

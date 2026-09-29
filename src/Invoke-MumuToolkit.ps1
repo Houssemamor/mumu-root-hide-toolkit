@@ -429,7 +429,22 @@ function Invoke-ToolkitAdvertisements {
         }
     }
     elseif ($Restore) {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The toolkit holds no advertisement restore point for the selected installation, so no advertisement file is changed.' -Data (@{ Code = 'CAMPAIGN_RESTORE_POINT_MISSING' })
+        # Two different situations reach this branch and they must not share an answer. A machine that has
+        # never removed the ads has nothing to put back, which is a precondition and not a fault. A machine
+        # that holds a restore point for a *different* installation was pointed at the wrong one, which is
+        # a real refusal: reporting it as a warning would return a success exit code for a restore that
+        # touched nothing.
+        $scope = Get-ToolkitCampaignScopeKey -Install $Install
+        $campaignsRoot = [IO.Path]::Combine($StateRoot, 'campaigns')
+        $otherScopes = @()
+        if ([IO.Directory]::Exists($campaignsRoot)) {
+            $otherScopes = @(Get-ChildItem -LiteralPath $campaignsRoot -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -cne $scope -and @(Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue).Count -gt 0 })
+        }
+        if ($otherScopes.Count -gt 0) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message 'The toolkit holds an advertisement restore point for a different installation, not for this one, so nothing was restored and no advertisement file was changed. Run Remove ads for this installation first.' -Data (@{ Code = 'CAMPAIGN_RESTORE_POINT_MISSING' })
+        }
+        return Get-ToolkitResult -Status 'Warning' -Message 'There is no advertisement restore point for this installation yet, so nothing was restored. Run Remove ads first if you want one.' -Data (@{ Code = 'CAMPAIGN_RESTORE_POINT_MISSING' })
     }
 
     $backupRoot = New-ToolkitCampaignRoot -StateRoot $StateRoot -Install $Install
@@ -688,6 +703,12 @@ function Invoke-ToolkitAction {
     }
 
     if ($Action -ceq 'RemoveAds' -or $Action -ceq 'Restore') {
+        # These rewrite files in the installation that every instance shares, so they are gated on the
+        # same word as the guest changes. The word was already being collected and then dropped on the
+        # floor here, which is why a single keypress was enough to rewrite the advertisement files.
+        if (-not $Confirmed) {
+            return Get-ToolkitResult -Status 'CriticalError' -Message ('USER_CONFIRMATION_REQUIRED: ' + $Action + ' rewrites advertisement files shared by every instance, so it must be confirmed first. No advertisement file was changed.') -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
+        }
         return (Invoke-ToolkitAdvertisements -Install $install.Data -StateRoot $statePath -Restore:($Action -ceq 'Restore'))
     }
 
@@ -1373,7 +1394,10 @@ function Invoke-MenuLoop {
         }
         $choice = Resolve-ToolkitScreenChoice -Screen $screen -Answer $answer -Snapshot $snapshot -Instance $selected
         if ($null -eq $choice) {
-            & $write ('Select one of the choices this screen printed. Press Enter to see it again.')
+            # The screen is reprinted on the next turn of the loop, so this only has to name the mistake.
+            # It used to add "Press Enter to see it again", which described a keypress that was never
+            # needed: the screen comes back by itself, and following the hint just reprinted it again.
+            & $write '  Not one of the choices this screen printed. Pick a listed number or letter.'
             continue
         }
         if ([string]$choice.Kind -ceq 'Quit') {
@@ -1433,6 +1457,26 @@ function Invoke-MenuLoop {
             continue
         }
         if ([string]$choice.Kind -ceq 'NewInstance') {
+            # Creating an instance spends real disk on the machine, so it is confirmed like every other
+            # change. It used to run from the single keypress that chose the row, which meant the menu
+            # summary promised an explicit confirmation that this row never asked for.
+            if ($ShowBanner) {
+                foreach ($line in @(Format-ToolkitDisclosure -Action 'NewInstance' -Instance $null)) {
+                    & $write $line
+                }
+            }
+            if (([string](& $ask 'Type CONFIRM to create a new instance') -cne 'CONFIRM')) {
+                $refused = Get-ToolkitResult -Status 'CriticalError' -Message 'USER_CONFIRMATION_REQUIRED: No new instance was created.' -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
+                foreach ($line in @(Format-ToolkitResult -Result $refused -Interactive)) {
+                    & $write $line
+                }
+                # The refusal has to reach the exit code, or a session that created nothing still reports
+                # success to a caller and to the launcher.
+                $exitCode = Get-ToolkitExitCode $refused
+                $screen = 'Dashboard'
+                $snapshot = $null
+                continue
+            }
             # The snapshot is read defensively because this screen is also reachable from a seeded session
             # where the caller supplied the install root and the cache may be empty.
             $newInstall = $null
@@ -1486,6 +1530,13 @@ function Invoke-MenuLoop {
             continue
         }
         if ([string]$choice.Kind -ceq 'Advertisements') {
+            # These rewrite files in the shared installation, so they are confirmed like the guest changes.
+            # They used to run from the keypress that chose the row, with no disclosure and no word asked.
+            if ($ShowBanner) {
+                foreach ($line in @(Format-ToolkitDisclosure -Action ([string]$choice.Advertisements) -Instance $null)) {
+                    & $write $line
+                }
+            }
             $arguments = @{}
             foreach ($key in @($ActionArguments.Keys)) {
                 $arguments[[string]$key] = $ActionArguments[$key]
@@ -1550,6 +1601,12 @@ function Invoke-MenuLoop {
             if ([bool]$target.FreshIdentifiers) {
                 $arguments['FreshIdentifiers'] = $true
             }
+        }
+        elseif ($null -ne $selected) {
+            # A read-only action dispatched before a target was chosen, which is how Status is reached, is
+            # given the instance this screen is showing. Without this it was handed no instance at all.
+            $arguments['InstanceIndex'] = [int]$selected.Index
+            $arguments['AndroidVersion'] = [string]$selected.AndroidVersion
         }
         # The ask is always handed to the action. Guarding this on the injected value dropped a supplied ask
         # and silently fell back to Read-Host, so a scripted run could not answer the package, consent or
@@ -1733,8 +1790,14 @@ function Start-ToolkitController {
                 }
             }
             $confirmed = $Confirmed
-            if (-not $confirmed -and $Choice -in @('Root12', 'Root15', 'FullSetup')) {
-                $confirmed = ([string](& $usePrompt ('Type CONFIRM to run ' + $Choice + ' on the selected instance')) -ceq 'CONFIRM')
+            if (-not $confirmed -and $Choice -in @('Root12', 'Root15', 'FullSetup', 'RemoveAds', 'Restore')) {
+                # The question names the effect in words, not the action name: these rows work on a shared
+                # installation with no instance selected, so "run RemoveAds on the selected instance" asked
+                # about an instance that was never chosen.
+                $question = if ($Choice -ceq 'RemoveAds') { 'Type CONFIRM to remove the ads for this installation' }
+                elseif ($Choice -ceq 'Restore') { 'Type CONFIRM to restore the ads for this installation' }
+                else { 'Type CONFIRM to run ' + $Choice + ' on the selected instance' }
+                $confirmed = ([string](& $usePrompt $question) -ceq 'CONFIRM')
             }
             $targetMode = $Mode
             $targetStartIndex = $StartIndex
