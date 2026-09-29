@@ -4466,6 +4466,10 @@ function Invoke-Root12Case {
         [string]$Confirmation = '',
         [scriptblock]$Prompt = $null,
         [object]$ResumeClone = $null,
+        # The run authorization defaults to true for a direct caller, which is how this flow was always
+        # invoked, and a case that is about the refusal passes -Unauthorized so the two refusals stay
+        # distinguishable without every authorized case having to opt in.
+        [switch]$Unauthorized,
         [switch]$RequireCachedAsset
     )
 
@@ -4477,8 +4481,8 @@ function Invoke-Root12Case {
         Interactive = $Interactive
         Confirmation = $Confirmation
         CacheRoot = $CacheRoot
-        Runner = (New-Root12ManagerRunner -State $State)
-    }
+        RunConfirmed = (-not $Unauthorized)
+        Runner = (New-Root12ManagerRunner -State $State)    }
     if ($null -ne $Prompt) {
         $parameters['Prompt'] = $Prompt
     }
@@ -4784,16 +4788,31 @@ function Invoke-Root12Tests {
             -JournalRoot $journalRoot -CacheRoot $emptyCacheRoot -Interactive $true -RequireCachedAsset
         Assert-Root12Failure -Result $coldCacheInteractiveCase.Result -Journal $coldCacheInteractiveCase.Journal -Code 'ASSET_VERIFICATION_FAILED' -Message 'A confirmed request skipped the pinned asset verification.'
 
+        # A run that is not authorized makes no clone at all. The authorization is collected before the
+        # copy, so declining costs nothing: the earlier order cloned an instance and installed the artifact
+        # before asking, which made a misclick cost a full instance's disk.
         $decliningState = New-Root12ManagerState -Install $install
         $decliningCase = Invoke-Root12Case -State $decliningState -Instance $android12 -Manifest $manifest `
+            -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { 'no' } -Unauthorized
+        Assert-Root12Failure -Result $decliningCase.Result -Journal $decliningCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A declined run was accepted.'
+        Assert-Equal 0 @($decliningState.Calls | Where-Object { (@($_) -join ' ') -like '*clone -v*' }).Count 'A declined run cloned the instance before it was authorized.'
+        Assert-Equal 0 (Get-Root12LaunchCount -Calls $decliningState.Calls) 'A declined run launched the installer before it was authorized.'
+        Assert-Equal 0 @($decliningState.Calls | Where-Object { (@($_) -join ' ') -like '*getprop sys.boot_completed*' }).Count 'A declined run cold-booted anything.'
+
+        # An authorized run that is then declined at the Kitsune choice still stops before the install, so
+        # the two refusals are distinguishable: this one names the Kitsune instruction.
+        $kitsuneDecliningState = New-Root12ManagerState -Install $install
+        $kitsuneDecliningCase = Invoke-Root12Case -State $kitsuneDecliningState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { 'no' }
-        Assert-Root12Failure -Result $decliningCase.Result -Journal $decliningCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A declined Kitsune confirmation was accepted.'
-        Assert-Equal 1 (Get-Root12LaunchCount -Calls $decliningState.Calls) 'A declined confirmation performed a step beyond the pre-install launch.'
-        Assert-Equal 1 @($decliningState.Calls | Where-Object { (@($_) -join ' ') -like '*getprop sys.boot_completed*' }).Count 'A declined confirmation did not perform exactly the pre-install boot wait.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*pidof magiskd*') 'A declined confirmation verified the root daemon.'
-        Assert-Equal -1 (Get-Root12CallIndex -Calls $decliningState.Calls -Pattern '*root_permission*-val*false*') 'A declined confirmation disabled the vendor root.'
-        Assert-Equal $decliningState.CloneIndex $decliningCase.Result.Data.CloneIndex 'A declined confirmation did not report the recoverable clone.'
-        $decliningJournal = Get-OperationJournal -Path $decliningCase.Journal.JournalPath
+        Assert-Root12Failure -Result $kitsuneDecliningCase.Result -Journal $kitsuneDecliningCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A declined Kitsune confirmation was accepted.'
+        Assert-True ($kitsuneDecliningCase.Result.Message -match 'Direct Install into system partition') 'A declined Kitsune confirmation did not name the instruction it refused.'
+        Assert-Equal 1 @($kitsuneDecliningState.Calls | Where-Object { (@($_) -join ' ') -like '*clone -v*' }).Count 'An authorized run did not make the single clone it is allowed.'
+        Assert-Equal 1 (Get-Root12LaunchCount -Calls $kitsuneDecliningState.Calls) 'A declined Kitsune confirmation performed a step beyond the pre-install launch.'
+        Assert-Equal -1 (Get-Root12CallIndex -Calls $kitsuneDecliningState.Calls -Pattern '*root_permission*-val*false*') 'A declined confirmation disabled the vendor root.'
+        # The authorized run is the one that made a clone, so the recovery record and the journaled
+        # instruction belong to it. An unauthorized run leaves no clone to recover, which is the point.
+        Assert-Equal $kitsuneDecliningState.CloneIndex $kitsuneDecliningCase.Result.Data.CloneIndex 'A declined Kitsune confirmation did not report the recoverable clone.'
+        $decliningJournal = Get-OperationJournal -Path $kitsuneDecliningCase.Journal.JournalPath
         $decliningText = ([string](@($decliningJournal.Checkpoints) | ForEach-Object { $_.Message }) -join ' ')
         Assert-True ($decliningText -match 'Direct Install into system partition') 'A declined confirmation did not journal the exact Kitsune instruction.'
         Assert-True ($decliningText -match 'Select and Patch a File') 'A declined confirmation did not journal the rejected Kitsune alternatives.'
@@ -4811,6 +4830,8 @@ function Invoke-Root12Tests {
         Assert-Root12Failure -Result $throwingCase.Result -Journal $throwingCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'An unavailable console prompt was accepted.'
         Assert-Equal -1 (Get-Root12CallIndex -Calls $throwingState.Calls -Pattern '*pidof magiskd*') 'An unavailable console prompt verified the root daemon.'
 
+        # The run is authorized so the case still reaches the Kitsune option check it is about. Without the
+        # authorization it would stop earlier, for the more fundamental reason.
         $ordinaryState = New-Root12ManagerState -Install $install
         $ordinaryCase = Invoke-Root12Case -State $ordinaryState -Instance $android12 -Manifest $manifest `
             -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install'
@@ -8715,6 +8736,14 @@ function Invoke-MenuTests {
         Assert-True ($concealText -match 'instance 0 \(Roo\+3d 12\)') 'The disclosure does not name the instance it will change.'
         Assert-True ($concealText -match '2 app\(s\) join the Root template: com\.a, com\.b') 'The disclosure does not name the apps and the count.'
         Assert-True ($concealText -match 'probing for su') 'The disclosure does not state what the change means for an app that looks for su.'
+        # The disclosure is printed before the app list is collected, so it must not claim a count that
+        # nobody has chosen yet. A "0 app(s)" line is a false statement about a run that may add any number.
+        $noPackagesDisclosure = @(Format-ToolkitDisclosure -Action 'Conceal' -Instance $screenInstance)
+        Assert-True ((@($noPackagesDisclosure) -join "`n") -match 'The apps you name next join the Root template') 'A disclosure with no app list did not say where the list comes from.'
+        Assert-True ((@($noPackagesDisclosure) -join "`n") -notmatch '0 app\(s\)') 'A disclosure with no app list claimed that zero apps would be added.'
+        foreach ($disclosureLine in $noPackagesDisclosure) {
+            Assert-True (-not ([string]$disclosureLine -match ':\s*$')) "A disclosure line ends in a colon with nothing after it: $disclosureLine"
+        }
         $setupDisclosure = @(Format-ToolkitDisclosure -Action 'FullSetup' -Instance $screenInstance)
         $setupText = @($setupDisclosure) -join "`n"
         Assert-True ($setupText -match 'root that applies to this Android version') 'The full setup disclosure does not say which root it applies.'
@@ -8872,6 +8901,18 @@ function Invoke-MenuTests {
         $recorded = Invoke-ToolkitMenuTarget -Choice 'ContinueClone' -Install $screenSnapshot.Install -StateRoot $menuStateRoot -Instance $screenInstance
         Assert-Equal $false $recorded.Proceed 'Continuing with no recorded clone moved on to the action screen.'
         Assert-Equal 'CLONE_RECORD_MISSING' ([string]$recorded.Result.Data.Code) 'Continuing with no recorded clone did not name the missing record.'
+
+        # Before an action runs there is no clone yet, so the action screen names the source and says the
+        # action will work on a copy of it. Reading the clone index before it exists printed an empty index
+        # and an empty name, which is a claim about nothing.
+        $beforeAction = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $screenSnapshot -Instance $screenInstance -Target ([pscustomobject]@{ Mode = 'Clone'; SourceIndex = 0; SourceName = 'Roo+3d 12'; CloneIndex = -1; CloneName = ''; FreshIdentifiers = $false }))
+        $beforeText = @($beforeAction) -join "`n"
+        Assert-True ($beforeText -match 'clone of instance 0 \(Roo\+3d 12\)') 'The action screen did not say it will work on a clone of the source.'
+        Assert-True ($beforeText -notmatch 'Working on instance\s+\(') 'The action screen named a working instance that does not exist yet.'
+
+        # A resumed run already knows its clone, so it names the clone rather than the source.
+        $resumedScreen = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $screenSnapshot -Instance $screenInstance -Target ([pscustomobject]@{ Mode = 'Continue'; SourceIndex = 0; SourceName = 'Roo+3d 12'; CloneIndex = 7; CloneName = 'recorded clone'; FreshIdentifiers = $false }))
+        Assert-True ((@($resumedScreen) -join "`n") -match 'verified clone at index 7 \(recorded clone\)') 'A resumed action screen did not name the clone it will work on.'
 
         # A tag that writes is red and a tag that reaches the network is yellow, so the consequence is
         # visible in the row itself and not only in the disclosure behind it.

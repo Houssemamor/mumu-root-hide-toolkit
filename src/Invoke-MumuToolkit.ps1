@@ -748,7 +748,7 @@ function Invoke-ToolkitAction {
             return Get-ToolkitResult -Status 'CriticalError' -Message ('The dependency manifest could not be loaded, so no instance was changed. ' + [string]$_.Exception.Message) -Data (@{ Code = 'MANIFEST_INVALID' })
         }
         $journal = New-ToolkitActionJournal -StateRoot $statePath -Operation 'Root12' -Instance $selected
-        $result = Install-Android12Root -Instance $selected -Manifest $manifest -Journal $journal -Interactive:($null -ne $Prompt) -Prompt $Prompt -ResumeClone $ResumeClone
+        $result = Install-Android12Root -Instance $selected -Manifest $manifest -Journal $journal -Interactive:($null -ne $Prompt) -Prompt $Prompt -ResumeClone $ResumeClone -RunConfirmed:([bool]$Confirmed)
         return (Close-ToolkitActionJournal -Journal $journal -Result $result)
     }
 
@@ -1102,7 +1102,10 @@ function Invoke-MenuAction {
     else {
         try {
             if ($null -ne $Runner) {
-                $result = & $Runner $Action
+                # The action seam is told which prompt to use and which instance the screens settled on, so
+                # a caller that supplied them reaches the action's questions and its target without the
+                # action resolving either of them again.
+                $result = & $Runner $Action $Prompt $InstanceIndex $AndroidVersion $ResumeClone ([bool]$FreshIdentifiers)
             }
             else {
                 $result = Invoke-ToolkitActionWithElevation -Action $Action -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $SourceIndex -StateRoot $StateRoot -Packages $Packages -Mode $Mode -StartIndex $StartIndex -AndroidVersion $AndroidVersion -ResumeClone $ResumeClone -FreshIdentifiers:$FreshIdentifiers -Confirmed:$Confirmed -FetchDependencies:$FetchDependencies -ElevatedChild:$ElevatedChild -Prompt $Prompt -ElevationRunner $ElevationRunner
@@ -1514,7 +1517,15 @@ function Invoke-MenuLoop {
         if ($ShowBanner -and $action -in @('Root12', 'Root15', 'Conceal', 'FullSetup', 'RemoveAds', 'Restore')) {
             $disclosureInstance = $selected
             if ($null -ne $target) {
-                $disclosureInstance = [pscustomobject]@{ Index = [int]$target.CloneIndex; Name = [string]$target.CloneName }
+                # Before an action runs the clone does not exist, so the disclosure names the source the
+                # action is about to copy rather than a clone index that is still -1.
+                $disclosureIndex = [int](Get-ToolkitRecordValue -Record $target -PropertyNames @('CloneIndex'))
+                if ($disclosureIndex -ge 0) {
+                    $disclosureInstance = [pscustomobject]@{ Index = $disclosureIndex; Name = [string]$target.CloneName }
+                }
+                else {
+                    $disclosureInstance = [pscustomobject]@{ Index = [int]$target.SourceIndex; Name = [string]$target.SourceName }
+                }
             }
             foreach ($line in @(Format-ToolkitDisclosure -Action $action -Instance $disclosureInstance -Packages @())) {
                 & $write $line
@@ -1540,9 +1551,10 @@ function Invoke-MenuLoop {
                 $arguments['FreshIdentifiers'] = $true
             }
         }
-        if ($null -eq $Ask) {
-            $arguments['Prompt'] = $ask
-        }
+        # The ask is always handed to the action. Guarding this on the injected value dropped a supplied ask
+        # and silently fell back to Read-Host, so a scripted run could not answer the package, consent or
+        # confirmation questions the action asks.
+        $arguments['Prompt'] = $ask
         $result = $null
         try {
             $result = Invoke-MenuAction @arguments
@@ -1677,7 +1689,30 @@ function Start-ToolkitController {
         # captured here where the runner is assembled.
         $consentWord = $script:ToolkitDependencyConsentWord
         $runner = {
-            param($Choice)
+            param($Choice, $SuppliedPrompt, $SuppliedInstanceIndex, $SuppliedAndroidVersion, $SuppliedResumeClone, $SuppliedFresh)
+
+            # A prompt handed in by the caller wins over the one this closure was built with, so the same
+            # action seam can be driven by a different console.
+            $usePrompt = $SuppliedPrompt
+            if ($null -eq $usePrompt) {
+                $usePrompt = $ask
+            }
+
+            # The instance the target screen settled on wins over the command line one. Without this the
+            # action resolved its own instance and asked again, so the screen's choice was decorative.
+            $useInstanceIndex = $InstanceIndex
+            if ($null -ne $SuppliedInstanceIndex) {
+                $useInstanceIndex = [int]$SuppliedInstanceIndex
+            }
+            $useAndroidVersion = $AndroidVersion
+            if (-not [string]::IsNullOrWhiteSpace([string]$SuppliedAndroidVersion)) {
+                $useAndroidVersion = [string]$SuppliedAndroidVersion
+            }
+            $useResumeClone = $ResumeClone
+            if ($null -ne $SuppliedResumeClone) {
+                $useResumeClone = $SuppliedResumeClone
+            }
+            $useFresh = [bool]$FreshIdentifiers -or [bool]$SuppliedFresh
 
             $selectedPackages = @($Packages)
             # An explicit -FetchDependencies is the consent, and a cache that already holds both verified
@@ -1687,19 +1722,19 @@ function Start-ToolkitController {
             # row asks rather than reaching the app list from a different path.
             if ($Choice -ceq 'Conceal' -or $Choice -ceq 'FullSetup') {
                 if ($selectedPackages.Count -eq 0) {
-                    $answer = [string](& $ask 'Comma-separated application package names for the Root template')
+                    $answer = [string](& $usePrompt 'Comma-separated application package names for the Root template')
                     $selectedPackages = @($answer -split ',' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
                 }
                 if (-not $fetchDependencies -and -not (Test-ToolkitConcealmentCacheHot)) {
                     # The consent is asked for exactly as the command line asks for it, so a cold cache is
                     # reachable from the menu and a declining answer still downloads nothing.
-                    $consent = [string](& $ask ('Type ' + $consentWord + ' to download the pinned concealment dependencies into the per-user cache now'))
+                    $consent = [string](& $usePrompt ('Type ' + $consentWord + ' to download the pinned concealment dependencies into the per-user cache now'))
                     $fetchDependencies = $consent.Trim() -ceq $consentWord
                 }
             }
             $confirmed = $Confirmed
             if (-not $confirmed -and $Choice -in @('Root12', 'Root15', 'FullSetup')) {
-                $confirmed = ([string](& $ask ('Type CONFIRM to run ' + $Choice + ' on the selected instance')) -ceq 'CONFIRM')
+                $confirmed = ([string](& $usePrompt ('Type CONFIRM to run ' + $Choice + ' on the selected instance')) -ceq 'CONFIRM')
             }
             $targetMode = $Mode
             $targetStartIndex = $StartIndex
@@ -1708,7 +1743,7 @@ function Start-ToolkitController {
                 $targetMode = $Mode
                 $targetStartIndex = $StartIndex
             }
-            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $InstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -AndroidVersion $AndroidVersion -ResumeClone $ResumeClone -FreshIdentifiers:$FreshIdentifiers -Confirmed:$confirmed -FetchDependencies:$fetchDependencies -ElevatedChild:$ElevatedChild -Prompt $ask -ElevationRunner $ElevationRunner)
+            return (Invoke-ToolkitActionWithElevation -Action $Choice -InstallRoot $InstallRoot -InstanceIndex $useInstanceIndex -SourceIndex $targetSourceIndex -StateRoot $statePath -Packages $selectedPackages -Mode $targetMode -StartIndex $targetStartIndex -AndroidVersion $useAndroidVersion -ResumeClone $useResumeClone -FreshIdentifiers:$useFresh -Confirmed:$confirmed -FetchDependencies:$fetchDependencies -ElevatedChild:$ElevatedChild -Prompt $usePrompt -ElevationRunner $ElevationRunner)
         }.GetNewClosure()
     }
 

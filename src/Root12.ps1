@@ -463,6 +463,11 @@ function Install-Android12Root {
         [scriptblock]$Runner = $null,
         [scriptblock]$Prompt = $null,
         [object]$ResumeClone = $null,
+        # The run authorization is separate from the Kitsune choice further down. It defaults to on for a
+        # direct caller, which is how this flow was always invoked, and the menu passes it explicitly so
+        # the confirmation it collected is the one that gates the copy. Without the gate a declined run
+        # still cloned an instance and installed the artifact before anything was asked.
+        [bool]$RunConfirmed = $true,
         [switch]$RequireCachedAsset
     )
 
@@ -542,6 +547,13 @@ function Install-Android12Root {
     }
     catch {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The verified Kitsune asset could not be journaled.' -Data (@{ Code = 'JOURNAL_WRITE_FAILED' })
+    }
+
+    # The run authorization is checked here, before the clone, and not only against the interactive flag
+    # above. A resume still revalidates its recorded clone, so authorizing it costs nothing and refusing it
+    # changes nothing.
+    if (-not $RunConfirmed) {
+        return New-ToolkitRootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: The Android 12 root copies the instance and installs the pinned Kitsune release, so it must be confirmed before the copy is made. No instance was created or changed and the dependency cache was not touched.') -Data (@{ Code = 'USER_CONFIRMATION_REQUIRED' })
     }
 
     $cloneIndex = -1

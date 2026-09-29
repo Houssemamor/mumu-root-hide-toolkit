@@ -214,7 +214,14 @@ function Format-ToolkitDisclosure {
     $lines = @()
     $lines += '  This will change instance ' + $index + ' (' + $name + ').'
     if ($Action -ceq 'Conceal') {
-        $lines += '  * ' + [string]@($Packages).Count + ' app(s) join the Root template: ' + (@($Packages) -join ', ')
+        # The app list is collected by the action after this disclosure, so naming a count here would print
+        # a number nobody has chosen yet. The disclosure says where the list comes from instead.
+        if (@($Packages).Count -gt 0) {
+            $lines += '  * ' + [string]@($Packages).Count + ' app(s) join the Root template: ' + (@($Packages) -join ', ')
+        }
+        else {
+            $lines += '  * The apps you name next join the Root template on the clone.'
+        }
         $lines += '  * The vendor root is off on the clone, so an app probing for su sees nothing.'
     }
     elseif ($Action -ceq 'Root12') {
@@ -226,7 +233,7 @@ function Format-ToolkitDisclosure {
     }
     elseif ($Action -ceq 'FullSetup') {
         $lines += '  * The root that applies to this Android version is applied to a clone of this instance.'
-        $lines += '  * The selected apps join the Root template on that clone.'
+        $lines += '  * The apps you name next join the Root template on that clone.'
         $lines += '  * The campaign advertisement files for this installation are suppressed.'
     }
     elseif ($Action -ceq 'RemoveAds') {
@@ -536,7 +543,15 @@ function Get-ToolkitScreenLines {
     $lines = @(Format-ToolkitScreen -Title $title -Rows @(Get-ToolkitActionRows -AndroidVersion $version) -Notes @('Anything that writes prints what it will change and asks for CONFIRM.'))
     if ($null -ne $Target) {
         $lines += ''
-        $lines += '  Working on instance ' + [string]$Target.Index + ' (' + [string]$Target.Name + ').'
+        # Before an action runs there is no clone yet, so the line names the source and says the action will
+        # work on a copy of it. Reading the not-yet-known clone index printed an empty index and name.
+        $cloneIndex = [int](Get-ToolkitRecordValue -Record $Target -PropertyNames @('CloneIndex'))
+        if ([string]$Target.Mode -ceq 'Continue' -and $cloneIndex -ge 0) {
+            $lines += ('  Working on the verified clone at index ' + [string]$cloneIndex + ' (' + [string]$Target.CloneName + ').')
+        }
+        else {
+            $lines += ('  The action will work on a clone of instance ' + [string]$Target.SourceIndex + ' (' + [string]$Target.SourceName + ').')
+        }
     }
     $lines += ''
     $lines += 'Select an action (1-5):'

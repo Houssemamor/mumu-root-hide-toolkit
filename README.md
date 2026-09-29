@@ -279,6 +279,12 @@ confirmation itself. It is a composition of the three actions above rather than 
 runs through the same dispatch, keeps its own journal, and the run reports which steps completed.
 
 `Root12` is menu-only. A noninteractive run resolves the installation and the instance and then
+refuses with `USER_CONFIRMATION_REQUIRED`, because the Kitsune install is a guided action in the
+emulator. The run authorization is checked **before the clone**: declining costs nothing, no instance
+is created and the dependency cache is not touched. That ordering was wrong once: the flow cloned an
+instance and installed the artifact before asking, so a misclick cost a full instance's disk. The
+Kitsune option itself is a second, later question, asked once the clone exists so it can name the
+instance the APK actually landed on.
 returns `USER_CONFIRMATION_REQUIRED` without creating a clone, without changing anything in MuMu, and
 without reaching the network or the dependency cache, because the exact Kitsune choice must be
 confirmed by a person and the noninteractive dispatcher carries no confirmation token. The pinned
