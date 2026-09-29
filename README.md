@@ -50,6 +50,7 @@ covered by fixture tests only. `Limitations` states every remaining limit in ful
 - [Status](#status)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Walkthrough](#walkthrough)
 - [Actions](#actions)
 - [Pinned versions](#pinned-versions)
 - [How the safety rules work](#how-the-safety-rules-work)
@@ -58,6 +59,7 @@ covered by fixture tests only. `Limitations` states every remaining limit in ful
 - [Android 12: the exact Kitsune choice](#android-12-the-exact-kitsune-choice)
 - [Android 15: built-in root and explicit confirmation](#android-15-built-in-root-and-explicit-confirmation)
 - [Concealment scope](#concealment-scope)
+- [What a Magisk module is here, and why one is installed](#what-a-magisk-module-is-here-and-why-one-is-installed)
 - [Advertisement scope and restore](#advertisement-scope-and-restore)
 - [Administrator rights](#administrator-rights)
 - [Transport bounds](#transport-bounds)
@@ -97,9 +99,10 @@ This is the setup order, and it is also the shortest path to a result you can ve
 6. Run `Conceal` with the package names of the specific apps that must not see root.
 7. Run `RemoveAds` to suppress MuMu's own campaign advertisements, and `Restore` to put them back.
 
-The menu numbers are not this order. The menu puts the two read-only actions first, then `Target`,
-then the actions that change something, so `Target` is `3` and runs before `Detect` (`1`) and
-`Verify` (`2`).
+The order above is the command-line order. The menu does not use these numbers at all: it has no `Detect`,
+`Verify` or `Target` rows, because discovery runs on its own when the menu opens and `Status` is one
+keystroke from the instance list. If you prefer the menu, follow [Walkthrough](#walkthrough) instead of
+this list.
 
 `Target` does not remember its choice. Every later action needs the target index again, passed as
 `-InstanceIndex` or answered at the menu. If you do not pass one and more than one instance is
@@ -111,7 +114,12 @@ Double-click `Run-MumuToolkit.bat`. The menu is three screens in one design, and
 again before each prompt so the choices never scroll out of reach.
 
 Every block below is **captured output from a real run** on this repository's own test host, not a mock
-up. The status colors are not visible in the text capture; the console shows green for `Success` and
+up, with one exception applied throughout: the instance names have been replaced with `Base`,
+`Device-B` and a description of the clone, so no real machine's names appear here. Everything else on
+every line is exactly what the run printed, and the test suite renders the current screens and fails if a
+line here is no longer one of them.
+
+The status colors are not visible in the text capture; the console shows green for `Success` and
 `AlreadyApplied`, yellow for `Warning`, `RecoverableError` and the invalid-answer hint, red for
 `CriticalError`, cyan for the screen title, and dim gray for the rule and safety line.
 
@@ -121,8 +129,8 @@ change instead of being asked to trust a menu. Two number columns, because they 
 
 ```text
       #  Idx  Name                Android Running  Vendor root
-      1  0    Roo+3d 12 Shad      12.0    no       no
-      2  2    Roo+3d 12-Houssem   12.0    yes      no
+      1  0    Base                12.0    no       no
+      2  2    Device-B            12.0    yes      no
   Installation Chinese  D:\Program Files\Netease\MuMuPlayer
 
   MuMu Root Hide Toolkit
@@ -152,7 +160,7 @@ action asks for the confirmation that covers the clone it is about to make. Both
 walk:
 
 ```text
-  Instance 0  Roo+3d 12 Shad  Android 12.0
+  Instance 0  Base  Android 12.0
   ============================================================
   Inspect    1 Status                          read-only
   Target     2 Clone, keep device info         new instance
@@ -164,7 +172,7 @@ walk:
 
 Select what to do (1-5):
 
-  Instance 0  Roo+3d 12 Shad  Android 12.0
+  Instance 0  Base  Android 12.0
   ===========================================================
   Change     1 Root with Kitsune               downloads + changes guest
   Change     2 Conceal apps                    changes guest
@@ -172,7 +180,7 @@ Select what to do (1-5):
   Back       4 Back to the instances
   Anything that writes prints what it will change and asks for CONFIRM.
 
-  The action will work on a clone of instance 0 (Roo+3d 12 Shad).
+  The action will work on a clone of instance 0 (Base).
 
 Select an action (1-4):
 ```
@@ -204,7 +212,7 @@ screen instead. The rows are filtered by the instance's Android version, so an e
 never offered:
 
 ```text
-  Instance 0  Roo+3d 12 Shad  Android 12.0
+  Instance 0  Base  Android 12.0
   ===========================================================
   Change     1 Root with Kitsune               downloads + changes guest
   Change     2 Conceal apps                    changes guest
@@ -212,7 +220,7 @@ never offered:
   Back       4 Back to the instances
   Anything that writes prints what it will change and asks for CONFIRM.
 
-  The action will work on a clone of instance 0 (Roo+3d 12 Shad).
+  The action will work on a clone of instance 0 (Base).
 ```
 
 The tag on each row is the shortest true statement of what it costs: `read-only` changes nothing,
@@ -254,7 +262,7 @@ Anything that writes prints a disclosure first, so you read the consequence and 
 real `Full setup` row with the confirmation declined:
 
 ```text
-  This will not change instance 0 (Roo+3d 12 Shad) itself.
+  This will not change instance 0 (Base) itself.
   It works on a new clone of that instance, so the source is left as it is.
   * The root that applies to this Android version is applied to a clone of this instance.
   * The apps you name next join the Root template on that clone.
@@ -265,7 +273,7 @@ real `Full setup` row with the confirmation declined:
   Recovery: run Verify for a read-only report, then retry the action. The operation journal and the log are kept under the toolkit state directory.
 ```
 
-The headline used to read `This will change instance 0 (Roo+3d 12 Shad).` while the bullets underneath it
+The headline used to read `This will change instance 0 (Base).` while the bullets underneath it
 spoke of *the clone*, so the same sentence both promised and denied that the instance you had just selected
 was the thing being written to. It now names the source and the clone separately. The advertisement rows
 get a different headline again, because they change the installation and touch no instance at all.
@@ -328,11 +336,137 @@ PS> Run-MumuToolkit.bat -Action Detect -NonInteractive -InstanceIndex 0
   InstallRoot = D:\Program Files\Netease\MuMuPlayer
   InstanceCount = 2
   InstanceIndex = 0
-  InstanceName = Roo+3d 12 Shad
+  InstanceName = Base
   ManagerPath = D:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe
   RootSetting = False
   Running = False
 ```
+
+## Walkthrough
+
+This is the menu path, start to finish, for a first run on a machine with one Android 12 instance. Every
+step below is a real screen from the captures above. Nothing here is written until you type `CONFIRM`, and
+you can stop at any step: the menu never closes itself when an action fails.
+
+**1. Double-click `Run-MumuToolkit.bat`.** Discovery runs on its own, so the first thing you see is the
+list of instances you are about to choose from, not a menu that asks you to trust it:
+
+```text
+      #  Idx  Name                Android Running  Vendor root
+      1  0    Base                12.0    no       no
+  Installation Chinese  D:\Program Files\Netease\MuMuPlayer
+
+  MuMu Root Hide Toolkit
+  ===================================================================
+  Create     N New empty instance              new instance
+  Advertise  A Remove ads                      changes installation
+             B Restore ads                     restores
+             Q Quit
+  Vendor root is the MuMu setting. The guest root is reported by Status.
+
+Select an instance (1-2), or N, A, B or Q:
+```
+
+Read two columns carefully, because they are not the same thing. `#` is what you type; `Idx` is the index
+MuMu itself uses. `Vendor root` is the MuMu setting and says nothing about whether the guest is rooted.
+
+**2. Type the number of your instance.** This is the only selection you make by number, and it changes
+nothing. You land on a screen that asks what to do with that one instance:
+
+```text
+  Instance 0  Base  Android 12.0
+  ============================================================
+  Inspect    1 Status                          read-only
+  Target     2 Clone, keep device info         new instance
+             3 Clone, fresh identifiers        new instance
+             4 Continue on its clone           changes guest
+  Back       5 Back to the instances
+  Status reads this instance and changes nothing. Every other choice works on a clone.
+  The source instance is never written.
+
+Select what to do (1-5):
+```
+
+**3. Type `1` for `Status` first, always.** It reads the guest and changes nothing, and it is the step
+that tells you whether the rest is worth doing. Read it in full rather than scanning for the root line:
+
+- `Guest.Root = Unverified` with `Guest.Code = ADB_FAILED` means the guest is **stopped**, not unrooted.
+  Start the instance and run `Status` again. A stopped guest cannot answer, and the report says so rather
+  than guessing.
+- `Guest.Root = Unrooted` is a real measurement: the guest answered and has no root.
+- A field that could not be measured reads `not-detected`; a value that is genuinely absent reads `none`.
+  Neither is ever turned into a measurement that was not taken.
+- Any `Failure 1 = ...` line is a sentence, not a code, and it is the reason anything above it is unknown.
+
+**4. Only once `Status` is clean, pick a target.** On an Android 12 instance choose `2` for
+`Clone, keep device info`. Rows `2`, `3` and `4` are **declarations, not clones**: nothing is copied here,
+and the action you pick next is the thing that makes the single clone. `4 Continue on its clone` reuses the
+clone a previous run recorded in the journal, and refuses with `CLONE_RECORD_MISSING` if there is no record
+rather than quietly making you a second instance.
+
+**5. Pick the action.** Every row on this screen writes, which is why the read-only `Status` is not here:
+
+```text
+  Instance 0  Base  Android 12.0
+  ===========================================================
+  Change     1 Root with Kitsune               downloads + changes guest
+  Change     2 Conceal apps                    changes guest
+             3 Full setup                      downloads + changes guest
+  Back       4 Back to the instances
+  Anything that writes prints what it will change and asks for CONFIRM.
+
+  The action will work on a clone of instance 0 (Base).
+
+Select an action (1-4):
+```
+
+**6. Read the disclosure, then type `CONFIRM`.** The disclosure appears before the question, so you see the
+consequence and then decide:
+
+```text
+  This will not change instance 0 (Base) itself.
+  It works on a new clone of that instance, so the source is left as it is.
+  * The pinned Kitsune release is installed into the system partition of the clone.
+  * The clone vendor root is turned off, so an app probing for su sees nothing.
+```
+
+Anything other than the exact word `CONFIRM` refuses the action and changes nothing. The confirmation is
+asked twice on an Android 12 root, and both are required: once for the run, and once for the Kitsune
+choice described in [the exact Kitsune choice](#android-12-the-exact-kitsune-choice).
+
+**7. Answer the Kitsune question in the emulator, then wait.** The toolkit launches Kitsune in the clone
+and asks you to choose `Install -> Direct Install into system partition` **inside the Kitsune app**, then
+asks you to confirm that you did. The cold boot after that is automatic:
+
+```text
+  The clone at index 4 (the new clone's name) is rebooting now. This is automatic: nothing else is
+  needed from you, and no word will release the wait. The root is checked as soon as the guest
+  reports it finished booting.
+```
+
+The name in that line is the clone MuMu created, which it names for you rather than asking; the index is
+the one that matters, because it is what the journal records and what a later `Continue on its clone`
+resumes.
+
+The console is silent for a few minutes while the clone reboots. **Do not type anything.** The wait ends
+when the guest reports it finished booting, or when the bound in
+[Transport bounds](#transport-bounds) is reached, and never on an answer, so a word you type is not
+releasing anything.
+
+**8. Read the result, and check it yourself.** Run `Status` on the clone afterward. The toolkit's own
+report is the claim; `Status` is the measurement. On this host `Root12` reports a `Warning` rather than a
+`Success`, and the reason is in [Status](#status) above.
+
+### If you only want to read
+
+Type `1` at the instance list, then `1` again. That is the whole read-only path, and it is the only path
+that cannot spend disk, download anything, or write to MuMu.
+
+### Recovering from a stop
+
+The menu does not close on a failure. Read the `Code` line, then follow
+[Recovery](#recovery). Every action keeps a journal, and a run that stopped part way is resumable through
+`Continue on its clone` rather than by starting over on a second instance.
 
 ## Actions
 
@@ -475,8 +609,8 @@ installation and the manager (`Install.*`, `ManagerVersion`), every instance the
   Install.Source = Registry
   ManagerVersion = Unknown
   Instances:
-    Instance 0 | Roo+3d 12 Shad | Android 12.0 | Running False | RootSetting False
-    Instance 2 | Roo+3d 12-Houssem | Android 12.0 | Running True | RootSetting False
+    Instance 0 | Base | Android 12.0 | Running False | RootSetting False
+    Instance 2 | Device-B | Android 12.0 | Running True | RootSetting False
   Virtualization = Enabled
   Guest.Root = Unverified
   Guest.Code = ADB_FAILED
@@ -746,6 +880,96 @@ verified while the Vector artifact was not installed at all. Separately, the sel
 that is absent; install the app on the clone yourself, or select apps that are installed, before
 concealment can be called qualified. The Vector install path has been exercised only by fixtures,
 and the flat-archive gate for the pinned v2.2 asset has not been run against a live clone.
+
+## What a Magisk module is here, and why one is installed
+
+Exactly one Magisk module is ever installed by this toolkit: the pinned **Vector** v2.2 module, into
+`/data/adb/modules/zygisk_vector`. This section explains what it is, why concealment needs one, and
+exactly what the toolkit does to put it there, because "installs a module" is otherwise a sentence you
+have to take on trust.
+
+### Why a module at all
+
+The root itself is **not** a module. On Android 12, Kitsune is installed into the system partition by the
+Kitsune app's own `Install -> Direct Install into system partition` flow, and it lives in the partition,
+not in a module directory. On Android 15 the built-in root is enabled through MuMu's own setting. Neither
+root is something this toolkit drops into a folder.
+
+Concealment is a different job, and it needs something that runs in the same space as the apps being
+hidden from. A root implementation is visible to an app that looks for it: it can find `su` on the `PATH`,
+find a root daemon, find a root package by name, or notice a patched binary. Vector is a Zygisk-based
+module that intercepts the app process at load time so those signals are not there to find. So the chain is:
+
+- **Kitsune, or MuMu's built-in root, provides root.** Installed into the partition, not as a module.
+- **Hide My Applist OSS** rewrites the package list an app can see, so the root *packages* are absent from
+  an app's view. Installed as an ordinary APK with `install -r`.
+- **Vector** is the part that has to live in the root implementation's own space, because it hooks process
+  creation. That is a module, so it is the one thing that must go into `/data/adb/modules`.
+
+None of the three is redundant. HMA hides the packages, Vector hides the hooks and the `su` path, and the
+root itself does the actual work.
+
+### What counts as a module
+
+A Magisk module is a **directory**, not an archive, and not an app. It lives at
+`/data/adb/modules/<module id>/` and contains at least a `module.prop` declaring `id=`, plus a `bin`
+directory or a `*.sh` boot script. The root implementation reads those directories at boot and loads each
+one. So installing one is a matter of putting a correctly shaped directory in a specific place, and the
+whole difficulty is knowing the shape is right before you move it.
+
+### How the toolkit installs Vector
+
+On the verified clone, in this order, every step refusing to continue on failure:
+
+1. **Verify the artifact before it goes near the guest.** Size and SHA-256 are checked against
+   `Manifest.json` in the per-user cache. This step never reaches the network; a download happens only if
+   you asked for one with `-FetchDependencies` or by typing `FETCH`. A mismatch is `ASSET_VERIFICATION_FAILED`
+   and nothing is staged.
+2. **Check whether it is already there.** `ls /data/adb/modules/zygisk_vector`. If it answers with
+   content, the module is recorded as already present and the install is skipped rather than repeated.
+   If the listing cannot be read at all, the run stops with `ADB_FAILED`, because "unknown" is not
+   "absent" and installing over an unknown state is not safe.
+3. **Stage the archive.** `adb push` the verified zip to `/data/local/tmp/`.
+4. **Extract it.** `unzip -o` into a fresh `/data/local/tmp/vector-extract-<random>/`, so a stale
+   directory from an earlier run can never be mistaken for this run's contents.
+5. **Inspect the layout, and accept exactly two shapes.** Either a single top-level `zygisk_vector/`
+   directory, or a flat module archive whose root `module.prop` is validated: the declared `id` must be
+   `zygisk_vector`, there must be a `*.sh` or `bin` entry, and there must be no second module root nested
+   inside. An archive that is both shapes, neither, carries a nested module, or declares a different `id`
+   is refused with `MODULE_LAYOUT_UNSUPPORTED`.
+6. **Move it into place.** `mv` the validated directory to `/data/adb/modules/zygisk_vector`.
+7. **Read it back.** The module directory must exist after the move or the install is
+   `MODULE_INSTALL_FAILED`. A move that reported success but produced nothing is a failure, not a pass.
+8. **Clean up on every failure after the push.** Any refusal from step 4 onward removes the pushed archive
+   and the staging directory, so a rejected archive is never left sitting in the guest.
+
+The clone is then rebooted by the action that owns it, and the module is loaded at that boot. `Verify`
+reports what it can observe afterwards: `Guest.VectorModuleInstalled` is read from the guest rather than
+assumed from the install having returned success.
+
+### What is in the manifest but never installed
+
+`Manifest.json` pins five artifacts. Only three are installed by any action, and the other two are
+deliberately not:
+
+| Artifact | Installed | Why |
+| --- | --- | --- |
+| `kitsune` | yes, by `Root12` | the Android 12 root itself, into the system partition |
+| `hma` | yes, by `Conceal` | an APK, installed as a package, not a module |
+| `vector` | yes, by `Conceal` | the one Magisk module, into `/data/adb/modules/zygisk_vector` |
+| `neozygisk` | **never** | a root-side Zygisk implementation, not a concealment dependency. Pinning it documents what it is not used for. |
+| `corepatch` | **never** | an app-level bypass module. Out of scope for concealment. |
+
+A pinned dependency that is never installed is worth stating plainly, because "the manifest lists it" and
+"the toolkit installs it" are different claims and only one of them is true here.
+
+### What is not proven about this
+
+The Vector install path has been exercised by **fixtures only**. On the live host it stopped at step 5
+with `MODULE_LAYOUT_UNSUPPORTED`, before the move, so the flat-archive gate has never been run against a
+real clone. That is why the steps above describe the intended behaviour rather than a recorded success,
+and it is the first thing to fix if you are re-qualifying this on your own machine. See
+[Status](#status).
 
 ## Advertisement scope and restore
 

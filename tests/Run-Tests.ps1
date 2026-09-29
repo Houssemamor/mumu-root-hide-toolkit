@@ -11388,18 +11388,22 @@ function Invoke-DocsTests {
     Assert-True ($verifySectionText -match '(?i)Chinese') 'The Verify sample does not name the edition the live run actually used.'
     # The capture is only worth trusting if it names the machine it came from and reports the stopped
     # guest honestly rather than showing a healthy state nobody observed.
-    Assert-True ($verifySectionText -match 'Roo\+3d 12 Shad') 'The Verify capture does not name an instance the live run reported.'
+    Assert-True ($verifySectionText -match '(?m)^\s*Instance 0 \| Base \| Android 12\.0 \|') 'The Verify capture does not name the instance the live run reported.'
     Assert-True ($verifySectionText -match '(?m)^\s*Guest\.Code = ADB_FAILED\s*$') 'The Verify capture does not report the ADB failure the live run recorded.'
     Assert-True ($verifySectionText -match '(?m)^\s*JournalState = None\s*$') 'The Verify capture does not report the absent journal state the live run recorded.'
 
 
     # The captured screens in the README are the renderer's output, so a change to the renderer has to
     # change the documentation too. Each block below is a line the renderer actually produced.
+    #
+    # The renders use the same names the README does, which are not the real ones: the captures are a real
+    # run with the instance names replaced, so a name from someone's actual machine must never appear here
+    # and the lines that carry a name are compared against the sanitized rendering instead of skipped.
     $menuSection = [regex]::Match($readme, '(?ms)^### The interactive menu$.*?(?=^### |^## )')
     Assert-True $menuSection.Success 'README has no interactive menu section.'
     $menuText = $menuSection.Value
     $menuScreen = [pscustomobject]@{
-        Index = 0; Name = 'Roo+3d 12 Shad'; AndroidVersion = '12.0'; Running = $false; RootSetting = $false
+        Index = 0; Name = 'Base'; AndroidVersion = '12.0'; Running = $false; RootSetting = $false
     }
     $menuSnapshot = [pscustomobject]@{
         Install      = [pscustomobject]@{ Edition = 'Chinese'; InstallRoot = 'D:\Program Files\Netease\MuMuPlayer' }
@@ -11418,7 +11422,7 @@ function Invoke-DocsTests {
         if ($line -match '^\s*(MuMu Root|Instance 0|Select|=|Target\s|Other\s|Back\s|Every guest)') { continue }
         Assert-True ($menuText -match [regex]::Escape($line)) "The captured target screen does not contain a line the renderer produces: $line"
     }
-    $actionExample = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $menuSnapshot -Instance $menuScreen -Target ([pscustomobject]@{ Mode = 'Clone'; SourceIndex = 0; SourceName = 'Roo+3d 12 Shad'; CloneIndex = -1; CloneName = ''; FreshIdentifiers = $false }))
+    $actionExample = @(Get-ToolkitScreenLines -Screen 'Actions' -Snapshot $menuSnapshot -Instance $menuScreen -Target ([pscustomobject]@{ Mode = 'Clone'; SourceIndex = 0; SourceName = 'Base'; CloneIndex = -1; CloneName = ''; FreshIdentifiers = $false }))
     foreach ($line in $actionExample) {
         if ($line -match '^\s*(MuMu Root|Instance 0|Select|=|Inspect\s|Change\s|Other\s|Back\s|Anything|The action)') { continue }
         Assert-True ($menuText -match [regex]::Escape($line)) "The captured action screen does not contain a line the renderer produces: $line"
@@ -11445,7 +11449,7 @@ function Invoke-DocsTests {
             ManagerPath   = 'D:\Program Files\Netease\MuMuPlayer\nx_main\MuMuManager.exe'
             InstanceCount = 2
             InstanceIndex = 0
-            InstanceName  = 'Roo+3d 12 Shad'
+            InstanceName  = 'Base'
             AndroidVersion = '12.0'
             RootSetting   = $false
             Running       = $false
@@ -11455,6 +11459,16 @@ function Invoke-DocsTests {
     foreach ($line in @($machineLines | Select-Object -Skip 1)) {
         Assert-True ($menuText -match [regex]::Escape($line)) "The captured noninteractive output does not contain a line the machine renderer produces: $line"
     }
+
+    # The captures are real runs with the instance names replaced, so no real machine's names belong in the
+    # document. This is a leak guard rather than a formatting rule: the names that were removed are the ones
+    # that actually appeared in the captured output.
+    Assert-True ($readme -notmatch 'Roo\+3d') 'README publishes a real instance name from the capture host.'
+    Assert-True ($readme -notmatch 'Android Device-\d') 'README publishes a real auto-named instance from the capture host.'
+    Assert-True ($readme -match '(?m)^\s+\d+\s+\d+\s+Base\s+12\.0') 'The captured dashboard table does not use the sanitized instance name.'
+    # The names are replaced, so the document has to say so. A capture with the names swapped and no note
+    # about it reads as verbatim output, which is the claim this suite exists to keep honest.
+    Assert-True ($menuSection.Value -match '(?i)instance names have been replaced') 'The interactive menu section does not say the instance names in the captures are replaced.'
 
     $concealmentSection = [regex]::Match($readme, '(?ms)^## Concealment scope$.*?(?=^## )')
     Assert-True $concealmentSection.Success 'README has no Concealment scope section.'
