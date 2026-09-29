@@ -684,6 +684,24 @@ function Install-Android12Root {
         return New-ToolkitRootFailure -Journal $Journal -Message ('USER_CONFIRMATION_REQUIRED: Only ' + $script:ToolkitKitsuneChoice + ' is accepted, and it was not confirmed. The cold boot, the root verification, and the vendor root change were not started. Boot the reported clone to recover, then resume this workflow on that clone.') -Data (New-Android12Recovery -Code 'USER_CONFIRMATION_REQUIRED' -Step 'confirmation' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
+    # The cold boot below is silent for minutes, and a silent console reads as a hang. The operator has
+    # already answered every question, so the line says what is happening and, more importantly, that
+    # nothing is required from them: they must not type a word to release the wait, because the wait ends
+    # on the guest reporting sys.boot_completed=1 or on the bound, and never on an answer. A machine run
+    # has nobody to reassure, so the journal is the only place the fact is recorded.
+    if ($Interactive -and (Get-Command Write-ToolkitConsoleLine -CommandType Function -ErrorAction SilentlyContinue)) {
+        Write-ToolkitConsoleLine ('  The clone at index ' + [string]$cloneIndex + ' (' + $cloneName + ') is rebooting now. This is automatic: nothing else is needed from you, and no word will release the wait. The root is checked as soon as the guest reports it finished booting.')
+    }
+    try {
+        Write-JournalEvent -Journal $Journal -Level 'Info' -Message "The Kitsune system-partition install was confirmed, so the clone is cold-booted and the root is verified without any further operator answer." -Data @{
+                CloneIndex = $cloneIndex
+                CloneName = $cloneName
+            }
+    }
+    catch {
+        return New-ToolkitRootFailure -Journal $Journal -Message 'The cold boot notice could not be journaled.' -Data (New-Android12Recovery -Code 'JOURNAL_WRITE_FAILED' -Step 'cold-boot-notice' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+    }
+
     $shutdown = Invoke-CheckedProcess -FilePath $manager -ArgumentList @('control', '-v', ([string]$cloneIndex), 'shutdown') -Runner $Runner
     if ($null -eq $shutdown -or $shutdown.ExitCode -ne 0) {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The clone did not accept the cold-boot shutdown request.' -Data (New-Android12Recovery -Code 'BOOT_CONTROL_FAILED' -Step 'cold-boot' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)

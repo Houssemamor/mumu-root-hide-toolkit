@@ -4926,6 +4926,55 @@ function Invoke-Root12Tests {
         Assert-True ($installCallIndex -lt $launchCallIndex) 'The Kitsune APK was launched before it was installed.'
         Assert-True ($launchCallIndex -lt $coldBootLaunchIndex) 'The Kitsune APK was launched after the confirmation gate.'
 
+        # The cold boot is silent for minutes, and a silent console reads as a hang: an operator watching
+        # the clone reboot on its own cannot tell whether the run is working, crashed, or waiting for them
+        # to type something. The run therefore announces the automatic reboot and states that no answer is
+        # needed, because nothing releases the wait except the guest or the bound.
+        $noticeState = New-Root12ManagerState -Install $install
+        # The case is collected into a shared container because the redirected scriptblock runs in a child
+        # scope, where a plain assignment would be discarded before it can be asserted.
+        $noticeHolder = @{}
+        $noticeConsole = @(& {
+                $noticeHolder.Case = Invoke-Root12Case -State $noticeState -Instance $android12 -Manifest $manifest `
+                    -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Confirmation 'Direct Install into system partition'
+            } 6>&1 | ForEach-Object { [string]$_ })
+        $noticeCase = $noticeHolder.Case
+        Assert-True ($noticeCase.Result.Status -eq 'Success') "The Android 12 workflow failed while capturing the cold-boot notice. $($noticeCase.Result.Message)"
+        $noticeLines = @($noticeConsole | Where-Object { $_ -match 'rebooting' })
+        Assert-Equal 1 $noticeLines.Count 'The cold boot was not announced exactly once to the operator.'
+        $noticeLine = [string]$noticeLines[0]
+        Assert-True ($noticeLine -match 'nothing else is needed from you') 'The cold-boot notice does not say that the reboot is automatic and needs nothing from the operator.'
+        Assert-True ($noticeLine -match 'no word will release the wait') 'The cold-boot notice leaves the operator thinking a word releases the wait.'
+        Assert-True ($noticeLine -match ([string]$noticeState.CloneIndex)) 'The cold-boot notice does not name the clone that is rebooting.'
+        Assert-True ($noticeLine -match [regex]::Escape([string]$noticeState.CloneName)) 'The cold-boot notice does not name the clone instance name.'
+
+        # The announcement belongs to the confirmed path only. A run refused at the Kitsune choice never
+        # reaches the cold boot, so promising an automatic reboot there would be a lie.
+        $noticeDeclineState = New-Root12ManagerState -Install $install
+        $noticeDeclineHolder = @{}
+        $noticeDeclineConsole = @(& {
+                $noticeDeclineHolder.Case = Invoke-Root12Case -State $noticeDeclineState -Instance $android12 -Manifest $manifest `
+                    -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $true -Prompt { 'no' }
+            } 6>&1 | ForEach-Object { [string]$_ })
+        $noticeDeclineCase = $noticeDeclineHolder.Case
+        Assert-Root12Failure -Result $noticeDeclineCase.Result -Journal $noticeDeclineCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A declined Kitsune confirmation was accepted while capturing the cold-boot notice.'
+        Assert-Equal 0 @($noticeDeclineConsole | Where-Object { $_ -match 'rebooting' }).Count 'A run that never cold-booted still announced an automatic reboot.'
+
+        # A machine run cannot pass the Kitsune gate, because a human has to make that choice in the app.
+        # So the cold boot, and the announcement of it, are interactive-only by construction: a run that
+        # printed "it is rebooting now" without a way to reach the boot would be promising a reboot that
+        # never happens.
+        $noticeMachineState = New-Root12ManagerState -Install $install
+        $noticeMachineHolder = @{}
+        $noticeMachineConsole = @(& {
+                $noticeMachineHolder.Case = Invoke-Root12Case -State $noticeMachineState -Instance $android12 -Manifest $manifest `
+                    -JournalRoot $journalRoot -CacheRoot $assetCacheRoot -Interactive $false -Confirmation 'Direct Install into system partition'
+            } 6>&1 | ForEach-Object { [string]$_ })
+        $noticeMachineCase = $noticeMachineHolder.Case
+        Assert-Root12Failure -Result $noticeMachineCase.Result -Journal $noticeMachineCase.Journal -Code 'USER_CONFIRMATION_REQUIRED' -Message 'A non-interactive run passed the operator-only Kitsune gate.'
+        Assert-Equal 0 @($noticeMachineConsole | Where-Object { $_ -match 'rebooting' }).Count 'A non-interactive run announced a cold boot it can never reach.'
+        Assert-Equal 0 @($noticeMachineState.Calls | Where-Object { (@($_) -join ' ') -like '*getprop sys.boot_completed*' }).Count 'A non-interactive run cold-booted without an operator at the Kitsune gate.'
+
         $stoppedAdbState = New-Root12ManagerState -Install $install
         $stoppedAdbState.AdbRequiresRunning = $true
         $stoppedAdbCase = Invoke-Root12Case -State $stoppedAdbState -Instance $android12 -Manifest $manifest `
