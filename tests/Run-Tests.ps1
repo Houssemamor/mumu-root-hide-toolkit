@@ -11675,6 +11675,31 @@ function Invoke-DocsTests {
         Assert-True ($root15Section.Value -match $root15Statement.Pattern) $root15Statement.Message
     }
 
+    $sourcesSection = [regex]::Match($readme, '(?ms)^## Sources and prior art$.*?(?=^## )')
+    Assert-True $sourcesSection.Success 'README has no Sources and prior art section.'
+    # Attribution is only worth having if it is specific. A source named without the behaviour it was
+    # used for is decoration, so each of these has to say what it contributed.
+    foreach ($sourceStatement in @(
+            @{ Pattern = 'mumuplayer\.com/blog'; Message = 'The sources section does not cite the MuMu blog that documents the missing install option and the in-app reboot.' }
+            @{ Pattern = 'hamjin/kitsune-magisk-files'; Message = 'The sources section does not cite the Kitsune file mirror.' }
+            @{ Pattern = 'kernelsu\.org'; Message = 'The sources section does not cite the KernelSU documentation behind the allowlist handoff.' }
+            @{ Pattern = 'JingMatrix/Vector'; Message = 'The sources section does not cite the Vector documentation.' }
+            @{ Pattern = 'NeoZygisk/issues/120'; Message = 'The sources section does not cite the NeoZygisk and Vector compatibility report.' }
+            @{ Pattern = 'Magisk/issues/6930'; Message = 'The sources section does not cite the Magisk report behind the su fallback.' }
+            @{ Pattern = 'Bascter-Main/mumu_magisk_lsposed_oneclick'; Message = 'The sources section does not record the independent Android 15 prior art.' }
+            @{ Pattern = '(?i)does not do that'; Message = 'The sources section does not say where this toolkit departs from the sources it cites.' }
+            @{ Pattern = '(?i)Nothing here was copied as code'; Message = 'The sources section does not state that the sources were used for behaviour, not for code.' }
+        )) {
+        Assert-True ($sourcesSection.Value -match $sourceStatement.Pattern) $sourceStatement.Message
+    }
+    # The two operator traps are the claims most likely to be dismissed as folklore, so each has to carry
+    # its citation where the reader meets it, not only in the sources list.
+    $kitsuneSection = [regex]::Match($readme, '(?ms)^## Android 12: the exact Kitsune choice$.*?(?=^## )')
+    Assert-True ($kitsuneSection.Value -match 'mumuplayer\.com/blog') 'The missing-option advice does not cite the vendor documentation that gives it.'
+    Assert-True ($kitsuneSection.Value -match 'hamjin/kitsune-magisk-files') 'The missing-option advice does not cite the Kitsune author mirror that gives it.'
+    Assert-True ($kitsuneSection.Value -match '(?i)Reboot. function will not work') 'The non-working reboot claim is not quoted from the source that documents it.'
+    Assert-True ($root15Section.Value -match 'kernelsu\.org') 'The Android 15 allowlist handoff does not cite the KernelSU documentation.'
+
     $moduleSection = [regex]::Match($readme, '(?ms)^## What a Magisk module is here.*?(?=^## )')
     Assert-True $moduleSection.Success 'README has no Magisk module section.'
     # A Vector directory is not a loaded module, and the three ways the report can be wrong about that are
@@ -11788,7 +11813,10 @@ function Invoke-DocsTests {
         Assert-True ($document.Text -notmatch '(?i)\.(apk|zip|7z|msi|img|ico|iso|cab|whl|nupkg)\b') "$($document.Name) references a packaged binary artifact file name."
         foreach ($hostMatch in [regex]::Matches($document.Text, 'https?://([A-Za-z0-9.-]+)')) {
             $linkHost = $hostMatch.Groups[1].Value.ToLowerInvariant()
-            Assert-True (@('github.com', 'www.mumuplayer.com', 'mumuplayer.com') -contains $linkHost) "$($document.Name) links a host that is not an official upstream source: $linkHost"
+            # kernelsu.org is the KernelSU project's own documentation site, cited for the allowlist model
+            # the Android 15 handoff depends on. The allowlist is a link allowlist rather than a
+            # blocklist so a new citation has to be added here deliberately.
+            Assert-True (@('github.com', 'www.mumuplayer.com', 'mumuplayer.com', 'kernelsu.org') -contains $linkHost) "$($document.Name) links a host that is not an official upstream source: $linkHost"
         }
     }
     foreach ($ignoredPattern in @('*.apk', '*.zip', '*.exe', '*.pfx')) {

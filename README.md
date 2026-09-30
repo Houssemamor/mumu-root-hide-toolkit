@@ -71,6 +71,7 @@ covered by fixture tests only. `Limitations` states every remaining limit in ful
 - [Command line](#command-line)
 - [Limitations](#limitations)
 - [Tests](#tests)
+- [Sources and prior art](#sources-and-prior-art)
 - [License and attribution](#license-and-attribution)
 
 ## Requirements
@@ -794,12 +795,19 @@ again. Do not fall back to `Select and Patch a File`: it patches a boot image in
 system partition, which is not what this workflow verifies, and the toolkit will not accept a
 confirmation of a choice that was not that one.
 
+This is not folklore. MuMu's own [installation blog](https://www.mumuplayer.com/blog/how-to-use-magisk-on-mac.html)
+says *"If you didn't see this option, you can restart Kitsune Mask and try again"*, and the Kitsune
+author's own [file mirror](https://github.com/hamjin/kitsune-magisk-files) puts it more bluntly:
+*"If you don't see this option, close and re-open Kitsune Mask app."* Both are in
+[Sources and prior art](#sources-and-prior-art).
+
 Two other things that look like a hang but are not:
 
-- **The in-app reboot button does not work on an emulator.** That is expected. The workflow does not
-  use it: after you confirm the choice, the toolkit performs its own cold boot through the MuMu
-  manager. **Do not reboot the clone yourself first** - if you do, the toolkit simply shuts it down
-  and boots it again, which costs you a second boot for nothing.
+- **The in-app reboot button does not work on an emulator.** That is expected, and it is documented:
+  the vendor's own blog says *"The 'Reboot' function will not work in MuMuPlayer Pro."* The workflow
+  does not use it. After you confirm the choice, the toolkit performs its own cold boot through the
+  MuMu manager. **Do not reboot the clone yourself first** - if you do, the toolkit simply shuts it
+  down and boots it again, which costs you a second boot for nothing.
 - **The console looks frozen after you confirm, for several minutes.** That is the cold boot. It
   prints a line saying the reboot is automatic and that no word releases the wait. Wait for it. It
   ends when the guest reports it finished booting, or when the bound in [Transport bounds](#transport-bounds)
@@ -854,10 +862,11 @@ The built-in root is kept enabled on the clone.
 
 ### Root15 needs one step from you, and it is not optional
 
-**KernelSU is allowlist based.** Its own documentation states that only a permitted app can see `su`,
-and that all other apps remain unaware of it. Nothing is permitted when it is installed, so on a
-freshly enabled clone `su` does not exist **by design**, and no probe this toolkit runs can change
-that. A run that stopped there has not failed; it stopped exactly where a person has to take over.
+**KernelSU is allowlist based.** Its [own documentation](https://kernelsu.org/) states that only a
+permitted app can see `su`, and that all other apps remain unaware of it. Nothing is permitted when it
+is installed, so on a freshly enabled clone `su` does not exist **by design**, and no probe this
+toolkit runs can change that. A run that stopped there has not failed; it stopped exactly where a
+person has to take over.
 
 So when the KernelSU package is verified, the vendor root is on, and no `su` is visible, `Root15`
 reports a **`Warning`** with the code `ROOT_PERMISSION_PENDING` and a handoff, rather than a root
@@ -1057,8 +1066,11 @@ because a module directory is not a loaded module:
 Vector also needs a Zygisk implementation to run, which is either built into the root implementation
 (such as Kitsune's own) or supplied by a module such as NeoZygisk. **The toolkit does not claim to detect
 that.** It cannot be read reliably from a guest, and reporting a Zygisk implementation as absent on a
-guest whose Zygisk is built into its root would be the mirror image of the same mistake. Vector's own
-documentation states the requirement, and the dependency is recorded as a limitation rather than a check.
+guest whose Zygisk is built into its root would be the mirror image of the same mistake. Vector's
+[own documentation](https://github.com/JingMatrix/Vector) states the requirement, and
+[NeoZygisk issue #120](https://github.com/JingMatrix/NeoZygisk/issues/120) reports that Vector 2.x
+crashes on launch with NeoZygisk on some Android versions, which is a known interaction rather than a
+bad archive. The dependency is recorded as a limitation rather than a check.
 
 ### What is in the manifest but never installed
 
@@ -1320,6 +1332,29 @@ The tests use temporary fixtures, never a real MuMu installation, and never the 
 Actions workflow in `.github/workflows/test.yml` runs on Windows, checks out the repository, runs the
 PowerShell parser over every script, and runs the full suite. It installs nothing, downloads
 nothing, mutates nothing, and uploads no logs, because a log from this toolkit contains user paths.
+
+## Sources and prior art
+
+None of the behaviours below are original discoveries. They were found in public documentation, and
+where that happened the technique belongs to whoever published it. Nothing here was copied as code:
+these are the sources for **what the behaviour is**, and the implementation is this repository's own.
+`NOTICE.md` carries the same list as a formal attribution record.
+
+| Source | What this toolkit took from it |
+| --- | --- |
+| [MuMu Player official blog](https://www.mumuplayer.com/blog/how-to-use-magisk-on-mac.html) | That the system-partition install option can be absent on first open, that the in-app reboot does not work in the emulator, and that finishing by hand means removing the vendor `su` |
+| [`hamjin/kitsune-magisk-files`](https://github.com/hamjin/kitsune-magisk-files) | The same "close and re-open the app" instruction, and that closing the emulator's root access **intentionally** removes the Magisk `su` |
+| [KernelSU documentation](https://kernelsu.org/) | That KernelSU is allowlist based and only a permitted app can see `su`, which is the entire basis of the Android 15 handoff |
+| [Vector documentation](https://github.com/JingMatrix/Vector) | That Vector is a Zygisk module needing a Zygisk implementation, and the two archive layouts the installer accepts |
+| [NeoZygisk issue #120](https://github.com/JingMatrix/NeoZygisk/issues/120) | That Vector 2.x and NeoZygisk do not work together on every Android version |
+| [Magisk issue #6930](https://github.com/topjohnwu/Magisk/issues/6930) | That a guest can have a working Magisk root whose `su` is not on the `PATH`, which is why the root probe falls back |
+| [`Bascter-Main/mumu_magisk_lsposed_oneclick`](https://github.com/Bascter-Main/mumu_magisk_lsposed_oneclick) | Recorded as independent prior art for Android 15. Not a dependency, and not copied |
+
+**Where this toolkit departs from them, it says so.** The clearest case: the vendor documents deleting
+the vendor `su` as the way to finish an Android 12 root, and the clean-room reference automates that
+with a hash check and a private mount namespace. **This toolkit does not do that.** It detects the
+same failure, restores the vendor root, and reports `ROOT_AFTER_DISABLE_ROLLED_BACK` rather than
+claiming a result it has not earned. See [Limitations](#limitations).
 
 ## License and attribution
 
