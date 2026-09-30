@@ -114,7 +114,7 @@ function New-MuMuInstance {
         return New-ToolkitInstanceFailure -Journal $null -Message 'The create journal is invalid.'
     }
     if (-not $Confirmed) {
-        return New-ToolkitInstanceFailure -Journal $Journal -Message 'Creating a MuMu instance requires an explicit confirmation. Rerun it with -Confirmed. No instance was created.'
+        return New-ToolkitInstanceFailure -Journal $Journal -Message 'Creating a MuMu instance requires an explicit confirmation. Rerun it with -Confirmed. No instance was created.' -Code 'USER_CONFIRMATION_REQUIRED'
     }
     if ($Count -ne 1) {
         return New-ToolkitInstanceFailure -Journal $Journal -Message 'Exactly one instance can be created at a time, so no instance was created.'
@@ -283,7 +283,7 @@ function Select-ToolkitTarget {
         return New-ToolkitInstanceFailure -Journal $Journal -Message 'The target mode must be Identify, Create, or Clone, so no instance was created or changed.'
     }
     if (-not $Confirmed -and $Mode -cne 'Identify') {
-        return New-ToolkitInstanceFailure -Journal $Journal -Message "The $Mode target mode requires an explicit confirmation. Rerun it with -Confirmed. No instance was created or changed."
+        return New-ToolkitInstanceFailure -Journal $Journal -Message "The $Mode target mode requires an explicit confirmation. Rerun it with -Confirmed. No instance was created or changed." -Code 'USER_CONFIRMATION_REQUIRED'
     }
 
     $managerPath = [string](Get-ToolkitFirstProperty -InputObject $Install -PropertyNames @('ManagerPath'))

@@ -11026,6 +11026,9 @@ function Invoke-TargetTests {
         Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerCreate.State).Count "A refused noninteractive controller create reached a mutating manager command: $(@(Get-TargetManagerCommands -State $controllerCreate.State) -join '|')"
         $nonInteractiveClone = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClone.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Clone' -SourceIndex 3 -Runner (New-SafetyManagerRunner -State $controllerClone.State)
         Assert-Equal 'CriticalError' $nonInteractiveClone.Status 'A noninteractive clone target run without a confirmation was accepted.'
+        # A refusal a caller can retry has to carry a code, or a script cannot tell "you forgot a flag"
+        # apart from "this instance cannot be worked on" and has to match on the message text instead.
+        Assert-Equal 'USER_CONFIRMATION_REQUIRED' ([string]$nonInteractiveClone.Data.Code) 'A refused clone carries no code, so a caller cannot detect that it only needs a flag.'
         Assert-Equal 0 @(Get-TargetMutatingCommands -State $controllerClone.State).Count "A refused noninteractive controller clone reached a mutating manager command: $(@(Get-TargetManagerCommands -State $controllerClone.State) -join '|')"
         $nonInteractiveCloneSource = Invoke-ToolkitAction -Action 'Target' -InstallRoot $controllerClone.Install.InstallRoot -StateRoot $controllerStateRoot -Mode 'Clone' -Confirmed -Runner (New-SafetyManagerRunner -State $controllerClone.State)
         Assert-Equal 'CriticalError' $nonInteractiveCloneSource.Status 'A noninteractive clone target run without an explicit source was accepted.'

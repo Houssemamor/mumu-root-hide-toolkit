@@ -569,14 +569,23 @@ function Measure-MuMuInstanceDiskBytes {
 function New-ToolkitInstanceFailure {
     param(
         [object]$Journal,
-        [string]$Message
+        [string]$Message,
+        # A code is optional here, and that is a deliberate gap rather than an oversight: most of the
+        # instance refusals name a specific precondition in the message itself. The ones a caller cannot
+        # act on without a code carry USER_CONFIRMATION_REQUIRED, so a script can tell "you forgot a flag"
+        # apart from "this instance cannot be worked on".
+        [string]$Code = ''
     )
 
     $message = Protect-ToolkitText $Message
     if ([string]::IsNullOrWhiteSpace($message)) {
         $message = 'The instance operation failed.'
     }
-    $result = Get-ToolkitResult -Status 'CriticalError' -Message $message
+    $data = $null
+    if (-not [string]::IsNullOrWhiteSpace($Code)) {
+        $data = @{ Code = $Code }
+    }
+    $result = Get-ToolkitResult -Status 'CriticalError' -Message $message -Data $data
     if ($null -eq $Journal) {
         return $result
     }
