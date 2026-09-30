@@ -21,16 +21,16 @@ tool, and it is not uniform.
 
 | Action | Proven on real hardware | Result on this host |
 | --- | --- | --- |
-| `Detect` | yes | reports installations and instances correctly |
-| `Verify` | yes | the read-only report renders every field it collects |
-| `Target` | yes | all three modes were exercised: `Identify` read-only, `Create` added instance 3, `Clone` added instance 4 |
+| `Detect` | yes | reports installations and instances correctly, and refuses an ambiguous selection rather than guessing |
+| `Verify` | yes | the read-only report renders every field, and on a running guest it reads a real root state rather than an unreachable one |
+| `Target` | yes | all three modes were exercised: `Identify` read-only on instances 0 and 2, `Create` added instances 1 and 3, `Clone` added instances 4 and 5 |
 | `Root12` | yes, with a caveat | reports `Warning` with `ROOT_AFTER_DISABLE_ROLLED_BACK` and keeps the MuMu vendor root enabled |
-| `Root15` | **no** | unqualified. The live run produced a clone that inherited Kitsune, so no built-in-KernelSU target was ever verified |
+| `Root15` | yes, with a caveat | **qualified.** Clone 4 returned `RootVerified=true` with `KernelSU = v3.2.5` and `KitsuneAbsent = True`. The caveat is the one step a person has to take: KernelSU grants nothing until superuser is given to the ADB shell |
 | `Conceal` | **no** | unqualified. The Vector module install has not succeeded on a live clone, and the target package is not installed on it |
 | `RemoveAds` | **no** | wrote nothing. There is no campaign file anywhere in the Chinese-edition installation |
 | `Restore` | **no** | nothing to restore, because nothing was suppressed |
 
-Three things the table does not say on its own:
+Four things the table does not say on its own:
 
 - **`Root12` leaves MuMu's vendor root doing the work, not Kitsune's.** Disabling the vendor root on
   MuMu 6.8 removes the Kitsune `su` path, so the toolkit turns the vendor root back on and reports
@@ -38,6 +38,10 @@ Three things the table does not say on its own:
   rollback; it does not mean the Kitsune root survived on its own.
 - **`Root12` has no noninteractive path at all.** It is menu-only, so the one Android 12 action that
   is proven cannot be automated from a script.
+- **`Root15` needs a person, once.** The first run stops at `ROOT_PERMISSION_PENDING` with a handoff,
+  because KernelSU is allowlist based and nothing is permitted until you grant it. After the grant the
+  same clone resumes and verifies. That is a documented step, not a defect, but it does mean `Root15`
+  cannot be fully unattended.
 - **A clone is a new instance, not a copy of your data.** Apps installed on your original are not
   necessarily installed on the clone. That is one of the two documented reasons concealment is
   unqualified on this host; the other is the Vector install, which installing the app will not fix.
@@ -619,7 +623,7 @@ installation and the manager (`Install.*`, `ManagerVersion`), every instance the
   Guest.KernelSU = none
   Guest.DaemonCount = not-detected
   Guest.HmaInstalled = not-detected
-  Guest.VectorModuleInstalled = False
+  Guest.VectorModuleInstalled = not-detected
   Ads.RestorePoint = Missing
   Backups.CloneIndex = not-detected
   Backups.CloneName = none
@@ -638,8 +642,14 @@ installation and the manager (`Install.*`, `ManagerVersion`), every instance the
   JournalOperation = none
   JournalId = none
   Failures:
-    Failure 1 = The Kitsune package query failed. The installed package list could not be read.
+    Failure 1 = The Kitsune package query failed. The installed package list could not be read. The guest did not say whether /data/adb/modules/zygisk_vector exists, so the Vector module state is unknown: 
 ```
+
+That last line is worth reading rather than skipping. The guest is **stopped**, so it could not be
+asked anything, and the report says so for two separate probes rather than reporting what it did not
+find. `Guest.VectorModuleInstalled` is `not-detected` and not `False`, because a guest that could not
+look has not said the module is absent. An earlier version of this document printed `False` there,
+which was a claim about a module nobody had been able to check.
 
 Two details are worth reading rather than skimming:
 
@@ -871,12 +881,26 @@ Because that change is not reversible through the toolkit, `Root15` requires exp
 The menu asks you to type `CONFIRM`; the command line requires `-Confirmed`. Without it the action
 changes nothing and reports `USER_CONFIRMATION_REQUIRED`.
 
-Android 15 is **not qualified on this host yet.** The live run created clone 4 from an Android 15
-instance and recorded `KernelSU = v3.2.5`, `KitsuneAbsent = True`, `RootPermission = True`,
-`RootShell = False`. That result **supersedes** an earlier claim in this document that an Android 15
-clone inherits Kitsune: it did not, and the blocker is the allowlist grant above rather than an
-inherited package. The run is still unqualified because the superuser grant has not been made yet, so
-no Android 15 root has ever been verified end to end on this host.
+Android 15 **is qualified on this host**, with the superuser grant above as its one manual step. The
+live run created clone 4 from an Android 15 instance and, after the grant, the resumed run reported
+`[AlreadyApplied] ... built-in KernelSU package, root shell, and absent Kitsune package are verified`,
+with `Code = OK`, `RootShell = True`, and `Step = complete`.
+
+The read-only check agrees, and the guest itself confirms it independently of this toolkit:
+
+```text
+su -c id  ->  uid=0(root) gid=0(root) groups=0(root) context=u:r:ksu:s0
+id         ->  uid=2000(shell) gid=2000(shell) groups=2000(shell) ...
+which su   ->  /system/bin/su
+```
+
+The `u:r:ksu:s0` context is the part worth reading: it is the SELinux label KernelSU gives its own
+root shell, so this is KernelSU and not MuMu's vendor root. The `id` line is the other half. The adb
+shell stays `uid=2000`, exactly as documented, because root comes from `su` and not from the shell.
+
+This result **supersedes** an earlier claim in this document that an Android 15 clone inherits
+Kitsune. It does not: the run recorded `KitsuneAbsent = True` alongside `KernelSU = v3.2.5`, and the
+blocker was the allowlist grant rather than an inherited package.
 
 ## Concealment scope
 
@@ -939,14 +963,20 @@ are the parts this toolkit can verify from observation. That result is also carr
 `Verify` report, so it is not a claim you have to take on trust.
 
 **Concealment is unqualified on this host, for two independent reasons, and both are visible in the
-`Verify` report.** The pinned Vector module was **not installed**: the live dependency step on clone 4
-stopped with `MODULE_LAYOUT_UNSUPPORTED` before the move, so the HMA artifact was installed and
-verified while the Vector artifact was not installed at all. Separately, the selected app
-`jp.pokemon.pokemontcgp` is not installed on the live clone 4, so the action refuses it with
-`PACKAGE_NOT_INSTALLED` and no concealment scope is applied. No artifact is invented for a package
-that is absent; install the app on the clone yourself, or select apps that are installed, before
-concealment can be called qualified. The Vector install path has been exercised only by fixtures,
-and the flat-archive gate for the pinned v2.2 asset has not been run against a live clone.
+`Verify` report.** The pinned Vector module was **not installed**: in the earlier Android 12
+concealment run, the dependency step on that run's clone 4 stopped with `MODULE_LAYOUT_UNSUPPORTED`
+before the move, so the HMA artifact was installed and verified while the Vector artifact was not
+installed at all. Separately, the selected app `jp.pokemon.pokemontcgp` is not installed on that
+clone, so the action refuses it with `PACKAGE_NOT_INSTALLED` and no concealment scope is applied. No
+artifact is invented for a package that is absent; install the app on the clone yourself, or select
+apps that are installed, before concealment can be called qualified. The Vector install path has been
+exercised only by fixtures, and the flat-archive gate for the pinned v2.2 asset has not been run
+against a live clone.
+
+That clone 4 was an **Android 12** clone and it no longer exists. A later Android 15 run also produced
+a clone 4, which is the qualified KernelSU clone described under
+[Android 15](#android-15-built-in-root-and-explicit-confirmation); the two are different instances on
+different Android versions and only the Android 12 one is the subject of this paragraph.
 
 ## What a Magisk module is here, and why one is installed
 
@@ -1244,12 +1274,18 @@ These are the honest limits of the current state of the code.
   Kitsune `su` path is `/system/bin/su` and disabling the vendor root removes it while the adb shell
   stays `uid=2000`, so the retained vendor root is the working state, not a leftover. The retained
   vendor root is recorded in the journal and in the result.
-- Android 15 is unqualified. The live run produced a clone that inherited Kitsune, so clone 5
-  carries `io.github.huskydg.magisk` and has no built-in KernelSU target. `Root15` reports
-  `KITSUNE_PRESENT` for it, and a source instance that already carries Kitsune cannot be qualified.
+- Android 15 is qualified on this build, with one manual step. Clone 4 of the Android 15 run reported
+  `Code = OK`, `RootShell = True`, `KernelSUVersion = v3.2.5`, and `KitsuneAbsent = True`, and the guest
+  answers `su -c id` with `uid=0(root) ... context=u:r:ksu:s0`. The step a person has to take is the
+  KernelSU superuser grant described under
+  [Android 15](#android-15-built-in-root-and-explicit-confirmation); without it the first run stops at
+  `ROOT_PERMISSION_PENDING` and says so. A source instance that already carries the Kitsune package
+  still cannot be qualified, because `Root15` reports `KITSUNE_PRESENT` for it.
 - Concealment is unqualified, for two independent reasons: the Vector module install has not
-  succeeded on a live clone, and the target package `jp.pokemon.pokemontcgp` is not installed on
-  clone 4. Both are stated in full under [Concealment scope](#concealment-scope).
+  succeeded on a live clone, and the target package `jp.pokemon.pokemontcgp` is not installed on the
+  Android 12 clone 4 of the earlier concealment run. Both are stated in full under
+  [Concealment scope](#concealment-scope). Note that two different runs both produced a clone 4: the
+  concealment run below and the Android 15 run above, on different Android versions.
 - `RemoveAds` was a no-op on this host. There is no campaign file anywhere in the Chinese-edition
   installation, so the action reported success with an empty path set and wrote nothing. That is a
   fact about this installation, not evidence that the advertisement logic works.

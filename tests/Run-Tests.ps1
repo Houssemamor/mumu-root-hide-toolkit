@@ -11463,9 +11463,13 @@ function Invoke-DocsTests {
             @{ Pattern = '(?is)Android 12.{0,200}?\bqualified\b'; Message = 'README does not state that Android 12 is qualified.' }
             @{ Pattern = '(?i)retained vendor root'; Message = 'README does not state that the Android 12 qualification retained the vendor root.' }
             @{ Pattern = '(?i)Chinese[- ]edition MuMu 6\.8\.0\.0'; Message = 'README does not scope the live results to the Chinese-edition MuMu 6.8.0.0 build.' }
-            @{ Pattern = '(?is)Android 15.{0,200}?\bunqualified\b'; Message = 'README does not state that Android 15 is unqualified.' }
-            @{ Pattern = '(?i)inherited.{0,80}Kitsune'; Message = 'README does not state that the Android 15 clone inherited Kitsune.' }
-            @{ Pattern = '(?i)clone 5'; Message = 'README does not name the Android 15 clone index.' }
+            @{ Pattern = '(?i)Android 15 is qualified on this build'; Message = 'README does not state that Android 15 is qualified.' }
+            @{ Pattern = 'KitsuneAbsent = True'; Message = 'README does not record the live Android 15 Kitsune absence.' }
+            @{ Pattern = 'RootShell = True'; Message = 'README does not record the verified Android 15 root shell.' }
+            @{ Pattern = 'u:r:ksu:s0'; Message = 'README does not record the guest evidence that the Android 15 root is KernelSU and not the vendor root.' }
+            @{ Pattern = '(?i)ROOT_PERMISSION_PENDING'; Message = 'README does not state the code that reports the outstanding superuser grant.' }
+            @{ Pattern = '(?i)supersedes'; Message = 'README does not record that the Kitsune-inheritance claim was superseded.' }
+            @{ Pattern = '(?i)clone 4'; Message = 'README does not name the concealment clone index.' }
             @{ Pattern = '(?is)concealment.{0,200}?\bunqualified\b'; Message = 'README does not state that concealment is unqualified.' }
             @{ Pattern = 'jp\.pokemon\.pokemontcgp'; Message = 'README does not name the concealment target package.' }
             @{ Pattern = '(?i)clone 4'; Message = 'README does not name the concealment clone index.' }
@@ -11569,6 +11573,10 @@ function Invoke-DocsTests {
     Assert-True ($verifySectionText -match '(?m)^\s*Instance 0 \| Base \| Android 12\.0 \|') 'The Verify capture does not name the instance the live run reported.'
     Assert-True ($verifySectionText -match '(?m)^\s*Guest\.Code = ADB_FAILED\s*$') 'The Verify capture does not report the ADB failure the live run recorded.'
     Assert-True ($verifySectionText -match '(?m)^\s*JournalState = None\s*$') 'The Verify capture does not report the absent journal state the live run recorded.'
+    # The captured report has to carry the not-detected reading and the reason for it, or it is a capture
+    # of the older behaviour that reported an unlooked-at module as absent.
+    Assert-True ($verifySectionText -match '(?m)^\s*Guest\.VectorModuleInstalled = not-detected\s*$') 'The Verify capture reports the Vector module as absent on a guest that could not look.'
+    Assert-True ($verifySectionText -match 'did not say whether /data/adb/modules/zygisk_vector exists') 'The Verify capture does not carry the reason the Vector module state is unknown.'
 
 
     # The captured screens in the README are the renderer's output, so a change to the renderer has to
