@@ -308,15 +308,20 @@ function Enable-Android15Root {
         # and keeps the clone, the journal and the exit code honest about what a person still has to do.
         # Converting it to a critical error would fail a run that stopped exactly where it was told to stop.
         if ([string]$checks.Status -ceq 'Warning') {
+            # The state is rebuilt with the clone identity rather than passed through, because a result that
+            # names a clone in its message and reports CloneIndex = -1 cannot be resumed and cannot be read
+            # by a caller. The handoff is reattached afterwards because it is not a state field.
+            $pendingState = New-Android15RootState -Code ([string]$checks.Data.Code) -Fields $checks.Data -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName
+            $pendingState['Handoff'] = @($script:Root15HandoffSteps)
             $pendingMessage = "The built-in Android 15 root is enabled on the clone at index $cloneIndex and its KernelSU package is verified, but no root shell is visible until superuser is granted. $($checks.Message)"
             try {
-                Write-JournalEvent -Journal $Journal -Level 'Warning' -Message $pendingMessage -Data $checks.Data
-                Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Warning' -Message $pendingMessage -Data $checks.Data)
+                Write-JournalEvent -Journal $Journal -Level 'Warning' -Message $pendingMessage -Data $pendingState
+                Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Warning' -Message $pendingMessage -Data $pendingState)
             }
             catch {
                 return New-ToolkitRootFailure -Journal $Journal -Message 'The pending-superuser Android 15 result could not be journaled.' -Data (New-Android15RootState -Code 'JOURNAL_WRITE_FAILED' -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
             }
-            return Get-ToolkitResult -Status 'Warning' -Message $pendingMessage -Data $checks.Data
+            return Get-ToolkitResult -Status 'Warning' -Message $pendingMessage -Data $pendingState
         }
         return New-ToolkitRootFailure -Journal $Journal -Message $checks.Message -Data (New-Android15RootState -Code ([string]$checks.Data.Code) -Fields $checks.Data -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }

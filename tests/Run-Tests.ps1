@@ -6376,6 +6376,13 @@ function Invoke-Root15Tests {
         Assert-Equal 'ROOT_PERMISSION_PENDING' ([string]$pendingCase.Result.Data.Code) 'The pending superuser grant does not report its own code.'
         Assert-True ((@($pendingCase.Result.Data.Handoff) -join ' ') -match '(?i)KernelSU manager') 'The action result carries no handoff for the pending superuser grant.'
         Assert-Equal 'Completed' $pendingCase.Journal.State 'A pending superuser grant failed the operation journal instead of completing it.'
+        # The message names the clone, so the data has to name it too. A result that says "the clone at
+        # index 3" and then reports CloneIndex = -1 cannot be resumed and cannot be read by a caller.
+        Assert-True ($pendingCase.Result.Message -match ('index ' + [string]$pendingState.CloneIndex)) "The pending message does not name the clone it is about: $($pendingCase.Result.Message)"
+        Assert-Equal $pendingState.CloneIndex ([int]$pendingCase.Result.Data.CloneIndex) 'The pending result does not carry the clone index its message names.'
+        Assert-True (-not [string]::IsNullOrWhiteSpace([string]$pendingCase.Result.Data.CloneName)) 'The pending result does not carry the clone name its message names.'
+        Assert-Equal $install.SourceIndex ([int]$pendingCase.Result.Data.SourceIndex) 'The pending result does not carry the source instance it worked from.'
+        Assert-Equal 'verification' ([string]$pendingCase.Result.Data.Step) 'The pending result does not record the step it stopped at.'
         # The vendor root is left enabled on the clone, which is the documented end state for this workflow,
         # so a resumed run does not have to toggle it again.
         Assert-Equal 1 @(Get-Root15Calls -State $pendingState -Pattern '*root_permission*true*').Count 'The pending superuser grant did not enable the vendor root on the clone exactly once.'
