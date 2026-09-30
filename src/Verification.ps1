@@ -260,6 +260,45 @@ function Get-ToolkitRootShellStatus {
     return Get-ToolkitResult -Status 'CriticalError' -Message 'The root shell did not return a root identity.' -Data (@{ Code = 'ROOT_DENIED' })
 }
 
+# The canonical probe is "su -c id". A guest can carry a working Magisk root whose su is not on the PATH,
+# where only "magisk su" resolves and a single probe reports a live root as absent. The fallbacks are
+# tried only when the canonical probe says the binary is missing, never when it answers without a root
+# identity, because that answer is a denial and must not be retried into a success.
+$script:ToolkitRootShellProbes = @('shell su -c id', 'shell magisk su -c id', 'shell /system/bin/magisk su -c id')
+
+# Runs the probe sequence and classifies it. The canonical probe is the only verdict that stands on its
+# own: a fallback can promote the result to a success by proving a root, but it can never replace the
+# canonical failure with one of its own. A guest without su returns "not found" from every probe in a
+# slightly different shape, and letting the last fallback's wording decide produced ROOT_DENIED for a
+# guest that simply has no su, which is a different claim.
+function Invoke-ToolkitRootShellProbe {
+    param(
+        [string]$ManagerPath,
+        [int]$InstanceIndex,
+        [scriptblock]$Runner = $null
+    )
+
+    $canonicalCommand = $script:ToolkitRootShellProbes[0]
+    $canonicalCall = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command $canonicalCommand -Runner $Runner
+    $canonicalStatus = Get-ToolkitRootShellStatus -Call $canonicalCall
+    if ([string]$canonicalStatus.Status -ceq 'Success') {
+        return $canonicalStatus
+    }
+    if ([string](Get-ToolkitRecordValue -Record $canonicalStatus.Data -PropertyNames @('Code')) -cne 'ROOT_UNAVAILABLE') {
+        return $canonicalStatus
+    }
+    foreach ($command in @($script:ToolkitRootShellProbes | Select-Object -Skip 1)) {
+        $call = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command $command -Runner $Runner
+        $status = Get-ToolkitRootShellStatus -Call $call
+        if ([string]$status.Status -ceq 'Success') {
+            # A fallback answered, so the guest does have a root and the canonical probe simply could not
+            # see it. The probe that answered is named so the result is auditable rather than a bare pass.
+            return Get-ToolkitResult -Status 'Success' -Message ('The root shell returned a root identity through ' + $command + ', which is the fallback probe. The canonical probe reported no su on the PATH.') -Data (@{ Code = 'OK'; RootShell = $true; Probe = $command })
+        }
+    }
+    return $canonicalStatus
+}
+
 function New-ToolkitRootFailure {
     param(
         [object]$Journal,

@@ -94,8 +94,7 @@ function Test-Android15Root {
     }
     $fields['KitsuneAbsent'] = $true
 
-    $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
-    $rootShell = Get-ToolkitRootShellStatus -Call $rootCall
+    $rootShell = Invoke-ToolkitRootShellProbe -ManagerPath $manager -InstanceIndex $InstanceIndex -Runner $Runner
     if ($rootShell.Status -ne 'Success') {
         return Get-ToolkitResult -Status 'CriticalError' -Message ('The built-in root shell could not be verified. ' + $rootShell.Message) -Data (New-Android15RootState -Code ([string]$rootShell.Data.Code) -Fields $fields)
     }

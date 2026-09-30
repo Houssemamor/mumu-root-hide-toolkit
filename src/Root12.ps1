@@ -368,8 +368,7 @@ function Test-Android12Root {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The Kitsune root daemon query failed.' -Data (@{ Code = 'ADB_FAILED'; DaemonCount = -1; DaemonSamples = $daemonSamples })
     }
 
-    $rootCall = Invoke-ToolkitManagerAdb -ManagerPath $manager -InstanceIndex $InstanceIndex -Command 'shell su -c id' -Runner $Runner
-    $rootShell = Get-ToolkitRootShellStatus -Call $rootCall
+    $rootShell = Invoke-ToolkitRootShellProbe -ManagerPath $manager -InstanceIndex $InstanceIndex -Runner $Runner
     if ($rootShell.Status -ne 'Success') {
         return Get-ToolkitResult -Status 'CriticalError' -Message ('The Kitsune root shell could not be verified. ' + $rootShell.Message) -Data @{
                 Code = [string]$rootShell.Data.Code

@@ -6740,12 +6740,73 @@ function Invoke-Root15Tests {
 }
 
 function Invoke-VerificationTests {
-    foreach ($commandName in @('Invoke-ToolkitManagerAdb', 'Wait-ToolkitBootCompleted', 'Get-ToolkitRootSetting', 'Get-ToolkitPackageVersion', 'Get-ToolkitRootShellStatus', 'New-ToolkitRootFailure')) {
+    foreach ($commandName in @('Invoke-ToolkitManagerAdb', 'Wait-ToolkitBootCompleted', 'Get-ToolkitRootSetting', 'Get-ToolkitPackageVersion', 'Get-ToolkitRootShellStatus', 'Invoke-ToolkitRootShellProbe', 'New-ToolkitRootFailure')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Shared verification command is unavailable: $commandName"
     }
     Assert-True (Test-Path -LiteralPath $verificationScriptPath -PathType Leaf) 'src/Verification.ps1 does not exist.'
     Assert-True (Test-Path -LiteralPath $root12ScriptPath -PathType Leaf) 'src/Root12.ps1 does not exist.'
     Assert-True (Test-Path -LiteralPath $root15ScriptPath -PathType Leaf) 'src/Root15.ps1 does not exist.'
+
+    # A guest can carry a working Magisk root whose su is not on the PATH, where only "magisk su"
+    # resolves. A single canonical probe reports that live root as absent, so the probe sequence asks the
+    # fallback questions when, and only when, the canonical probe says the binary is missing.
+    $probeState = @{ Answers = @{}; Calls = @() }
+    $probeRunner = {
+        param($ActualFilePath, $ActualArgumentList)
+
+        $command = @($ActualArgumentList) -join ' '
+        foreach ($pair in $probeState.Answers.Keys) {
+            if ($command -like ('*' + $pair + '*')) {
+                $probeState.Calls += $command
+                return [pscustomobject]@{ ExitCode = [int]$probeState.Answers[$pair][0]; Text = [string]$probeState.Answers[$pair][1] }
+            }
+        }
+        return [pscustomobject]@{ ExitCode = 1; Text = 'probe fixture: unsupported request' }
+    }.GetNewClosure()
+
+    $rootText = 'uid=0(root) gid=0(root) groups=0(root)'
+    $shellText = 'uid=2000(shell) gid=2000(shell) groups=2000(shell)'
+    $missingText = '/system/bin/sh: su: not found'
+
+    # The keys carry the adb -c prefix so each probe matches exactly one command: a bare "su -c id" would
+    # also match "magisk su -c id" as a substring and every probe would answer the same way.
+    $probeState.Answers = @{ '-c shell su -c id' = @(0, $rootText) }
+    $probeState.Calls = @()
+    $canonicalProbe = Invoke-ToolkitRootShellProbe -ManagerPath 'MuMuManager.exe' -InstanceIndex 0 -Runner $probeRunner
+    Assert-Equal 'Success' ([string]$canonicalProbe.Status) "A guest that answered the canonical probe was not accepted: $($canonicalProbe.Message)"
+    Assert-Equal 1 $probeState.Calls.Count 'A guest that answered the canonical probe was asked a fallback question anyway.'
+
+    $probeState.Answers = @{ '-c shell su -c id' = @(127, $missingText); '-c shell magisk su -c id' = @(0, $rootText) }
+    $probeState.Calls = @()
+    $fallbackProbe = Invoke-ToolkitRootShellProbe -ManagerPath 'MuMuManager.exe' -InstanceIndex 0 -Runner $probeRunner
+    Assert-Equal 'Success' ([string]$fallbackProbe.Status) "A guest whose su is off the PATH but whose magisk su answers was reported as having no root: $($fallbackProbe.Message)"
+    Assert-True ([string]$fallbackProbe.Data.Probe -match 'magisk su') 'A root found through the fallback does not name the probe that found it.'
+    Assert-True ($fallbackProbe.Message -match '(?i)fallback probe') 'A root found through the fallback is reported as if the canonical probe had found it.'
+
+    # Every probe in the sequence answers the same way here, so the whole sequence is exhausted and the
+    # canonical code is what the caller is left with.
+    $probeState.Answers = @{}
+    foreach ($probeCommand in $script:ToolkitRootShellProbes) { $probeState.Answers[('-c ' + $probeCommand)] = @(127, $missingText) }
+    $probeState.Calls = @()
+    $absentProbe = Invoke-ToolkitRootShellProbe -ManagerPath 'MuMuManager.exe' -InstanceIndex 0 -Runner $probeRunner
+    Assert-Equal 'CriticalError' ([string]$absentProbe.Status) 'A guest with no su at all was reported as rooted.'
+    Assert-Equal 'ROOT_UNAVAILABLE' ([string]$absentProbe.Data.Code) 'A guest with no su at all does not report ROOT_UNAVAILABLE.'
+    Assert-Equal $script:ToolkitRootShellProbes.Count $probeState.Calls.Count 'A guest with no su at all was not asked every probe in the sequence.'
+
+    # The safety property: a probe that answers without a root identity is a denial, and a denial must
+    # never be retried into a success by a fallback that would answer.
+    $probeState.Answers = @{ '-c shell su -c id' = @(0, $shellText); '-c shell magisk su -c id' = @(0, $rootText) }
+    $probeState.Calls = @()
+    $deniedProbe = Invoke-ToolkitRootShellProbe -ManagerPath 'MuMuManager.exe' -InstanceIndex 0 -Runner $probeRunner
+    Assert-Equal 'CriticalError' ([string]$deniedProbe.Status) 'A denied root shell was retried into a success by the fallback probe.'
+    Assert-Equal 'ROOT_DENIED' ([string]$deniedProbe.Data.Code) 'A denied root shell does not report ROOT_DENIED.'
+    Assert-Equal 1 $probeState.Calls.Count 'A denied root shell was asked a fallback question, so a denial can be retried into a success.'
+
+    $probeState.Answers = @{ '-c shell su -c id' = @(-1, '') }
+    $probeState.Calls = @()
+    $failedProbe = Invoke-ToolkitRootShellProbe -ManagerPath 'MuMuManager.exe' -InstanceIndex 0 -Runner $probeRunner
+    Assert-Equal 'ADB_FAILED' ([string]$failedProbe.Data.Code) 'A root probe that could not be executed is not reported as an unreadable guest.'
+    Assert-Equal 1 $probeState.Calls.Count 'A root probe that could not be executed was asked a fallback question.'
 
     $verificationSource = [IO.File]::ReadAllText($verificationScriptPath)
     Assert-True ($verificationSource -notmatch "(?i)Code\s*=\s*'UNKNOWN'") 'The shared verification source reports an UNKNOWN failure code.'
