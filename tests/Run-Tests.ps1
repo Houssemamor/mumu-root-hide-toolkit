@@ -8648,7 +8648,9 @@ function Get-MenuGuestResponses {
     }
     if ($LegacyVectorModule) {
         # A guest that still carries only the legacy module directory must not be read as the pinned module.
-        $responses.Remove('ls /data/adb/modules/zygisk_vector')
+        # A real guest without the pinned directory says so, rather than answering with nothing, so the
+        # fixture says it too: an answer with no wording is a guest that did not look, not an absence.
+        $responses['ls /data/adb/modules/zygisk_vector'] = @(1, 'ls: /data/adb/modules/zygisk_vector: No such file or directory')
         $responses['ls /data/adb/modules/vector'] = @(0, 'vector')
     }
     if ($NoPackageList) {
@@ -9277,9 +9279,9 @@ function Invoke-MenuTests {
         Assert-Equal 'Unverified' $unrootedReport.Guest.Root 'The report did not report an unverified root.'
         Assert-Equal '' $unrootedReport.Guest.Kitsune 'The report invented a Kitsune package version.'
         Assert-Equal $null $unrootedReport.Guest.HmaInstalled 'A package list the guest never answered was reported as an absent Hide My Applist package.'
-        # The guest answered the module probe with a refusal, and a refusal is the guest reporting the
-        # pinned module directory is not there.
-        Assert-Equal $false $unrootedReport.Guest.VectorModuleInstalled 'A guest that refused the Vector module probe was not reported as an absent module.'
+        # The fixture answers this probe with a non-zero status and no guest wording. That is a guest that
+        # did not look, not a guest reporting the directory is absent, so the state is unknown.
+        Assert-Equal $null $unrootedReport.Guest.VectorModuleInstalled 'A guest that did not look for the Vector module was reported as an absent module.'
         Assert-True (@($unrootedReport.Failures).Count -ge 1) 'The report did not record its unreadable guest sections.'
         Assert-Equal 'None' $unrootedReport.JournalState 'The report invented a journal state without a journal.'
         Assert-Equal 0 $unrootedReport.Mutated 'The unverified report claims a mutation.'
@@ -9298,6 +9300,47 @@ function Invoke-MenuTests {
         $unreadableModuleLines = @(Format-ToolkitReport -Report $unreadableModuleReport)
         Assert-True ((@($unreadableModuleLines) -join "`n") -match 'Guest\.VectorModuleInstalled = not-detected') "An unreadable Vector module probe did not print not-detected: $(@($unreadableModuleLines) -join ' ')"
         Assert-True (@($unreadableModuleReport.Failures).Count -ge 1) 'An unreadable Vector module probe did not record a failure.'
+
+        # Only the guest saying the path is not there is an absence. A stopped instance answers with
+        # nothing, a guest with no su answers that su is missing, and a refused read answers that, so any
+        # of them is a guest that did not look rather than a guest reporting the module is not installed.
+        $deniedModuleResponses = Get-MenuGuestResponses
+        $deniedModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(1, 'ls: /data/adb/modules/zygisk_vector: Permission denied')
+        $deniedModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $deniedModuleResponses)
+        Assert-Equal $null $deniedModuleReport.Guest.VectorModuleInstalled 'A guest that refused the Vector module probe was reported as an absent module.'
+        $deniedModuleLines = @(Format-ToolkitReport -Report $deniedModuleReport)
+        Assert-True ((@($deniedModuleLines) -join "`n") -match 'Guest\.VectorModuleInstalled = not-detected') "A refused Vector module probe did not print not-detected: $(@($deniedModuleLines) -join ' ')"
+        Assert-True ((@($deniedModuleReport.Failures) -join '|') -match '(?i)unknown') "A refused Vector module probe did not record why the state is unknown: $(@($deniedModuleReport.Failures) -join '|')"
+
+        $silentModuleResponses = Get-MenuGuestResponses
+        $silentModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(1, '')
+        $silentModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $silentModuleResponses)
+        Assert-Equal $null $silentModuleReport.Guest.VectorModuleInstalled 'A guest that answered nothing was reported as an absent module, which is what a stopped instance looks like.'
+
+        $noSuModuleResponses = Get-MenuGuestResponses
+        $noSuModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(1, '/system/bin/sh: su: inaccessible or not found')
+        $noSuModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $noSuModuleResponses)
+        Assert-Equal $null $noSuModuleReport.Guest.VectorModuleInstalled 'A guest whose root has no su was reported as an absent Vector module.'
+
+        $absentModuleResponses = Get-MenuGuestResponses
+        $absentModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(1, 'ls: /data/adb/modules/zygisk_vector: No such file or directory')
+        $absentModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $absentModuleResponses)
+        Assert-Equal $false $absentModuleReport.Guest.VectorModuleInstalled 'A guest that said the module path does not exist was not reported as an absent module.'
+
+        # A module directory is not a loaded module: the root implementation keeps a disabled module in
+        # place and skips it at boot, so a present module that carries the disable marker is reported as a
+        # failure rather than counted as concealment that is working.
+        $disabledModuleResponses = Get-MenuGuestResponses
+        $newline = [Environment]::NewLine
+        $disabledModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(0, ('module.prop' + $newline + 'disable' + $newline + 'zygisk_vector.so'))
+        $disabledModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $disabledModuleResponses)
+        Assert-Equal $true $disabledModuleReport.Guest.VectorModuleInstalled 'A disabled Vector module is not reported as present, which is true and not the point.'
+        Assert-True ((@($disabledModuleReport.Failures) -join '|') -match '(?i)disable marker') "A disabled Vector module was reported as working concealment: $(@($disabledModuleReport.Failures) -join '|')"
+        $enabledModuleResponses = Get-MenuGuestResponses
+        $enabledModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(0, ('module.prop' + $newline + 'zygisk_vector.so'))
+        $enabledModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $enabledModuleResponses)
+        Assert-Equal $true $enabledModuleReport.Guest.VectorModuleInstalled 'An enabled Vector module is not reported as present.'
+        Assert-True ((@($enabledModuleReport.Failures) -join '|') -notmatch '(?i)disable marker') "An enabled Vector module was reported as disabled: $(@($enabledModuleReport.Failures) -join '|')"
 
         # The Hide My Applist presence field answers true, false, or not at all, because a package list
         # the guest never answered is not a guest that reported the package absent.
@@ -11541,6 +11584,20 @@ function Invoke-DocsTests {
     # The names are replaced, so the document has to say so. A capture with the names swapped and no note
     # about it reads as verbatim output, which is the claim this suite exists to keep honest.
     Assert-True ($menuSection.Value -match '(?i)instance names have been replaced') 'The interactive menu section does not say the instance names in the captures are replaced.'
+
+    $moduleSection = [regex]::Match($readme, '(?ms)^## What a Magisk module is here.*?(?=^## )')
+    Assert-True $moduleSection.Success 'README has no Magisk module section.'
+    # A Vector directory is not a loaded module, and the three ways the report can be wrong about that are
+    # each stated. A reader who only sees "installed" would believe concealment is working when it is not.
+    foreach ($moduleStatement in @(
+            @{ Pattern = '(?i)directory listing, not proof the module is working'; Message = 'The Magisk module section does not say that a Vector directory is not proof the module is working.' }
+            @{ Pattern = '(?i)disable` marker'; Message = 'The Magisk module section does not say that a disabled module is present but not loaded.' }
+            @{ Pattern = '(?i)refuses\*\* the read'; Message = 'The Magisk module section does not say that a refused read is not an absence.' }
+            @{ Pattern = '(?i)not-detected'; Message = 'The Magisk module section does not say what a refused read prints.' }
+            @{ Pattern = '(?i)does not claim to detect'; Message = 'The Magisk module section does not disclose that the Zygisk requirement is not checked.' }
+        )) {
+        Assert-True ($moduleSection.Value -match $moduleStatement.Pattern) $moduleStatement.Message
+    }
 
     $concealmentSection = [regex]::Match($readme, '(?ms)^## Concealment scope$.*?(?=^## )')
     Assert-True $concealmentSection.Success 'README has no Concealment scope section.'

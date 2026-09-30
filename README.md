@@ -985,9 +985,25 @@ On the verified clone, in this order, every step refusing to continue on failure
 8. **Clean up on every failure after the push.** Any refusal from step 4 onward removes the pushed archive
    and the staging directory, so a rejected archive is never left sitting in the guest.
 
-The clone is then rebooted by the action that owns it, and the module is loaded at that boot. `Verify`
-reports what it can observe afterwards: `Guest.VectorModuleInstalled` is read from the guest rather than
-assumed from the install having returned success.
+The clone is then rebooted by the action that owns it, and the module is loaded at that boot. What
+`Verify` reports afterwards is what it can actually observe, and it draws two lines rather than one,
+because a module directory is not a loaded module:
+
+- `Guest.VectorModuleInstalled` is `True` when the directory `/data/adb/modules/zygisk_vector` is
+  there. That is a **directory listing, not proof the module is working.**
+- If that listing also carries the `disable` marker, the module is present but the root implementation
+  skips it at boot, so nothing it would hide is hidden. `Verify` records that in `Failures` and the run
+  is not quiet about it. A module in this state is the one case where the toolkit would previously have
+  reported working concealment.
+- If the guest **refuses** the read, for example because the adb shell may not list the module root, the
+  field prints `not-detected` and the refusal is recorded. A guest that could not look has not said the
+  module is absent, so this is never reported as `False`.
+
+Vector also needs a Zygisk implementation to run, which is either built into the root implementation
+(such as Kitsune's own) or supplied by a module such as NeoZygisk. **The toolkit does not claim to detect
+that.** It cannot be read reliably from a guest, and reporting a Zygisk implementation as absent on a
+guest whose Zygisk is built into its root would be the mirror image of the same mistake. Vector's own
+documentation states the requirement, and the dependency is recorded as a limitation rather than a check.
 
 ### What is in the manifest but never installed
 

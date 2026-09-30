@@ -666,6 +666,14 @@ function Get-ToolkitGuestState {
         $module = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command $moduleCommand -Runner $Runner
         if ($null -ne $module -and $module.ExitCode -eq 0) {
             $guest['VectorModuleInstalled'] = $true
+            # A module directory is not a loaded module. The root implementation skips a disabled module at
+            # boot and leaves the directory in place, and the marker is listed by this same directory probe,
+            # so one read answers both "is it there" and "will it load". A separate probe for the marker
+            # would be a second command that neither a guest nor a fixture can tell from the first.
+            $moduleEntries = @(([string]$module.Text) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($moduleEntries -ccontains 'disable') {
+                $guest['Failure'] = $guest['Failure'] + ' The Vector module directory is present but it carries the disable marker, so the root implementation skips it at boot and nothing it would hide is hidden. Enable the module in the root implementation and boot the clone.'
+            }
         }
         elseif ($null -ne $module -and $module.ExitCode -eq -1) {
             # An unread probe is not an absent module, so the field is left undetected and the reason is
@@ -673,10 +681,16 @@ function Get-ToolkitGuestState {
             $guest['VectorModuleInstalled'] = $null
             $guest['Failure'] = $guest['Failure'] + " The Vector module at $modulePath could not be read: $([string]$module.Text)"
         }
-        elseif ($null -ne $module) {
-            # A guest that answered owns the answer: an exit status that is not a transport failure is the
-            # guest reporting the directory is not there.
+        elseif ($null -ne $module -and ([string]$module.Text) -match '(?i)no such file') {
+            # Only the guest saying the path is not there is an absence. Every other non-zero answer is a
+            # guest that did not look: a stopped instance answers with nothing at all, a guest whose root
+            # has no su answers that su is missing, and a guest refused the read answers that. Reading any
+            # of those as "not installed" is a claim about a module nobody was able to check.
             $guest['VectorModuleInstalled'] = $false
+        }
+        elseif ($null -ne $module) {
+            $guest['VectorModuleInstalled'] = $null
+            $guest['Failure'] = $guest['Failure'] + " The guest did not say whether $modulePath exists, so the Vector module state is unknown: $([string]$module.Text)"
         }
     }
     return $guest
