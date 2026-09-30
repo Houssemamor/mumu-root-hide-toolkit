@@ -4595,7 +4595,7 @@ function Assert-Root12Failure {
 }
 
 function Invoke-Root12Tests {
-    foreach ($commandName in @('Install-Android12Root', 'Get-Android12KitsunePrompt', 'Test-KitsuneConfirmation', 'Test-Android12Root', 'Read-Android12KitsuneConfirmation', 'Prepare-Android12Asset', 'Resolve-Android12Clone', 'Assert-Android12ResumeClone', 'Get-ToolkitRootSetting', 'Format-Android12InstallCommand')) {
+    foreach ($commandName in @('Install-Android12Root', 'Get-Android12KitsunePrompt', 'Test-KitsuneConfirmation', 'Test-Android12Root', 'Read-Android12KitsuneConfirmation', 'Prepare-Android12Asset', 'Resolve-Android12Clone', 'Assert-AndroidResumeClone', 'Get-ToolkitRootSetting', 'Format-Android12InstallCommand')) {
         Assert-True ($null -ne (Get-Command $commandName -CommandType Function -ErrorAction SilentlyContinue)) "Android 12 command is unavailable: $commandName"
     }
     Assert-True (Test-Path -LiteralPath $root12ScriptPath -PathType Leaf) 'src/Root12.ps1 does not exist.'
@@ -5054,15 +5054,39 @@ function Invoke-Root12Tests {
         Assert-Equal 1 @($declinedFlow.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'The resume of a returned recovery record created a second clone.'
 
         $dictionaryRecordState = New-Root12VerifiedCloneState -Install $install -Instance $android12 -Manifest $manifest -JournalRoot $journalRoot -CacheRoot $assetCacheRoot
-        $dictionaryRecordCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+        $dictionaryRecordCheck = Assert-AndroidResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
             -Record (@{ CloneIndex = [int]$dictionaryRecordState.CloneIndex; CloneName = [string]$dictionaryRecordState.CloneName }) `
             -Runner (New-Root12ManagerRunner -State $dictionaryRecordState)
         Assert-Equal 'Success' $dictionaryRecordCheck.Status 'A recovery record expressed as a dictionary was refused.'
         Assert-Equal $dictionaryRecordState.CloneIndex $dictionaryRecordCheck.Data.CloneIndex 'A dictionary recovery record resolved the wrong clone.'
-        $dictionaryMissingIndexCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+        $dictionaryMissingIndexCheck = Assert-AndroidResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
             -Record (@{ CloneName = 'Target clone' }) -Runner (New-Root12ManagerRunner -State $dictionaryRecordState)
         Assert-Equal 'CriticalError' $dictionaryMissingIndexCheck.Status 'A dictionary recovery record without an index was accepted.'
         Assert-Equal 'RESUME_RECORD_INVALID' $dictionaryMissingIndexCheck.Data.Code 'A dictionary recovery record without an index reported the wrong code.'
+
+        # The resume validator is shared by both root workflows, and it used to hardcode the Android 12
+        # version, so the Android 15 path validated its own clone against the wrong rules and refused
+        # every clone. A 15 clone is accepted when 15 is expected, refused when 12 is, and the refusal
+        # names the version it wanted rather than always blaming Android 12.
+        $sharedResumeState = New-Root15ManagerState -Install $install
+        # A fresh harness state has no clone yet, because the action makes it. The recorded clone is added
+        # here so the validator has something to revalidate, the way a resumed run finds one already there.
+        $sharedResumeState.Instances = @($sharedResumeState.Instances) + @(
+            [pscustomobject]@{
+                Index = [int]$sharedResumeState.CloneIndex; Name = [string]$sharedResumeState.CloneName
+                IsMain = 'false'; Running = 'true'; Android = '15.0'
+            }
+        )
+        $sharedResumeRecord = @{ CloneIndex = [int]$sharedResumeState.CloneIndex; CloneName = [string]$sharedResumeState.CloneName }
+        $resumeFifteen = Assert-AndroidResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+            -Record $sharedResumeRecord -ExpectedVersion '15.0' -Runner (New-Root15ManagerRunner -State $sharedResumeState)
+        Assert-Equal 'Success' $resumeFifteen.Status "The shared resume validator refused an Android 15 clone: $($resumeFifteen.Message)"
+        Assert-Equal $sharedResumeState.CloneIndex $resumeFifteen.Data.CloneIndex 'The Android 15 resume resolved the wrong clone.'
+        $resumeTwelve = Assert-AndroidResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+            -Record $sharedResumeRecord -ExpectedVersion '12.0' -Runner (New-Root15ManagerRunner -State $sharedResumeState)
+        Assert-Equal 'CriticalError' $resumeTwelve.Status 'An Android 15 clone was accepted as an Android 12 clone.'
+        Assert-Equal 'RESUME_CLONE_VERSION' ([string]$resumeTwelve.Data.Code) 'The wrong-version refusal reported the wrong code.'
+        Assert-True ($resumeTwelve.Message -match '(?i)Android 12') "The wrong-version refusal does not name the version it wanted: $($resumeTwelve.Message)"
         $resumeJournal = Get-OperationJournal -Path $resumedCase.Journal.JournalPath
         $resumeText = ([string](@($resumeJournal.Checkpoints) | ForEach-Object { $_.Message }) -join ' ')
         Assert-True ($resumeText -match 'resumed') 'The resume was not recorded in the journal.'
@@ -5077,7 +5101,7 @@ function Invoke-Root12Tests {
         Assert-Equal 1 @($resumeFailureState.Calls | Where-Object { @($_)[0] -ceq 'clone' }).Count 'A failed resume created a second clone.'
 
         $emptyState = New-Root12ManagerState -Install $install
-        $missingCloneCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+        $missingCloneCheck = Assert-AndroidResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
             -Record ([pscustomobject]@{ CloneIndex = $emptyState.CloneIndex }) -Runner (New-Root12ManagerRunner -State $emptyState)
         Assert-Equal 'CriticalError' $missingCloneCheck.Status 'A resume against a missing clone was accepted.'
         Assert-Equal 'RESUME_CLONE_MISSING' $missingCloneCheck.Data.Code 'A resume against a missing clone reported the wrong code.'
@@ -5091,7 +5115,7 @@ function Invoke-Root12Tests {
                 [pscustomobject]@{ Record = ([pscustomobject]@{ CloneIndex = 5; CloneName = '   ' }); Label = 'blank name' }
             )) {
             $invalidRecordState = New-Root12ManagerState -Install $install
-            $invalidRecordCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+            $invalidRecordCheck = Assert-AndroidResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
                 -Record $invalidRecord.Record -Runner (New-Root12ManagerRunner -State $invalidRecordState)
             Assert-Equal 'CriticalError' $invalidRecordCheck.Status "An invalid resume record was accepted: $($invalidRecord.Label)"
             Assert-Equal 'RESUME_RECORD_INVALID' $invalidRecordCheck.Data.Code "An invalid resume record reported the wrong code: $($invalidRecord.Label)"
@@ -5116,7 +5140,7 @@ function Invoke-Root12Tests {
                 'disk' { 'RESUME_CLONE_DISK' }
                 'base' { 'RESUME_CLONE_IDENTITY' }
             }
-            $defectCheck = Assert-Android12ResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
+            $defectCheck = Assert-AndroidResumeClone -ManagerPath $install.ManagerPath -VmsPath $install.VmsPath `
                 -Record ([pscustomobject]@{ CloneIndex = $defectState.CloneIndex; CloneName = $expectedName }) `
                 -Runner (New-Root12ManagerRunner -State $defectState)
             Assert-Equal 'CriticalError' $defectCheck.Status "A defective clone was accepted for resume: $resumeDefect"

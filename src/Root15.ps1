@@ -208,7 +208,7 @@ function Enable-Android15Root {
     $cloneIndex = -1
     $cloneName = ''
     if ($null -ne $ResumeClone) {
-        $resume = Assert-Android12ResumeClone -ManagerPath $manager -VmsPath $vmsPath -Record $ResumeClone -Runner $Runner
+        $resume = Assert-AndroidResumeClone -ManagerPath $manager -VmsPath $vmsPath -Record $ResumeClone -ExpectedVersion '15.0' -Runner $Runner
         if ($resume.Status -ne 'Success') {
             return New-ToolkitRootFailure -Journal $Journal -Message $resume.Message -Data (New-Android15RootState -Code ([string]$resume.Data.Code) -Step 'resume' -SourceIndex $sourceIndex -CloneIndex ([int](Get-Android12RecordField -Record $resume.Data -Name 'CloneIndex')) -CloneName ([string](Get-Android12RecordField -Record $resume.Data -Name 'CloneName')))
         }

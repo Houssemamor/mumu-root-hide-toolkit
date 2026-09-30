@@ -183,11 +183,15 @@ function Resolve-Android12Clone {
         })
 }
 
-function Assert-Android12ResumeClone {
+function Assert-AndroidResumeClone {
     param(
         [string]$ManagerPath,
         [string]$VmsPath,
         [object]$Record,
+        # The Android version the clone has to be. This validator is shared by both root workflows, and it
+        # used to hardcode 12.0, so the Android 15 resume path validated its own clone against the Android
+        # 12 rules and refused every clone it was given.
+        [string]$ExpectedVersion = '12.0',
         [scriptblock]$Runner = $null
     )
 
@@ -242,8 +246,9 @@ function Assert-Android12ResumeClone {
     if ($null -eq $reportedVersion) {
         $reportedVersion = Get-ToolkitInstanceAndroidVersion -VmsPath $vms -Index $cloneIndex
     }
-    if ($reportedVersion -cne '12.0') {
-        return Get-ToolkitResult -Status 'CriticalError' -Message 'The recorded recovery clone is not an Android 12 instance.' -Data (@{ Code = 'RESUME_CLONE_VERSION' })
+    if ($reportedVersion -cne $ExpectedVersion) {
+        $expectedLabel = 'Android ' + ([string]$ExpectedVersion -replace '\.0$', '')
+        return Get-ToolkitResult -Status 'CriticalError' -Message ('The recorded recovery clone is not an ' + $expectedLabel + ' instance.') -Data (@{ Code = 'RESUME_CLONE_VERSION' })
     }
 
     $reportedVmsPath = [string](Get-ToolkitFirstProperty -InputObject $cloneRecord -PropertyNames @('vms_path', 'vmsPath'))
@@ -558,7 +563,7 @@ function Install-Android12Root {
     $cloneIndex = -1
     $cloneName = ''
     if ($null -ne $ResumeClone) {
-        $resumeCheck = Assert-Android12ResumeClone -ManagerPath $manager -VmsPath $vmsPath -Record $ResumeClone -Runner $Runner
+        $resumeCheck = Assert-AndroidResumeClone -ManagerPath $manager -VmsPath $vmsPath -Record $ResumeClone -ExpectedVersion '12.0' -Runner $Runner
         if ($resumeCheck.Status -ne 'Success') {
             return New-ToolkitRootFailure -Journal $Journal -Message $resumeCheck.Message -Data (New-Android12Recovery -Code ([string]$resumeCheck.Data.Code) -Step 'resume' -SourceIndex $sourceIndex -CloneIndex ([int](Get-Android12RecordField -Record $resumeCheck.Data -Name 'CloneIndex')) -CloneName ([string](Get-Android12RecordField -Record $resumeCheck.Data -Name 'CloneName')))
         }
