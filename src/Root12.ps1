@@ -30,7 +30,16 @@ function Test-KitsuneConfirmation {
         [string]$Confirmation
     )
 
-    return ($Confirmation -ceq $script:ToolkitKitsuneChoice)
+    # The full option text is the attestation, and CONFIRM is accepted as the short form of the same
+    # answer. This gate is not a password: it exists so a run that never did the system-partition
+    # install does not spend a multi-minute cold boot finding out, and the root is measured by
+    # observation immediately afterwards either way. Requiring a 35 character, case sensitive
+    # phrase to say "yes, I did it" bought no safety and was a typo waiting to happen.
+    $answer = ([string]$Confirmation).Trim()
+    if ($answer -ceq $script:ToolkitKitsuneChoice) {
+        return $true
+    }
+    return ($answer -ceq 'CONFIRM')
 }
 
 function Read-Android12KitsuneConfirmation {
@@ -663,7 +672,7 @@ function Install-Android12Root {
     # type something here, and this is the second gate, so the word CONFIRM that released the first one
     # is rejected here. The exact answer is named in the prompt because the match is case sensitive, and
     # a prompt that hides what to type strands the operator at a gate they cannot pass.
-    $promptText = 'Kitsune: choose ' + $script:ToolkitKitsunePrompt + '. Not the ordinary Direct Install and not Select and Patch a File. If the system-partition option is not shown, close the Kitsune app and open it again. Then type exactly: ' + $script:ToolkitKitsuneChoice
+    $promptText = 'Kitsune: in the app on the clone, choose ' + $script:ToolkitKitsunePrompt + '. Not the ordinary Direct Install and not Select and Patch a File. If the system-partition option is not shown, close the Kitsune app and open it again. Once you have made that choice here, type CONFIRM (or the full option text, ' + $script:ToolkitKitsuneChoice + ')'
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message "In the Kitsune app choose $promptText The workflow is paused until the operator confirms that exact choice." -Data (@{
                 Prompt = $promptText

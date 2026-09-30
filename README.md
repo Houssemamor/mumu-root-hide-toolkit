@@ -815,18 +815,23 @@ Two other things that look like a hang but are not:
 
 ### What the confirmation prompt actually asks for
 
-There are **two** gates, and they want **different** words. This trips people up, because the second
-prompt names the option to choose in the app and used to leave you to guess what to type:
+There are **two** gates. They look alike but they mean different things: the first authorizes the run
+before anything is copied, the second confirms you have already done something inside the emulator that
+the toolkit cannot see for itself.
 
 | Gate | When | Type |
 | --- | --- | --- |
 | Run authorization | before the clone is made | `CONFIRM` |
-| Kitsune choice | after you install in the app, before the cold boot | `Direct Install into system partition` |
+| Kitsune choice | after you install in the app, before the cold boot | `CONFIRM`, or the full `Direct Install into system partition` |
 
-The second answer is matched case sensitively and in full, so `confirm`, `yes` and `Done` are all
-refused with `USER_CONFIRMATION_REQUIRED`. The prompt now states the exact string to type, and the
-prompt is generated from the same value the gate compares against, so the two cannot drift apart. If
-you get that refusal, nothing was rebooted and no root was claimed; re-run and type the full phrase.
+The second gate is **not** a password, and requiring the long phrase to say "yes, I did it" bought no
+safety. It exists so a run that never did the system-partition install does not spend a multi-minute cold
+boot discovering that, and the root is measured by observation immediately afterwards either way.
+`direct install into system partition` in the wrong case, `yes`, the ordinary `Direct Install`, and
+`Select and Patch a File` are all still refused, because those are different choices rather than the
+same one typed differently. A pasted answer is trimmed rather than refused.
+
+If you get that refusal, nothing was rebooted and no root was claimed; re-run and answer it.
 
 If you abandon the run at that prompt, the clone is left with the **temporary vendor root still
 enabled**, because it is enabled before the install and only disabled after the root is verified.

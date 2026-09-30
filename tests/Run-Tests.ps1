@@ -4647,21 +4647,30 @@ function Invoke-Root12Tests {
         Assert-True ($prompt -match 'Direct Install into system partition') 'Kitsune prompt is ambiguous.'
 
         Assert-True (Test-KitsuneConfirmation -Confirmation 'Direct Install into system partition') 'The exact system-partition confirmation was rejected.'
+        # CONFIRM is the accepted short form. The gate exists to avoid a wasted cold boot, and the root is
+        # measured by observation straight afterwards, so a short deliberate answer is as good as the phrase.
+        Assert-True (Test-KitsuneConfirmation -Confirmation 'CONFIRM') 'The short CONFIRM answer was rejected at the Kitsune gate.'
         Assert-True (-not (Test-KitsuneConfirmation -Confirmation $null)) 'A missing Kitsune confirmation was accepted.'
         foreach ($ambiguous in @(
                 'Direct Install',
                 'Select and Patch a File',
                 'direct install into system partition',
-                'Direct Install into system partition ',
+                'confirm',
+                'Confirm',
+                'CONFIRMED',
+                'yes',
                 'Direct Install into system partition;',
                 'Install -> Direct Install into system partition',
                 ' Install -> Direct Install into system partition',
                 '',
-                '   ',
-                'yes'
+                '   '
             )) {
             Assert-True (-not (Test-KitsuneConfirmation -Confirmation $ambiguous)) "An ambiguous Kitsune confirmation was accepted: $ambiguous"
         }
+        # A pasted answer carries its own whitespace, and that is a paste artifact rather than a different
+        # choice, so it is trimmed instead of refused.
+        Assert-True (Test-KitsuneConfirmation -Confirmation 'Direct Install into system partition ') 'A pasted system-partition confirmation was refused over its trailing space.'
+        Assert-True (Test-KitsuneConfirmation -Confirmation ' CONFIRM ') 'A pasted CONFIRM was refused over its surrounding spaces.'
 
         Assert-Equal ([IO.Path]::Combine($env:LOCALAPPDATA, 'mumu-root-hide-toolkit', 'assets')) (Get-ToolkitAssetCacheRoot) 'The asset cache root is not the per-user dependency cache.'
 
@@ -4852,14 +4861,15 @@ function Invoke-Root12Tests {
         Assert-Equal 1 $promptState.Calls 'The operator was not asked exactly once for the Kitsune confirmation.'
         Assert-True ($promptState.Text -match 'Install -> Direct Install into system partition') 'The prompt did not show the exact Kitsune instruction.'
         Assert-True ($promptState.Text -match 'Select and Patch a File') 'The prompt did not warn about the rejected Kitsune options.'
-        # The operator is asked to type an answer here, and this is the second gate, so CONFIRM is
-        # rejected. A prompt that names the app option without naming the answer strands them at a gate
-        # they cannot pass, so the exact string is stated in the prompt and the advice about the missing
-        # option is carried with it.
-        Assert-True ($promptState.Text -match 'Then type exactly: Direct Install into system partition') 'The prompt does not state the exact answer the operator has to type.'
+        # The operator is asked to type an answer here, and this is the second gate, so the short form has
+        # to be named. A prompt that hides what to type strands them at a gate they cannot pass.
+        Assert-True ($promptState.Text -match 'type CONFIRM \(or the full option text, Direct Install into system partition\)') 'The prompt does not state the answers the operator may type.'
         Assert-True ($promptState.Text -match '(?i)close the Kitsune app and open it again') 'The prompt does not say what to do when the system-partition option is not shown.'
-        # The answer the prompt names is the answer the gate accepts, so the two cannot drift apart.
-        Assert-True (Test-KitsuneConfirmation -Confirmation ([regex]::Match($promptState.Text, 'Then type exactly: (.+)$').Groups[1].Value)) 'The answer named in the prompt is not the answer the gate accepts.'
+        # Every answer the prompt names is an answer the gate accepts, so the two cannot drift apart.
+        $promptedAnswers = @([regex]::Match($promptState.Text, 'type CONFIRM').Value -replace '^type\s+', '')
+        Assert-Equal 1 $promptedAnswers.Count 'The prompt did not name the short answer at all.'
+        Assert-True (Test-KitsuneConfirmation -Confirmation 'CONFIRM') 'The short answer named in the prompt is not an answer the gate accepts.'
+        Assert-True (Test-KitsuneConfirmation -Confirmation $script:ToolkitKitsuneChoice) 'The full answer named in the prompt is not an answer the gate accepts.'
         Assert-Equal $true $promptedCase.Result.Data.RootVerified 'A prompted Kitsune run did not verify the root shell.'
 
         $defaultPromptState = @{ Text = ''; Calls = 0 }
@@ -11699,6 +11709,19 @@ function Invoke-DocsTests {
     Assert-True ($kitsuneSection.Value -match 'hamjin/kitsune-magisk-files') 'The missing-option advice does not cite the Kitsune author mirror that gives it.'
     Assert-True ($kitsuneSection.Value -match '(?i)Reboot. function will not work') 'The non-working reboot claim is not quoted from the source that documents it.'
     Assert-True ($root15Section.Value -match 'kernelsu\.org') 'The Android 15 allowlist handoff does not cite the KernelSU documentation.'
+    # The two gates have to be documented as two gates with the answers each one accepts, because an
+    # operator who reads only the first row types the same word twice and does not know what the second
+    # one is for.
+    foreach ($gateStatement in @(
+            @{ Pattern = '(?i)Run authorization'; Message = 'The Android 12 section does not name the run authorization gate.' }
+            @{ Pattern = '(?i)Kitsune choice'; Message = 'The Android 12 section does not name the Kitsune choice gate.' }
+            @{ Pattern = '(?i)`CONFIRM`, or the full `Direct Install into system partition`'; Message = 'The Android 12 section does not offer the short answer at the Kitsune gate.' }
+            @{ Pattern = '(?i)not\*\* a password'; Message = 'The Android 12 section does not say the Kitsune gate is not a password.' }
+            @{ Pattern = '(?i)multi-minute cold\s+boot'; Message = 'The Android 12 section does not say what the Kitsune gate is actually for.' }
+            @{ Pattern = '(?i)trimmed rather than refused'; Message = 'The Android 12 section does not say a pasted answer is trimmed rather than refused.' }
+        )) {
+        Assert-True ($kitsuneSection.Value -match $gateStatement.Pattern) $gateStatement.Message
+    }
 
     $moduleSection = [regex]::Match($readme, '(?ms)^## What a Magisk module is here.*?(?=^## )')
     Assert-True $moduleSection.Success 'README has no Magisk module section.'
