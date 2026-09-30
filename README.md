@@ -839,19 +839,44 @@ the journal, and claims no root. Nothing outside the selected clone is changed i
 root setting on that clone, cold-boots it, and verifies the built-in KernelSU package, the absence of
 the Kitsune package, and a root shell, in that order. The Kitsune check runs first so a clone that
 inherited the Kitsune package is reported as `KITSUNE_PRESENT`, with the observed package line,
-instead of being reported as a root denial it never had. A guest with no `su` binary at all is
-reported as `ROOT_UNAVAILABLE`, which says the root state is unknown, rather than as a policy denial.
+instead of being reported as a root denial it never had.
 The built-in root is kept enabled on the clone.
+
+### Root15 needs one step from you, and it is not optional
+
+**KernelSU is allowlist based.** Its own documentation states that only a permitted app can see `su`,
+and that all other apps remain unaware of it. Nothing is permitted when it is installed, so on a
+freshly enabled clone `su` does not exist **by design**, and no probe this toolkit runs can change
+that. A run that stopped there has not failed; it stopped exactly where a person has to take over.
+
+So when the KernelSU package is verified, the vendor root is on, and no `su` is visible, `Root15`
+reports a **`Warning`** with the code `ROOT_PERMISSION_PENDING` and a handoff, rather than a root
+denial:
+
+```text
+  1. Open the KernelSU manager app on the clone.
+  2. Open its Superuser tab.
+  3. Grant superuser to the ADB shell (uid 2000).
+  4. Run Status on the clone again, or use Continue on its clone to finish this workflow.
+```
+
+The identity named is the **ADB shell**, because that is who the root probe runs as, so granting it is
+what lets the check see a root at all. The action closes its journal as **completed**, not failed: the
+clone is intact, the vendor root stays enabled, and resuming the same clone re-runs only the checks.
+
+A **denial** is a different answer and is still a failure. If `su` exists and refuses, that is not
+fixed by granting anything, so it stays `ROOT_DENIED` and gets no handoff.
 
 Because that change is not reversible through the toolkit, `Root15` requires explicit confirmation.
 The menu asks you to type `CONFIRM`; the command line requires `-Confirmed`. Without it the action
 changes nothing and reports `USER_CONFIRMATION_REQUIRED`.
 
-Android 15 is **not qualified on this host yet.** The live run on the instance at index 1 produced a
-clone that inherited `io.github.huskydg.magisk` and had no usable `su` and no built-in KernelSU
-daemon, so that clone is not a valid built-in-KernelSU target and the action reported
-`KITSUNE_PRESENT`. A source instance that already carries Kitsune cannot be qualified with
-`Root15`; a Kitsune-free instance still has to be run before Android 15 can be called qualified.
+Android 15 is **not qualified on this host yet.** The live run created clone 4 from an Android 15
+instance and recorded `KernelSU = v3.2.5`, `KitsuneAbsent = True`, `RootPermission = True`,
+`RootShell = False`. That result **supersedes** an earlier claim in this document that an Android 15
+clone inherits Kitsune: it did not, and the blocker is the allowlist grant above rather than an
+inherited package. The run is still unqualified because the superuser grant has not been made yet, so
+no Android 15 root has ever been verified end to end on this host.
 
 ## Concealment scope
 

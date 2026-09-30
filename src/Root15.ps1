@@ -2,6 +2,15 @@ $script:Root15KernelSUPackage = 'me.weishu.kernelsu'
 $script:Root15KitsunePackage = 'io.github.huskydg.magisk'
 $script:Root15FieldNames = @('RootPermission', 'KernelSU', 'RootShell', 'KitsuneAbsent', 'KernelSUVersion')
 $script:Root15PackageListCommand = 'shell pm list packages'
+# The step a person has to take, because KernelSU grants root from its own manager and nothing the
+# toolkit runs can stand in for it. The adb shell is named because that is the identity the root probe
+# runs as, so granting it is what makes the probe able to see a root at all.
+$script:Root15HandoffSteps = @(
+    'Open the KernelSU manager app on the clone.',
+    'Open its Superuser tab.',
+    'Grant superuser to the ADB shell (uid 2000).',
+    'Run Status on the clone again, or use Continue on its clone to finish this workflow.'
+)
 
 function New-Android15RootState {
     param(
@@ -96,7 +105,23 @@ function Test-Android15Root {
 
     $rootShell = Invoke-ToolkitRootShellProbe -ManagerPath $manager -InstanceIndex $InstanceIndex -Runner $Runner
     if ($rootShell.Status -ne 'Success') {
-        return Get-ToolkitResult -Status 'CriticalError' -Message ('The built-in root shell could not be verified. ' + $rootShell.Message) -Data (New-Android15RootState -Code ([string]$rootShell.Data.Code) -Fields $fields)
+        $rootCode = [string]$rootShell.Data.Code
+        # KernelSU is allowlist based: its own documentation is that only a permitted app can see su, and
+        # nothing is permitted until a person grants it. So a guest that carries KernelSU and shows no root
+        # shell is the documented default state rather than a broken one, and no probe this workflow can
+        # run will change it. Reporting it as a root denial would be a claim the guest did not make.
+        #
+        # A denial is left alone: that answer means su exists and refused, which is a different state and
+        # is not fixed by granting anything.
+        if ($rootCode -ceq 'ROOT_UNAVAILABLE') {
+            $pendingData = New-Android15RootState -Code 'ROOT_PERMISSION_PENDING' -Fields $fields
+            # Set outside the filtered field list, the way the Android 12 rollback sets its own extra keys,
+            # so the handoff is carried on a result that has no handoff field of its own.
+            $pendingData['Handoff'] = @($script:Root15HandoffSteps)
+            $pendingMessage = "The built-in KernelSU package is installed and the vendor root is enabled on the clone, but no su is visible, which is how KernelSU behaves until an app is granted superuser. Nothing this workflow runs can grant it. $($script:Root15HandoffSteps -join ' ')"
+            return Get-ToolkitResult -Status 'Warning' -Message $pendingMessage -Data $pendingData
+        }
+        return Get-ToolkitResult -Status 'CriticalError' -Message ('The built-in root shell could not be verified. ' + $rootShell.Message) -Data (New-Android15RootState -Code $rootCode -Fields $fields)
     }
     $fields['RootShell'] = $true
 
@@ -279,6 +304,20 @@ function Enable-Android15Root {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The Android 15 root checks could not be journaled.' -Data (New-Android15RootState -Code 'JOURNAL_WRITE_FAILED' -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
     if ($checks.Status -ne 'Success') {
+        # A pending superuser grant is a precondition rather than a failure, so it is closed as a warning
+        # and keeps the clone, the journal and the exit code honest about what a person still has to do.
+        # Converting it to a critical error would fail a run that stopped exactly where it was told to stop.
+        if ([string]$checks.Status -ceq 'Warning') {
+            $pendingMessage = "The built-in Android 15 root is enabled on the clone at index $cloneIndex and its KernelSU package is verified, but no root shell is visible until superuser is granted. $($checks.Message)"
+            try {
+                Write-JournalEvent -Journal $Journal -Level 'Warning' -Message $pendingMessage -Data $checks.Data
+                Complete-OperationJournal -Journal $Journal -Result (Get-ToolkitResult -Status 'Warning' -Message $pendingMessage -Data $checks.Data)
+            }
+            catch {
+                return New-ToolkitRootFailure -Journal $Journal -Message 'The pending-superuser Android 15 result could not be journaled.' -Data (New-Android15RootState -Code 'JOURNAL_WRITE_FAILED' -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
+            }
+            return Get-ToolkitResult -Status 'Warning' -Message $pendingMessage -Data $checks.Data
+        }
         return New-ToolkitRootFailure -Journal $Journal -Message $checks.Message -Data (New-Android15RootState -Code ([string]$checks.Data.Code) -Fields $checks.Data -Step 'verification' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 

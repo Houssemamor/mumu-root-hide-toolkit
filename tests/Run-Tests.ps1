@@ -6365,6 +6365,29 @@ function Invoke-Root15Tests {
         Assert-True ($recordedCallText -notmatch '(?i)kitsune') 'Android 15 flow downloaded Kitsune.'
         Assert-Equal 0 @(Get-Root15Calls -State $successState -Pattern '*install -r*').Count 'Android 15 flow installed Kitsune.'
         Assert-Equal 0 @(Get-Root15Calls -State $successState -Pattern '*monkey*').Count 'Android 15 flow launched a root manager application.'
+
+        # A guest whose KernelSU has granted nothing yet is the allowlist default, so the action stops
+        # where a person has to take over. It has to close as a completed warning rather than a failed
+        # journal, because nothing went wrong and the clone is intact.
+        $pendingState = New-Root15ManagerState -Install $install
+        $pendingState.RootShellMissing = $true
+        $pendingCase = Invoke-Root15Case -State $pendingState -Instance $android15 -JournalRoot $journalRoot -Confirmed $true
+        Assert-Equal 'Warning' $pendingCase.Result.Status "A clone whose superuser was never granted was not reported as a precondition: $($pendingCase.Result.Message)"
+        Assert-Equal 'ROOT_PERMISSION_PENDING' ([string]$pendingCase.Result.Data.Code) 'The pending superuser grant does not report its own code.'
+        Assert-True ((@($pendingCase.Result.Data.Handoff) -join ' ') -match '(?i)KernelSU manager') 'The action result carries no handoff for the pending superuser grant.'
+        Assert-Equal 'Completed' $pendingCase.Journal.State 'A pending superuser grant failed the operation journal instead of completing it.'
+        # The vendor root is left enabled on the clone, which is the documented end state for this workflow,
+        # so a resumed run does not have to toggle it again.
+        Assert-Equal 1 @(Get-Root15Calls -State $pendingState -Pattern '*root_permission*true*').Count 'The pending superuser grant did not enable the vendor root on the clone exactly once.'
+
+        # A denial is not a precondition. su exists and refused, which granting superuser does not change,
+        # so it must stay a failure and must not be handed a handoff that would not fix it.
+        $pendingDenyState = New-Root15ManagerState -Install $install
+        $pendingDenyState.RootShellText = 'uid=2000(shell) gid=2000(shell) groups=2000(shell)'
+        $pendingDenyCase = Invoke-Root15Case -State $pendingDenyState -Instance $android15 -JournalRoot $journalRoot -Confirmed $true
+        Assert-Root15Failure -Result $pendingDenyCase.Result -Journal $pendingDenyCase.Journal -Code 'ROOT_DENIED' -Message 'A denied root shell was softened into a pending superuser grant.'
+        Assert-True ($null -eq $pendingDenyCase.Result.Data.PSObject.Properties['Handoff']) 'A denied root shell was given a handoff that would not fix it.'
+
         $packageListCalls = @(Get-Root15Calls -State $successState -Pattern 'adb*-c shell pm list packages*')
         Assert-Equal 1 $packageListCalls.Count 'The Android 15 flow did not issue exactly one bare package list request.'
         $packageListArguments = [string[]]@($packageListCalls[0])
@@ -6483,7 +6506,9 @@ function Invoke-Root15Tests {
 
         foreach ($orderCase in @(
                 [pscustomobject]@{ Kitsune = $true; Missing = $true; Code = 'KITSUNE_PRESENT'; Status = 'CriticalError'; KitsuneAbsent = $false; RootShell = $false; Label = 'an inherited Kitsune package and no su' },
-                [pscustomobject]@{ Kitsune = $false; Missing = $true; Code = 'ROOT_UNAVAILABLE'; Status = 'CriticalError'; KitsuneAbsent = $true; RootShell = $false; Label = 'no Kitsune package and no su' },
+                # No su with KernelSU present is the allowlist default, not a failure, so this case is a
+                # warning carrying the handoff rather than a critical error.
+                [pscustomobject]@{ Kitsune = $false; Missing = $true; Code = 'ROOT_PERMISSION_PENDING'; Status = 'Warning'; KitsuneAbsent = $true; RootShell = $false; Label = 'no Kitsune package and no su' },
                 [pscustomobject]@{ Kitsune = $false; Missing = $false; Code = 'ROOT_DENIED'; Status = 'CriticalError'; KitsuneAbsent = $true; RootShell = $false; Label = 'no Kitsune package and a denied su' },
                 [pscustomobject]@{ Kitsune = $false; Missing = $false; Code = 'OK'; Status = 'Success'; KitsuneAbsent = $true; RootShell = $true; Label = 'the verified built-in root' }
             )) {
@@ -6512,9 +6537,16 @@ function Invoke-Root15Tests {
             else {
                 Assert-True ($orderRootCall -gt $orderListCall) "The Android 15 check did not probe the root shell after the package list ($($orderCase.Label))."
             }
-            if ($orderCase.Code -ceq 'ROOT_UNAVAILABLE') {
-                Assert-True ($orderChecks.Message -match '(?i)not available') "A missing su binary was reported as a policy denial ($($orderCase.Label)): $($orderChecks.Message)"
-                Assert-True ($orderChecks.Message -match '(?i)unknown') "A missing su binary does not say the root state is unknown ($($orderCase.Label))"
+            if ($orderCase.Code -ceq 'ROOT_PERMISSION_PENDING') {
+                # The pending case is only honest if it carries the step that resolves it, so the handoff
+                # has to name the manager, the tab, and the identity the root probe runs as.
+                $handoff = @($orderChecks.Data.Handoff)
+                Assert-True ($handoff.Count -ge 3) "The pending superuser grant carries no usable handoff ($($orderCase.Label)): $(@($handoff) -join ' ')"
+                Assert-True ((@($handoff) -join ' ') -match '(?i)KernelSU manager') "The handoff does not name the app to open ($($orderCase.Label))"
+                Assert-True ((@($handoff) -join ' ') -match '(?i)Superuser tab') "The handoff does not name the tab to open ($($orderCase.Label))"
+                Assert-True ((@($handoff) -join ' ') -match '(?i)ADB shell') "The handoff does not name the identity the root probe runs as ($($orderCase.Label))"
+                Assert-True ($orderChecks.Message -match '(?i)granted superuser') "The pending report does not say why no root is visible ($($orderCase.Label)): $($orderChecks.Message)"
+                Assert-True ($orderChecks.Message -match '(?i)nothing this workflow runs can grant it') "The pending report does not say that the toolkit cannot resolve it ($($orderCase.Label)): $($orderChecks.Message)"
             }
             if ($orderCase.Status -ceq 'Success') {
                 Assert-Equal $true $orderChecks.Data.KernelSU "The verified built-in root does not report KernelSU ($($orderCase.Label))"
@@ -11584,6 +11616,25 @@ function Invoke-DocsTests {
     # The names are replaced, so the document has to say so. A capture with the names swapped and no note
     # about it reads as verbatim output, which is the claim this suite exists to keep honest.
     Assert-True ($menuSection.Value -match '(?i)instance names have been replaced') 'The interactive menu section does not say the instance names in the captures are replaced.'
+
+    $root15Section = [regex]::Match($readme, '(?ms)^## Android 15: built-in root.*?(?=^## )')
+    Assert-True $root15Section.Success 'README has no Android 15 section.'
+    # The allowlist grant is a step only a person can take, so the document has to name the app, the tab,
+    # the identity, and what the action reports while it is outstanding. A reader who does not know this
+    # reads the empty su as a broken root.
+    foreach ($root15Statement in @(
+            @{ Pattern = '(?i)allowlist based'; Message = 'The Android 15 section does not say that KernelSU is allowlist based.' }
+            @{ Pattern = 'ROOT_PERMISSION_PENDING'; Message = 'The Android 15 section does not name the code reported while the grant is outstanding.' }
+            @{ Pattern = '(?i)KernelSU manager'; Message = 'The Android 15 section does not name the app to open for the grant.' }
+            @{ Pattern = '(?i)Superuser tab'; Message = 'The Android 15 section does not name the tab to open for the grant.' }
+            @{ Pattern = '(?i)uid 2000'; Message = 'The Android 15 section does not name the identity the root probe runs as.' }
+            @{ Pattern = '(?i)completed\*\*, not failed'; Message = 'The Android 15 section does not say the journal completes rather than fails.' }
+            @{ Pattern = '(?i)stays `ROOT_DENIED`'; Message = 'The Android 15 section does not say a denial is still a failure.' }
+            @{ Pattern = '(?i)supersedes'; Message = 'The Android 15 section does not record that the Kitsune-inheritance claim was superseded.' }
+            @{ Pattern = 'KitsuneAbsent = True'; Message = 'The Android 15 section does not record the live Kitsune absence that superseded it.' }
+        )) {
+        Assert-True ($root15Section.Value -match $root15Statement.Pattern) $root15Statement.Message
+    }
 
     $moduleSection = [regex]::Match($readme, '(?ms)^## What a Magisk module is here.*?(?=^## )')
     Assert-True $moduleSection.Success 'README has no Magisk module section.'
