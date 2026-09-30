@@ -773,6 +773,48 @@ Do not choose the ordinary `Direct Install` or `Select and Patch a File` option.
 choice above is accepted; any other answer stops the workflow before the cold boot, and the clone is
 left as it is.
 
+### If the system-partition option is not there
+
+**The `Direct Install` option that modifies `/system` directly does not always appear on the first
+open.** On some clones and after some reboots, Kitsune shows only the ordinary options, and the
+system-partition choice is simply absent from the screen.
+
+When that happens, **close the Kitsune app completely and open it again**, then look for the option
+again. Do not fall back to `Select and Patch a File`: it patches a boot image instead of writing the
+system partition, which is not what this workflow verifies, and the toolkit will not accept a
+confirmation of a choice that was not that one.
+
+Two other things that look like a hang but are not:
+
+- **The in-app reboot button does not work on an emulator.** That is expected. The workflow does not
+  use it: after you confirm the choice, the toolkit performs its own cold boot through the MuMu
+  manager. **Do not reboot the clone yourself first** - if you do, the toolkit simply shuts it down
+  and boots it again, which costs you a second boot for nothing.
+- **The console looks frozen after you confirm, for several minutes.** That is the cold boot. It
+  prints a line saying the reboot is automatic and that no word releases the wait. Wait for it. It
+  ends when the guest reports it finished booting, or when the bound in [Transport bounds](#transport-bounds)
+  is reached, and never on an answer.
+
+### What the confirmation prompt actually asks for
+
+There are **two** gates, and they want **different** words. This trips people up, because the second
+prompt names the option to choose in the app and used to leave you to guess what to type:
+
+| Gate | When | Type |
+| --- | --- | --- |
+| Run authorization | before the clone is made | `CONFIRM` |
+| Kitsune choice | after you install in the app, before the cold boot | `Direct Install into system partition` |
+
+The second answer is matched case sensitively and in full, so `confirm`, `yes` and `Done` are all
+refused with `USER_CONFIRMATION_REQUIRED`. The prompt now states the exact string to type, and the
+prompt is generated from the same value the gate compares against, so the two cannot drift apart. If
+you get that refusal, nothing was rebooted and no root was claimed; re-run and type the full phrase.
+
+If you abandon the run at that prompt, the clone is left with the **temporary vendor root still
+enabled**, because it is enabled before the install and only disabled after the root is verified.
+Either finish the run or resume it with `Continue on its clone`, which picks the same clone back up
+from the journal rather than making another one.
+
 After you confirm, the toolkit cold-boots the clone, verifies the Kitsune package, the root daemon,
 and a root shell, disables the temporary vendor root again, and then repeats the same three checks.
 Success is reported only when those checks still pass after the cleanup, because disabling the vendor

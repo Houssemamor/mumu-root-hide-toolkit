@@ -655,7 +655,11 @@ function Install-Android12Root {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The installed Kitsune app did not start on the clone. Open it from the emulator and repeat the guided install.' -Data (New-Android12Recovery -Code 'APK_LAUNCH_FAILED' -Step 'apk-launch' -SourceIndex $sourceIndex -CloneIndex $cloneIndex -CloneName $cloneName)
     }
 
-    $promptText = $script:ToolkitKitsunePrompt + ' ' + $script:ToolkitKitsuneRejection
+    # The prompt answers the wrong question if it only names the app option: the operator is asked to
+    # type something here, and this is the second gate, so the word CONFIRM that released the first one
+    # is rejected here. The exact answer is named in the prompt because the match is case sensitive, and
+    # a prompt that hides what to type strands the operator at a gate they cannot pass.
+    $promptText = 'Kitsune: choose ' + $script:ToolkitKitsunePrompt + '. Not the ordinary Direct Install and not Select and Patch a File. If the system-partition option is not shown, close the Kitsune app and open it again. Then type exactly: ' + $script:ToolkitKitsuneChoice
     try {
         Write-JournalEvent -Journal $Journal -Level 'Info' -Message "In the Kitsune app choose $promptText The workflow is paused until the operator confirms that exact choice." -Data (@{
                 Prompt = $promptText

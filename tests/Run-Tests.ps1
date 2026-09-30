@@ -4852,6 +4852,14 @@ function Invoke-Root12Tests {
         Assert-Equal 1 $promptState.Calls 'The operator was not asked exactly once for the Kitsune confirmation.'
         Assert-True ($promptState.Text -match 'Install -> Direct Install into system partition') 'The prompt did not show the exact Kitsune instruction.'
         Assert-True ($promptState.Text -match 'Select and Patch a File') 'The prompt did not warn about the rejected Kitsune options.'
+        # The operator is asked to type an answer here, and this is the second gate, so CONFIRM is
+        # rejected. A prompt that names the app option without naming the answer strands them at a gate
+        # they cannot pass, so the exact string is stated in the prompt and the advice about the missing
+        # option is carried with it.
+        Assert-True ($promptState.Text -match 'Then type exactly: Direct Install into system partition') 'The prompt does not state the exact answer the operator has to type.'
+        Assert-True ($promptState.Text -match '(?i)close the Kitsune app and open it again') 'The prompt does not say what to do when the system-partition option is not shown.'
+        # The answer the prompt names is the answer the gate accepts, so the two cannot drift apart.
+        Assert-True (Test-KitsuneConfirmation -Confirmation ([regex]::Match($promptState.Text, 'Then type exactly: (.+)$').Groups[1].Value)) 'The answer named in the prompt is not the answer the gate accepts.'
         Assert-Equal $true $promptedCase.Result.Data.RootVerified 'A prompted Kitsune run did not verify the root shell.'
 
         $defaultPromptState = @{ Text = ''; Calls = 0 }
