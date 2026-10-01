@@ -251,7 +251,15 @@ function Get-ToolkitRootShellStatus {
     if ($Call.ExitCode -eq 0 -and ([string]$Call.Text) -match '(?m)uid=0\(') {
         return Get-ToolkitResult -Status 'Success' -Message 'The root shell returned a root identity.' -Data (@{ Code = 'OK'; RootShell = $true })
     }
-    if ($Call.ExitCode -eq 127) {
+    # The guest says the binary is not there either with exit 127 or in the shell's own words, and this
+    # build normalises the exit code, so the wording is the only reliable signal. Without it a missing su
+    # was classified as a denial, which is a different claim about the guest, and it also stopped the
+    # fallback probe from ever running on exactly the guests that need it.
+    #
+    # Only the unambiguous phrasings count. "Permission denied" and a non-root uid are denials and are
+    # deliberately not matched, so a refusal is never retried into a success by a fallback that would
+    # answer.
+    if ($Call.ExitCode -eq 127 -or ([string]$Call.Text) -match '(?i)(no such file or directory|inaccessible or not found)') {
         return Get-ToolkitResult -Status 'CriticalError' -Message 'The root shell binary is not available in the guest, so the root state is unknown and no denial can be concluded.' -Data (@{ Code = 'ROOT_UNAVAILABLE' })
     }
     if ($Call.ExitCode -ne 0 -and [string]::IsNullOrWhiteSpace([string]$Call.Text)) {

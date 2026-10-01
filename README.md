@@ -24,7 +24,7 @@ tool, and it is not uniform.
 | `Detect` | yes | reports installations and instances correctly, and refuses an ambiguous selection rather than guessing |
 | `Verify` | yes | the read-only report renders every field, and on a running guest it reads a real root state rather than an unreachable one |
 | `Target` | yes | all three modes were exercised: `Identify` read-only on instances 0 and 2, `Create` added instances 1 and 3, `Clone` added instances 4 and 5 |
-| `Root12` | yes, with a caveat | reports `Warning` with `ROOT_AFTER_DISABLE_ROLLED_BACK` and keeps the MuMu vendor root enabled |
+| `Root12` | yes | reports a `Success` root on a Kitsune clone. The temporary vendor root is disabled, and the root still verifies afterwards through Magisk's own binary |
 | `Root15` | yes, with a caveat | **qualified.** Clone 4 returned `RootVerified=true` with `KernelSU = v3.2.5` and `KitsuneAbsent = True`. The caveat is the one step a person has to take: KernelSU grants nothing until superuser is given to the ADB shell |
 | `Conceal` | **no** | unqualified. The Vector module install has not succeeded on a live clone, and the target package is not installed on it |
 | `RemoveAds` | **no** | wrote nothing. There is no campaign file anywhere in the Chinese-edition installation |
@@ -32,12 +32,12 @@ tool, and it is not uniform.
 
 Four things the table does not say on its own:
 
-- **`Root12` leaves MuMu's vendor root doing the work, not Kitsune's.** Disabling the vendor root on
-  MuMu 6.8 removes the Kitsune `su` path, so the toolkit turns the vendor root back on and reports
-  `Warning`. A result of `RootVerified=true` there means a root shell was verified after that
-  rollback; it does not mean the Kitsune root survived on its own.
-- **`Root12` has no noninteractive path at all.** It is menu-only, so the one Android 12 action that
-  is proven cannot be automated from a script.
+- **`Root12` also needs a person, once.** Kitsune is allowlist based in the same way KernelSU is, and the
+  Kitsune app's **Superuser** tab has to grant the **ADB shell (uid 2000)** before the root shell answers.
+  Without that grant the first run stops with `ROOT_DENIED`, which is a real refusal rather than a
+  missing file. The vendor root stays enabled at that point, so nothing is lost by re-running.
+- **`Root12` has no noninteractive path at all.** It is menu-only, so the Android 12 action cannot be
+  automated from a script.
 - **`Root15` needs a person, once.** The first run stops at `ROOT_PERMISSION_PENDING` with a handoff,
   because KernelSU is allowlist based and nothing is permitted until you grant it. After the grant the
   same clone resumes and verifies. That is a documented step, not a defect, but it does mean `Root15`
@@ -843,14 +843,30 @@ and a root shell, disables the temporary vendor root again, and then repeats the
 Success is reported only when those checks still pass after the cleanup, because disabling the vendor
 root can remove the root shell.
 
-On MuMu 6.8 that cleanup does remove `/system/bin/su` while the Kitsune files and one `magiskd`
-survive. The adb shell on that build stays `uid=2000`, root comes from the Magisk `su`, and the
-`su` path lives at `/system/bin/su`, so the Kitsune root does not survive the cleanup. When the
-checks after the cleanup fail, the toolkit therefore enables the vendor root again on that clone,
-reads the settings back, repeats the three checks, and reports a `Warning` with the code
-`ROOT_AFTER_DISABLE_ROLLED_BACK`, `VendorRootRetained`, and a message that names the retained vendor
-root and the removed `su` path. The journal is completed as a warning, the clone keeps the vendor
-root on, and the result is never reported as a `Success` root result.
+On MuMu 6.8 that cleanup does remove the `/system/bin/su` **symlink**, and the Kitsune files plus one
+`magiskd` survive. The symlink points at `/system/bin/magisk`, which is Kitsune's own binary, and that
+binary survives the cleanup too. The adb shell on that build stays `uid=2000`, so the root check has to
+go through Magisk's own entry point rather than through `su`, and it does:
+
+```text
+su -c id            ->  /system/bin/sh: /system/bin/su: No such file or directory
+which su            ->  /system/bin/su
+/system/bin/magisk  ->  -rwxr-xr-x  root root  280296
+magisk su -c id     ->  uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
+```
+
+**So the Kitsune root does survive disabling the vendor root.** What dies is the `su` path, and the root
+is still there behind Magisk's binary. The root probe tries `su -c id` first and then
+`magisk su -c id`, so the check after the cleanup finds the root and the action reports a `Success`
+rather than a rolled-back `Warning`. A guest that answers the canonical probe with a missing binary in
+its own words, rather than exit 127, is read as a missing binary for exactly this reason; a guest that
+answers with a **refusal** is still a refusal and is never retried into a success.
+
+The rollback is retained for the case where it is genuinely needed. If the root is not found after the
+cleanup, the toolkit enables the vendor root again on that clone, reads the settings back, repeats the
+three checks, and reports a `Warning` with the code `ROOT_AFTER_DISABLE_ROLLED_BACK` and
+`VendorRootRetained`. The journal is completed as a warning, the clone keeps the vendor root on, and
+the result is never reported as a `Success` root result.
 
 A script must check `Status`, not the process exit code, because a `Warning` exits `0`. If the
 rollback itself fails, the toolkit reports `CriticalError` with the code `ROOT_RECOVERY_FAILED`, fails
@@ -1285,12 +1301,13 @@ These are the honest limits of the current state of the code.
 - Live runs were performed on a real installation, on the Chinese-edition MuMu 6.8.0.0 build. The
   results are mixed and are stated one action at a time in [Status](#status). Every other statement
   here is still covered only by fixture tests and parser checks.
-- Android 12 is qualified on this build, with one caveat: the Kitsune root is installed and verified,
-  and the MuMu vendor root is then left enabled, so the action reports `Warning` with
-  `ROOT_AFTER_DISABLE_ROLLED_BACK` and `RootVerified=true` rather than `Success`. On MuMu 6.8 the
-  Kitsune `su` path is `/system/bin/su` and disabling the vendor root removes it while the adb shell
-  stays `uid=2000`, so the retained vendor root is the working state, not a leftover. The retained
-  vendor root is recorded in the journal and in the result.
+- Android 12 is qualified on this build. On clone 6 the Kitsune `su` symlink is removed when the
+  temporary vendor root is disabled, and the root is verified again through `/system/bin/magisk`, which
+  survives, so the action reports `Success` rather than rolling the vendor root back on. The root shell
+  answer is `uid=0(root) ... context=u:r:magisk:s0`. The `ROOT_AFTER_DISABLE_ROLLED_BACK` rollback is
+  retained for a guest where the root is genuinely not found afterwards, and a **refusal** is still a
+  refusal: `Permission denied` is never retried through the fallback probe. A person has to grant the
+  ADB shell in the Kitsune Superuser tab before the first run can succeed, exactly as on Android 15.
 - Android 15 is qualified on this build, with one manual step. Clone 4 of the Android 15 run reported
   `Code = OK`, `RootShell = True`, `KernelSUVersion = v3.2.5`, and `KitsuneAbsent = True`, and the guest
   answers `su -c id` with `uid=0(root) ... context=u:r:ksu:s0`. The step a person has to take is the

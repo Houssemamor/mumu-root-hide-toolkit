@@ -6881,6 +6881,33 @@ function Invoke-VerificationTests {
     Assert-Equal 'ADB_FAILED' ([string]$failedProbe.Data.Code) 'A root probe that could not be executed is not reported as an unreadable guest.'
     Assert-Equal 1 $probeState.Calls.Count 'A root probe that could not be executed was asked a fallback question.'
 
+    # This build normalises the exit code, so the guest's own wording is the only signal that the binary is
+    # absent. Reading it as a denial both claimed something the guest never said and stopped the fallback
+    # from running on exactly the guest that needs it, which is a real Kitsune clone with the su symlink
+    # removed and the magisk binary still present.
+    $absentWording = '/system/bin/sh: /system/bin/su: No such file or directory'
+    $probeState.Answers = @{ '-c shell su -c id' = @(1, $absentWording); '-c shell magisk su -c id' = @(0, $rootText) }
+    $probeState.Calls = @()
+    $wordingProbe = Invoke-ToolkitRootShellProbe -ManagerPath 'MuMuManager.exe' -InstanceIndex 0 -Runner $probeRunner
+    Assert-Equal 'Success' ([string]$wordingProbe.Status) "A guest reporting a missing su in its own words was not given the fallback probe: $($wordingProbe.Message)"
+    Assert-True ([string]$wordingProbe.Data.Probe -match 'magisk su') 'A root found after a missing su was not attributed to the fallback probe.'
+
+    $inaccessibleProbe = Get-ToolkitRootShellStatus -Call ([pscustomobject]@{ ExitCode = 1; Text = '/system/bin/sh: su: inaccessible or not found' })
+    Assert-Equal 'ROOT_UNAVAILABLE' ([string]$inaccessibleProbe.Data.Code) 'A guest reporting an inaccessible su is not reported as a missing binary.'
+
+    # A refusal names the policy, not a missing file, and must stay a refusal so the fallback cannot turn
+    # it into a success.
+    foreach ($denialText in @('su: Permission denied', 'Permission denied')) {
+        $denialStatus = Get-ToolkitRootShellStatus -Call ([pscustomobject]@{ ExitCode = 1; Text = $denialText })
+        Assert-Equal 'ROOT_DENIED' ([string]$denialStatus.Data.Code) "A refused root shell ($denialText) was read as a missing binary."
+    }
+    $probeState.Answers = @{ '-c shell su -c id' = @(1, 'su: Permission denied'); '-c shell magisk su -c id' = @(0, $rootText) }
+    $probeState.Calls = @()
+    $deniedWordingProbe = Invoke-ToolkitRootShellProbe -ManagerPath 'MuMuManager.exe' -InstanceIndex 0 -Runner $probeRunner
+    Assert-Equal 'CriticalError' ([string]$deniedWordingProbe.Status) 'A refusal naming a permission was retried into a success by the fallback probe.'
+    Assert-Equal 'ROOT_DENIED' ([string]$deniedWordingProbe.Data.Code) 'A refusal naming a permission does not report a denial.'
+    Assert-Equal 1 $probeState.Calls.Count 'A refusal naming a permission was asked a fallback question.'
+
     $verificationSource = [IO.File]::ReadAllText($verificationScriptPath)
     Assert-True ($verificationSource -notmatch "(?i)Code\s*=\s*'UNKNOWN'") 'The shared verification source reports an UNKNOWN failure code.'
     foreach ($forbidden in @(
@@ -11471,7 +11498,10 @@ function Invoke-DocsTests {
     Assert-True ($readme -notmatch '(?i)no live (qualification|run|test)') 'README still claims that no live qualification was performed, which is false.'
     foreach ($liveStatement in @(
             @{ Pattern = '(?is)Android 12.{0,200}?\bqualified\b'; Message = 'README does not state that Android 12 is qualified.' }
-            @{ Pattern = '(?i)retained vendor root'; Message = 'README does not state that the Android 12 qualification retained the vendor root.' }
+            @{ Pattern = '(?i)u:r:magisk:s0'; Message = 'README does not record the guest evidence that the Android 12 root is Magisk and not the vendor root.' }
+            @{ Pattern = '(?is)ROOT_AFTER_DISABLE_ROLLED_BACK.{0,200}?retained'; Message = 'README does not say the Android 12 rollback is retained for a genuinely missing root.' }
+            @{ Pattern = '(?i)refusal\*\* is still a\s+refusal'; Message = 'README does not say a refusal is never retried through the fallback probe.' }
+            @{ Pattern = '(?i)Superuser\*\* tab has to grant'; Message = 'README does not say Android 12 needs the ADB shell granted in the Kitsune Superuser tab.' }
             @{ Pattern = '(?i)Chinese[- ]edition MuMu 6\.8\.0\.0'; Message = 'README does not scope the live results to the Chinese-edition MuMu 6.8.0.0 build.' }
             @{ Pattern = '(?i)Android 15 is qualified on this build'; Message = 'README does not state that Android 15 is qualified.' }
             @{ Pattern = 'KitsuneAbsent = True'; Message = 'README does not record the live Android 15 Kitsune absence.' }
