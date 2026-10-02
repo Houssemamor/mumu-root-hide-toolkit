@@ -727,11 +727,12 @@ function Get-ToolkitGuestState {
             $guest['VectorModuleInstalled'] = $null
             $guest['Failure'] = $guest['Failure'] + " The Vector module at $modulePath could not be read: $([string]$module.Text)"
         }
-        elseif ($null -ne $module -and ([string]$module.Text) -match '(?i)no such file') {
-            # Only the guest saying the path is not there is an absence. Every other non-zero answer is a
-            # guest that did not look: a stopped instance answers with nothing at all, a guest whose root
-            # has no su answers that su is missing, and a guest refused the read answers that. Reading any
-            # of those as "not installed" is a claim about a module nobody was able to check.
+        elseif ($null -ne $module -and ([string]$module.Text) -match '(?i)no such file or directory' -and
+            ([string]$module.Text) -match [regex]::Escape([string]$modulePath)) {
+            # Only the guest saying the probed path is not there is an absence. The missing path has to be
+            # named in the answer, because on a clone with no su at all the same words describe the command
+            # word rather than the module, and reading that as an absence reports a module that is installed
+            # as not installed.
             $guest['VectorModuleInstalled'] = $false
         }
         elseif ($null -ne $module) {

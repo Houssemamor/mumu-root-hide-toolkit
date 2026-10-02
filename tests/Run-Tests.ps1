@@ -8735,6 +8735,26 @@ function New-MenuGuestRunner {
         if (-not $command.StartsWith('adb')) {
             return Invoke-CheckedProcess -FilePath $ActualFilePath -ArgumentList $ActualArgumentList
         }
+        # A guest can answer differently depending on which privileged word it was given, so a key that
+        # names the word is tried before the generic one. Without this a fixture cannot tell a guest that
+        # has no su from a guest that has it, because the same inner command matches both forms.
+        $qualified = @()
+        foreach ($word in @('magisk su', 'su')) {
+            if ($command -match ('shell ' + [regex]::Escape($word) + ' -c(?: ''(.*)''|(.*))$')) {
+                $inner = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+                $inner = ([string]$inner).Trim()
+                $qualified += ($word + " -c '" + $inner + "'")
+                $qualified += ($word + ' -c ' + $inner)
+            }
+        }
+        foreach ($pattern in $qualified) {
+            if ($Responses.ContainsKey($pattern)) {
+                return [pscustomobject]@{
+                    ExitCode = [int]$Responses[$pattern][0]
+                    Text     = [string]$Responses[$pattern][1]
+                }
+            }
+        }
         foreach ($pattern in @($Responses.Keys)) {
             if ($command -like ('*' + $pattern + '*')) {
                 return [pscustomobject]@{
@@ -9458,6 +9478,14 @@ function Invoke-MenuTests {
         $absentModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(1, 'ls: /data/adb/modules/zygisk_vector: No such file or directory')
         $absentModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $absentModuleResponses)
         Assert-Equal $false $absentModuleReport.Guest.VectorModuleInstalled 'A guest that said the module path does not exist was not reported as an absent module.'
+
+        # The same words can describe the command word rather than the module, which is what happens on a
+        # clone whose su symlink is gone. Reading that as an absence reports a module that is installed as
+        # not installed, so the probed path has to be the one the guest says is missing.
+        $missingSuModuleResponses = Get-MenuGuestResponses
+        $missingSuModuleResponses['ls /data/adb/modules/zygisk_vector'] = @(1, '/system/bin/sh: /system/bin/su: No such file or directory')
+        $missingSuModuleReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -Journal $null -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses $missingSuModuleResponses)
+        Assert-Equal $null $missingSuModuleReport.Guest.VectorModuleInstalled 'A missing su was read as an absent Vector module.'
 
         # A module directory is not a loaded module: the root implementation keeps a disabled module in
         # place and skips it at boot, so a present module that carries the disable marker is reported as a
@@ -10436,6 +10464,20 @@ $unresumableRoot = Join-Path $testRoot 'menu unresumable root'
         Assert-Equal 'KERNELSU_ABSENT' $kitsuneEvidenceReport.Concealment.Code 'The report did not report the absent KernelSU package on a Kitsune clone.'
         Assert-Equal $false $kitsuneEvidenceReport.Concealment.KernelSUInstalled 'The report reported a KernelSU package on a Kitsune clone that has none.'
         Assert-Equal 1 @($kitsuneEvidenceReport.Concealment.InScope).Count 'The report did not observe the concealment scope on a Kitsune clone.'
+
+        # A clone that has been rooted successfully has no su left, so every read on it has to ask for
+        # the command word that guest actually answers. The fixture runner is what makes that modelable:
+        # without prefix-qualified keys one inner command answers for both words, and a guest with no su
+        # cannot be told apart from a guest that has one. Concealment's prefix resolution and its
+        # evidence read both depend on this.
+        $prefixRunner = New-MenuGuestRunner -Responses @{
+            'su -c id'    = @(1, '/system/bin/sh: /system/bin/su: No such file or directory')
+            'magisk su -c id' = @(0, 'uid=0(root) gid=0(root)')
+        }
+        $suProbe = & $prefixRunner 'adb' @('adb', '-v', '1', '-c', 'shell su -c id')
+        Assert-Equal 1 $suProbe.ExitCode 'The fixture runner answered a missing su with the reply registered for the magisk word.'
+        $magiskProbe = & $prefixRunner 'adb' @('adb', '-v', '1', '-c', 'shell magisk su -c id')
+        Assert-Equal 0 $magiskProbe.ExitCode 'The fixture runner did not answer the magisk probe with the reply registered for the magisk word.'
 
         $noCloneEvidenceReport = Get-ToolkitReport -Install $concealInstall.Install -Instance ([pscustomobject]@{ Index = 2; Name = 'Android 12'; AndroidVersion = '12.0'; Install = $concealInstall.Install }) -StateRoot (Join-Path $testRoot 'menu no clone evidence state') -Runner (New-MenuGuestRunner -Responses $evidenceResponses)
         Assert-Equal 'CLONE_UNVERIFIED' $noCloneEvidenceReport.Concealment.Code 'The report collected concealment evidence without a verified clone record.'

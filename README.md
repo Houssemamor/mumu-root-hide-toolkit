@@ -26,7 +26,7 @@ tool, and it is not uniform.
 | `Target` | yes | all three modes were exercised: `Identify` read-only on instances 0 and 2, `Create` added instances 1 and 3, `Clone` added instances 4 and 5 |
 | `Root12` | yes | reports a `Success` root on a Kitsune clone. The temporary vendor root is disabled, and the root still verifies afterwards through Magisk's own binary |
 | `Root15` | yes, with a caveat | **qualified.** Clone 4 returned `RootVerified=true` with `KernelSU = v3.2.5` and `KitsuneAbsent = True`. The caveat is the one step a person has to take: KernelSU grants nothing until superuser is given to the ADB shell |
-| `Conceal` | **no** | unqualified, for one reason: the pinned Vector module **is** installed on a live clone now, but the target package is not installed on it, so the action refuses with `PACKAGE_NOT_INSTALLED` |
+| `Conceal` | **partial** | the blacklist scope write and its read-back are qualified on a live Android 12 clone: the `Root` template and the `scope` map were read back out of the guest's own `config.json`. Not qualified: whether Vector actually *loads* at boot, which this host cannot observe |
 | `RemoveAds` | **no** | wrote nothing. There is no campaign file anywhere in the Chinese-edition installation |
 | `Restore` | **no** | nothing to restore, because nothing was suppressed |
 
@@ -1117,9 +1117,10 @@ A pinned dependency that is never installed is worth stating plainly, because "t
 ### What is not proven about this
 
 The steps above are now a **recorded success** rather than an intention: the pinned v2.2 flat archive
-passed step 5 on a live clone and the module was read back at `/data/adb/modules/zygisk_vector`. What is
-still unproven is concealment itself, because the target app is not installed on that clone. See
-[Status](#status) and [Concealment scope](#concealment-scope).
+passed step 5 on a live clone and the module was read back at `/data/adb/modules/zygisk_vector`. The
+blacklist `Root` template and the resulting `scope` map were then read back out of the clone's own HMA
+`config.json`. What is still unproven is whether Vector *loads*, because reading Zygisk's own state is
+not possible on this host. See [Status](#status) and [Concealment scope](#concealment-scope).
 
 ## Advertisement scope and restore
 
@@ -1319,11 +1320,12 @@ These are the honest limits of the current state of the code.
   [Android 15](#android-15-built-in-root-and-explicit-confirmation); without it the first run stops at
   `ROOT_PERMISSION_PENDING` and says so. A source instance that already carries the Kitsune package
   still cannot be qualified, because `Root15` reports `KITSUNE_PRESENT` for it.
-- Concealment is unqualified for one remaining reason: the pinned Vector v2.2 module **is** installed on
-  a live Android 12 clone and was read back there, but the target package `jp.pokemon.pokemontcgp` is
-  not installed on that clone, so the action refuses with `PACKAGE_NOT_INSTALLED`. Install the app in the
-  clone, or select an app that is already there, and the scope step can be exercised. Stated in full
-  under [Concealment scope](#concealment-scope).
+- Concealment is **partially** qualified. What the host proved: the pinned Vector v2.2 module installs,
+  the blacklist `Root` template is written into HMA's `config.json`, and a named app is mapped into that
+  template's scope. What it could not prove: that Vector is loaded and active, because Zygisk's own state
+  is not readable here. `Conceal` therefore reports `KERNELSU_ABSENT` on an Android 12 Kitsune clone even
+  when the scope is correct, because that clone has no KernelSU package for the superuser profile step.
+  See [Concealment scope](#concealment-scope).
 - `RemoveAds` was a no-op on this host. There is no campaign file anywhere in the Chinese-edition
   installation, so the action reported success with an empty path set and wrote nothing. That is a
   fact about this installation, not evidence that the advertisement logic works.

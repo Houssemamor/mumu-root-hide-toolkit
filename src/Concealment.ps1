@@ -1330,6 +1330,13 @@ function Get-ConcealmentEvidence {
         return $evidence
     }
     $evidence['Target'] = [string]$CloneIndex
+    # The same missing-su that the installer has to cope with applies to every read on the clone: the
+    # successful root step removed the symlink, so a read that assumes su reports a guest nobody asked
+    # about. Resolve the command word once, against the clone, before anything is read from it.
+    $prefix = Resolve-ToolkitGuestShellPrefix -ManagerPath $manager -InstanceIndex $CloneIndex -Runner $Runner
+    if ($prefix.Status -eq 'Success') {
+        $script:ConcealmentGuestShellPrefix = [string]$prefix.Data.Prefix
+    }
     $config = Read-ConcealmentHmaConfig -ManagerPath $manager -InstanceIndex $CloneIndex -Runner $Runner
     if ($config.Status -ne 'Success') {
         $evidence['Status'] = [string]$config.Status
