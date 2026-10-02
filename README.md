@@ -26,7 +26,7 @@ tool, and it is not uniform.
 | `Target` | yes | all three modes were exercised: `Identify` read-only on instances 0 and 2, `Create` added instances 1 and 3, `Clone` added instances 4 and 5 |
 | `Root12` | yes | reports a `Success` root on a Kitsune clone. The temporary vendor root is disabled, and the root still verifies afterwards through Magisk's own binary |
 | `Root15` | yes, with a caveat | **qualified.** Clone 4 returned `RootVerified=true` with `KernelSU = v3.2.5` and `KitsuneAbsent = True`. The caveat is the one step a person has to take: KernelSU grants nothing until superuser is given to the ADB shell |
-| `Conceal` | **no** | unqualified. The Vector module install has not succeeded on a live clone, and the target package is not installed on it |
+| `Conceal` | **no** | unqualified, for one reason: the pinned Vector module **is** installed on a live clone now, but the target package is not installed on it, so the action refuses with `PACKAGE_NOT_INSTALLED` |
 | `RemoveAds` | **no** | wrote nothing. There is no campaign file anywhere in the Chinese-edition installation |
 | `Restore` | **no** | nothing to restore, because nothing was suppressed |
 
@@ -992,21 +992,26 @@ manual handoff stays. On that clone the root comes from Kitsune, and the HMA sco
 are the parts this toolkit can verify from observation. That result is also carried in the read-only
 `Verify` report, so it is not a claim you have to take on trust.
 
-**Concealment is unqualified on this host, for two independent reasons, and both are visible in the
-`Verify` report.** The pinned Vector module was **not installed**: in the earlier Android 12
-concealment run, the dependency step on that run's clone 4 stopped with `MODULE_LAYOUT_UNSUPPORTED`
-before the move, so the HMA artifact was installed and verified while the Vector artifact was not
-installed at all. Separately, the selected app `jp.pokemon.pokemontcgp` is not installed on that
-clone, so the action refuses it with `PACKAGE_NOT_INSTALLED` and no concealment scope is applied. No
-artifact is invented for a package that is absent; install the app on the clone yourself, or select
-apps that are installed, before concealment can be called qualified. The Vector install path has been
-exercised only by fixtures, and the flat-archive gate for the pinned v2.2 asset has not been run
-against a live clone.
+**Concealment is unqualified on this host, for one reason rather than two.** The pinned Vector module
+**is now installed on a live clone**: `Install-ConcealmentDependencies` verified the v2.2 artifact by
+size and SHA-256, pushed it, extracted it, checked that its root `module.prop` declares
+`id=zygisk_vector`, and moved it to `/data/adb/modules/zygisk_vector`, where it was read back on the
+guest. What is still missing is the other half: the selected app `jp.pokemon.pokemontcgp` is not
+installed on that clone, so the action refuses with `PACKAGE_NOT_INSTALLED` and no concealment scope is
+applied. No artifact is invented for a package that is absent.
 
-That clone 4 was an **Android 12** clone and it no longer exists. A later Android 15 run also produced
-a clone 4, which is the qualified KernelSU clone described under
-[Android 15](#android-15-built-in-root-and-explicit-confirmation); the two are different instances on
-different Android versions and only the Android 12 one is the subject of this paragraph.
+That install used to fail on the live clone with `MODULE_LAYOUT_UNSUPPORTED`, and before that the flat
+archive itself extracted fine by hand. The real cause was underneath: a correctly rooted clone has **no
+`/system/bin/su`**, because disabling the MuMu vendor root removes that symlink, and every concealment
+guest command is issued through `su -c`. The extraction never ran. Concealment now resolves which
+privileged word the guest answers once, against the clone and after the journal is writable, and uses
+`magisk su` when that is the one that works. The Kitsune root and concealment can therefore be run in
+sequence, which is what `Full setup` does.
+
+The earlier Android 12 concealment run, on its own clone 4, is still recorded as failed. Note that two
+different runs both produced a clone 4: that Android 12 one and the qualified Android 15 clone described
+under [Android 15](#android-15-built-in-root-and-explicit-confirmation); they are different instances on
+different Android versions.
 
 ## What a Magisk module is here, and why one is installed
 
@@ -1111,11 +1116,10 @@ A pinned dependency that is never installed is worth stating plainly, because "t
 
 ### What is not proven about this
 
-The Vector install path has been exercised by **fixtures only**. On the live host it stopped at step 5
-with `MODULE_LAYOUT_UNSUPPORTED`, before the move, so the flat-archive gate has never been run against a
-real clone. That is why the steps above describe the intended behaviour rather than a recorded success,
-and it is the first thing to fix if you are re-qualifying this on your own machine. See
-[Status](#status).
+The steps above are now a **recorded success** rather than an intention: the pinned v2.2 flat archive
+passed step 5 on a live clone and the module was read back at `/data/adb/modules/zygisk_vector`. What is
+still unproven is concealment itself, because the target app is not installed on that clone. See
+[Status](#status) and [Concealment scope](#concealment-scope).
 
 ## Advertisement scope and restore
 
@@ -1315,11 +1319,11 @@ These are the honest limits of the current state of the code.
   [Android 15](#android-15-built-in-root-and-explicit-confirmation); without it the first run stops at
   `ROOT_PERMISSION_PENDING` and says so. A source instance that already carries the Kitsune package
   still cannot be qualified, because `Root15` reports `KITSUNE_PRESENT` for it.
-- Concealment is unqualified, for two independent reasons: the Vector module install has not
-  succeeded on a live clone, and the target package `jp.pokemon.pokemontcgp` is not installed on the
-  Android 12 clone 4 of the earlier concealment run. Both are stated in full under
-  [Concealment scope](#concealment-scope). Note that two different runs both produced a clone 4: the
-  concealment run below and the Android 15 run above, on different Android versions.
+- Concealment is unqualified for one remaining reason: the pinned Vector v2.2 module **is** installed on
+  a live Android 12 clone and was read back there, but the target package `jp.pokemon.pokemontcgp` is
+  not installed on that clone, so the action refuses with `PACKAGE_NOT_INSTALLED`. Install the app in the
+  clone, or select an app that is already there, and the scope step can be exercised. Stated in full
+  under [Concealment scope](#concealment-scope).
 - `RemoveAds` was a no-op on this host. There is no campaign file anywhere in the Chinese-edition
   installation, so the action reported success with an empty path set and wrote nothing. That is a
   fact about this installation, not evidence that the advertisement logic works.

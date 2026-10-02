@@ -183,15 +183,25 @@ function Test-ConcealmentPackageName {
     return ($Name -cmatch $script:ConcealmentPackagePattern)
 }
 
+$script:ConcealmentGuestShellPrefix = ''
+
 function New-ConcealmentGuestCommand {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Command,
-        [int]$InstanceIndex = -1
+        [int]$InstanceIndex = -1,
+        [string]$ShellPrefix = ''
     )
 
+    if ([string]::IsNullOrWhiteSpace($ShellPrefix)) {
+        $ShellPrefix = $script:ConcealmentGuestShellPrefix
+    }
+    if ([string]::IsNullOrWhiteSpace($ShellPrefix)) {
+        $ShellPrefix = 'su'
+    }
+
     # The shared funnel owns the quoting and the allowlist; this wrapper only adds the concealment state shape.
-    $request = New-ToolkitGuestCommand -Command $Command
+    $request = New-ToolkitGuestCommand -Command $Command -ShellPrefix $ShellPrefix
     if ($request.Status -ne 'Success') {
         return Get-ToolkitResult -Status 'CriticalError' -Message $request.Message -Data (New-ConcealmentState -Code 'GUEST_COMMAND_INVALID' -Step 'guest-command' -InstanceIndex $InstanceIndex)
     }
@@ -793,6 +803,16 @@ function Install-ConcealmentDependencies {
     catch {
         return New-ToolkitRootFailure -Journal $Journal -Message 'The verified concealment dependencies could not be journaled.' -Data (New-ConcealmentState -Code 'JOURNAL_WRITE_FAILED' -Step 'asset' -InstanceIndex $instanceIndex -Fields $cloneFields)
     }
+
+    # Which privileged word this guest answers is resolved once, against the clone and never the source,
+    # and only after the journal is writable, because a run that cannot record what it did must not touch a
+    # guest at all. A clone that Root12 rooted properly has no /system/bin/su, because disabling the vendor
+    # root removes that symlink, so asking su would fail every command here before it reached the guest.
+    $shellPrefix = Resolve-ToolkitGuestShellPrefix -ManagerPath $manager -InstanceIndex $instanceIndex -Runner $Runner
+    if ($shellPrefix.Status -ne 'Success') {
+        return New-ToolkitRootFailure -Journal $Journal -Message $shellPrefix.Message -Data (New-ConcealmentState -Code ([string]$shellPrefix.Data.Code) -Step 'shell-prefix' -InstanceIndex $instanceIndex -Fields $cloneFields)
+    }
+    $script:ConcealmentGuestShellPrefix = [string]$shellPrefix.Data.Prefix
 
     $installed = @()
     $alreadyPresent = @()

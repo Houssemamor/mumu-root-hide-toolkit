@@ -7308,6 +7308,9 @@ function New-ConcealmentGuestState {
         ConfigText = ''
         Packages = @()
         Modules = @()
+        # Which privileged word the modelled guest answers. A correctly rooted clone has no /system/bin/su,
+        # so the default here is the Magisk form; a fixture that wants the older guest sets RootShellPrefix.
+        RootShellPrefix = 'magisk su'
         HmaPackage = [string]$script:ConcealmentRootPackages[0]
         AdbFailPattern = ''
         AdbFailExitCode = 1
@@ -7520,6 +7523,16 @@ function New-ConcealmentManagerRunner {
         if ($request -ceq 'shell pm list packages') {
             return [pscustomobject]@{ ExitCode = 0; Text = (@($State.Packages | ForEach-Object { 'package:' + [string]$_ }) -join [Environment]::NewLine) }
         }
+        # The privileged word probe. A fixture that names a working word in RootShellPrefix answers only
+        # that one, which is how the "su is gone, magisk answers" guest is modelled.
+        if ($request -match '^shell (?:magisk )?su -c id$') {
+            $answered = ([string]$State.RootShellPrefix -eq 'su' -and $request -ceq 'shell su -c id') -or
+                ([string]$State.RootShellPrefix -eq 'magisk su' -and $request -ceq 'shell magisk su -c id')
+            if ($answered) {
+                return [pscustomobject]@{ ExitCode = 0; Text = 'uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0' }
+            }
+            return [pscustomobject]@{ ExitCode = 1; Text = '/system/bin/sh: su: No such file or directory' }
+        }
         if ($request -match '^shell dumpsys package (\S+)$') {
             $name = $Matches[1]
             if ($State.Packages -cnotcontains $name) {
@@ -7530,7 +7543,7 @@ function New-ConcealmentManagerRunner {
                 Text = ('Package [' + $name + '] (a1b2c3):' + [Environment]::NewLine + '    versionCode=1 minSdk=28' + [Environment]::NewLine + '    versionName=1.0')
             }
         }
-        if ($request -match '^shell su -c ''(.*)''$') {
+        if ($request -match '^shell (?:magisk )?su -c ''(.*)''$') {
             return Invoke-ConcealmentGuestShell -State $State -Command $Matches[1]
         }
         if ($request -match '^install -r "(.+)"$') {
@@ -7895,6 +7908,25 @@ function Invoke-ConcealmentTests {
     Assert-True (@($dependencyResult.Data.Installed) -ccontains 'hma') 'The verified HMA APK was not reported as installed.'
     Assert-True (@($dependencyResult.Data.Installed) -ccontains 'vector') 'The verified Vector module was not reported as installed.'
     Assert-Equal 0 @($dependencyResult.Data.AlreadyPresent).Count 'Concealment dependency installation reported an absent dependency as already present.'
+
+    # Which privileged word the install actually used is the whole point of resolving it. A correctly rooted
+    # clone has no /system/bin/su, so an install that asks su anyway fails every command before it reaches the
+    # guest, and one that always asks magisk fails on a guest that only has su.
+    # The id probes are excluded: the resolver tries every candidate once, so seeing both probed is correct.
+    # What matters is that the work itself runs on the word that answered.
+    $magiskPrefixCalls = @(@($installState.Calls) | ForEach-Object { @($_) -join ' ' } | Where-Object { $_ -match 'adb.*-c shell ' -and $_ -notmatch 'su -c id$' })
+    Assert-True (@($magiskPrefixCalls | Where-Object { $_ -match 'shell su -c' }).Count -eq 0) 'A guest with no /system/bin/su was still asked su.'
+    Assert-True (@($magiskPrefixCalls | Where-Object { $_ -match 'shell magisk su -c' }).Count -ge 1) 'The install never used the privileged word the guest answered.'
+
+    $suOnlyState = New-ConcealmentGuestState -Install $install
+    $suOnlyState.RootShellPrefix = 'su'
+    $suOnlyState.Packages = @($script:ConcealmentRootPackages[1], $script:ConcealmentRootPackages[3], $script:ConcealmentSelectedPackage)
+    $suOnlyJournal = New-ConcealmentJournal -Root $journalRoot -Instance $instance
+    $suOnlyResult = Install-ConcealmentDependencies -Instance $instance -VerifiedClone $clone -Manifest $assets.Manifest -Journal $suOnlyJournal -CacheRoot $assetCacheRoot -Runner (New-ConcealmentManagerRunner -State $suOnlyState)
+    Assert-True ($suOnlyResult.Status -eq 'Success') "Concealment dependency installation failed on a guest that answers su. $($suOnlyResult.Message)"
+    $suOnlyCalls = @(@($suOnlyState.Calls) | ForEach-Object { @($_) -join ' ' } | Where-Object { $_ -match 'adb.*-c shell ' -and $_ -notmatch 'su -c id$' })
+    Assert-True (@($suOnlyCalls | Where-Object { $_ -match 'shell magisk su -c' }).Count -eq 0) 'A guest that answers su was asked magisk instead.'
+    Assert-True (@($suOnlyCalls | Where-Object { $_ -match 'shell su -c' }).Count -ge 1) 'The install never used the privileged word the guest answered.'
     Assert-True (@($installState.Packages) -ccontains $script:ConcealmentRootPackages[0]) 'The HMA package was not installed on the clone.'
     Assert-True (@($installState.Modules) -ccontains 'zygisk_vector') 'The Vector module was not installed on the clone.'
     Assert-ConcealmentCloneOnly -State $installState -Message 'Concealment dependency installation acted outside the verified clone.'
@@ -11538,6 +11570,9 @@ function Invoke-DocsTests {
             @{ Pattern = '(?i)supersedes'; Message = 'README does not record that the Kitsune-inheritance claim was superseded.' }
             @{ Pattern = '(?i)clone 4'; Message = 'README does not name the concealment clone index.' }
             @{ Pattern = '(?is)concealment.{0,200}?\bunqualified\b'; Message = 'README does not state that concealment is unqualified.' }
+            @{ Pattern = 'id=zygisk_vector'; Message = 'README does not record that the Vector module passed its id check on a live clone.' }
+            @{ Pattern = '(?i)PACKAGE_NOT_INSTALLED'; Message = 'README does not state that concealment now stops only on the absent target package.' }
+            @{ Pattern = '(?is)because disabling the MuMu vendor root removes that symlink'; Message = 'README does not record that a rooted clone loses its su symlink, which is why concealment resolves a different command word.' }
             @{ Pattern = 'jp\.pokemon\.pokemontcgp'; Message = 'README does not name the concealment target package.' }
             @{ Pattern = '(?i)clone 4'; Message = 'README does not name the concealment clone index.' }
             @{ Pattern = '(?is)RemoveAds.{0,200}?\bno-op\b'; Message = 'README does not state that RemoveAds was a no-op on this host.' }

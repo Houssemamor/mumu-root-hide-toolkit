@@ -60,7 +60,10 @@ function Test-ToolkitGuestPath {
 function New-ToolkitGuestCommand {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Command
+        [string]$Command,
+        # Defaults to su so every existing caller is unchanged. A caller that has resolved which privileged
+        # word this guest answers passes it in.
+        [string]$ShellPrefix = 'su'
     )
 
     $refused = {
@@ -95,7 +98,32 @@ function New-ToolkitGuestCommand {
             return (& $refused "the argument is neither a known command word nor a base64 payload: $token")
         }
     }
-    return Get-ToolkitResult -Status 'Success' -Message 'The guest command is safely quoted.' -Data ('shell su -c ' + [char]39 + $Command + [char]39)
+    return Get-ToolkitResult -Status 'Success' -Message 'The guest command is safely quoted.' -Data ('shell ' + $ShellPrefix + ' -c ' + [char]39 + $Command + [char]39)
+}
+
+# The privileged command word on a guest. It is not always "su": disabling the MuMu vendor root removes the
+# /system/bin/su symlink, so a correctly rooted clone keeps its root behind Magisk's own binary instead.
+# A caller that writes to /data/adb on such a clone has to ask Magisk rather than su, or every one of its
+# commands fails before it reaches the guest.
+$script:ToolkitGuestShellPrefixes = @('su', 'magisk su')
+
+function Resolve-ToolkitGuestShellPrefix {
+    param(
+        [string]$ManagerPath,
+        [int]$InstanceIndex,
+        [scriptblock]$Runner = $null
+    )
+
+    foreach ($prefix in $script:ToolkitGuestShellPrefixes) {
+        if (-not (Test-ToolkitCommandAvailable -Name 'Invoke-ToolkitManagerAdb')) {
+            break
+        }
+        $probe = Invoke-ToolkitManagerAdb -ManagerPath $ManagerPath -InstanceIndex $InstanceIndex -Command ('shell ' + $prefix + ' -c id') -Runner $Runner
+        if ($null -ne $probe -and $probe.ExitCode -eq 0 -and ([string]$probe.Text) -match '(?m)uid=0\(') {
+            return Get-ToolkitResult -Status 'Success' -Message ("This guest runs privileged commands through '" + $prefix + "'.") -Data (@{ Code = 'OK'; Prefix = $prefix })
+        }
+    }
+    return Get-ToolkitResult -Status 'CriticalError' -Message 'No privileged command word on this guest returned a root identity, so nothing that writes to the guest can run.' -Data (@{ Code = 'ROOT_UNAVAILABLE' })
 }
 
 # A guest command is retried only when the whole request reads state and changes nothing, so a repeated
