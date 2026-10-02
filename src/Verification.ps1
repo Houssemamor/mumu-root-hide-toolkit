@@ -419,8 +419,28 @@ function Get-ToolkitVerifiedClone {
     }
 
     foreach ($record in @(Get-ToolkitJournalRecords -StateRoot $StateRoot)) {
-        if ([string]$record.Operation -cnotmatch '^(Root12|Root15)$' -or [string]$record.State -cne 'Completed') {
+        if ([string]$record.Operation -cnotmatch '^(Root12|Root15)$') {
             continue
+        }
+        # "The operation completed" and "the clone was verified" are different facts, and conflating them
+        # made a run that verified its clone and then failed at a later check refuse to resume, which cost a
+        # full instance of disk for a retry of something that had already been set up. A failed journal is
+        # therefore accepted only when it carries the structured checkpoint where the clone was verified, so
+        # a clone that failed while being made is still refused.
+        $cloneWasVerified = ([string]$record.State -ceq 'Completed')
+        if (-not $cloneWasVerified) {
+            $verifiedCheckpoint = $null
+            foreach ($checkpoint in @($record.Checkpoints)) {
+                $checkpointData = Get-ToolkitRecordValue -Record $checkpoint -PropertyNames @('Data')
+                if ((Get-ToolkitRecordValue -Record $checkpointData -PropertyNames @('StaticReady')) -eq $true -and
+                    $null -ne (Get-ToolkitRecordValue -Record $checkpointData -PropertyNames @('CloneIndex'))) {
+                    $verifiedCheckpoint = $checkpointData
+                    break
+                }
+            }
+            if ($null -eq $verifiedCheckpoint) {
+                continue
+            }
         }
         if ($null -eq $record.Result) {
             continue
@@ -429,6 +449,24 @@ function Get-ToolkitVerifiedClone {
         $cloneIndex = Get-ToolkitRecordValue -Record $data -PropertyNames @('CloneIndex')
         $cloneName = Get-ToolkitRecordValue -Record $data -PropertyNames @('CloneName')
         $sourceIndex = Get-ToolkitRecordValue -Record $data -PropertyNames @('SourceIndex')
+
+        if (-not $cloneWasVerified) {
+            # A failed journal's result describes the failure, not the clone, so the payload is rebuilt from
+            # the verified-clone checkpoint. Returning Success with the failure's own data would name a
+            # clone in the message and then report no clone index at all.
+            $cloneIndex = Get-ToolkitRecordValue -Record $verifiedCheckpoint -PropertyNames @('CloneIndex')
+            $cloneName = Get-ToolkitRecordValue -Record $verifiedCheckpoint -PropertyNames @('CloneName')
+            $sourceIndex = Get-ToolkitRecordValue -Record $verifiedCheckpoint -PropertyNames @('SourceIndex')
+            $data = [ordered]@{
+                Code             = 'OK'
+                Step             = 'resume'
+                SourceIndex      = $sourceIndex
+                CloneIndex       = $cloneIndex
+                CloneName        = [string]$cloneName
+                AndroidVersion   = Get-ToolkitRecordValue -Record $verifiedCheckpoint -PropertyNames @('AndroidVersion')
+                RecoveredAs      = 'verified-clone-checkpoint'
+            }
+        }
         if ($null -eq $cloneIndex -or [string]::IsNullOrWhiteSpace([string]$cloneName)) {
             continue
         }

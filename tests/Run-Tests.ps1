@@ -9564,6 +9564,33 @@ function Invoke-MenuTests {
         Assert-Equal 'CriticalError' $wrongIndexClone.Status 'A clone record for another instance was accepted.'
         $absentStoreClone = Get-ToolkitVerifiedClone -StateRoot (Join-Path $testRoot 'menu fixtures\absent state') -Install $reportInstall.Install -Index 2
         Assert-Equal 'CriticalError' $absentStoreClone.Status 'A missing journal store produced a clone record.'
+
+        # A run that verified its clone and then failed at a later check is resumable, because the clone
+        # was verified and re-verifying it is what the resume path does anyway. Refusing it cost a whole
+        # instance of disk to retry something already set up.
+        $resumableRoot = Join-Path $testRoot 'menu resumable root'
+        $resumableJournal = New-OperationJournal -Root (Join-Path $resumableRoot 'journals') -Operation 'Root12' -Instance $reportInstance
+        Write-JournalEvent -Journal $resumableJournal -Level 'Info' -Message 'The Android 12 root workflow continued on the clone at index 7.' -Data ([pscustomobject]@{ CloneIndex = 7; CloneName = 'Resumable clone'; SourceIndex = 2; AndroidVersion = '12.0'; StaticReady = $true })
+        Fail-OperationJournal -Journal $resumableJournal -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'The root shell was denied.' -Data ([pscustomobject]@{ Code = 'ROOT_DENIED' }))
+        $resumedAfterFailure = Get-ToolkitVerifiedClone -StateRoot $resumableRoot -Install $reportInstall.Install -Index 2
+        Assert-Equal 'Success' $resumedAfterFailure.Status "A verified clone was not resumable after a later failure: $($resumedAfterFailure.Message)"
+        Assert-Equal 7 ([int]$resumedAfterFailure.Data.CloneIndex) 'The resumed clone did not come from the verified-clone checkpoint.'
+        # The payload has to describe the clone, not the failure that ended the run: a Success whose data
+        # carries the failure's own code and no clone index names a clone in the message and reports none.
+        Assert-Equal 'OK' ([string]$resumedAfterFailure.Data.Code) 'The recovered clone record reports the old failure code instead of its own.'
+        Assert-Equal 'Resumable clone' ([string]$resumedAfterFailure.Data.CloneName) 'The recovered clone record carries the wrong clone name.'
+        Assert-Equal 'verified-clone-checkpoint' ([string](Get-ToolkitRecordValue -Record $resumedAfterFailure.Data -PropertyNames @('RecoveredAs'))) 'The recovered clone record does not say it came from the verified-clone checkpoint.'
+
+        # The safety boundary: a run that failed while making the clone recorded no verified-clone checkpoint.
+# The index here is a plausible one, so the checkpoint's own StaticReady flag is the only thing refusing
+# it: an index that could never parse would be refused by a different guard and would prove nothing.
+$unresumableRoot = Join-Path $testRoot 'menu unresumable root'
+        $unresumableJournal = New-OperationJournal -Root (Join-Path $unresumableRoot 'journals') -Operation 'Root12' -Instance $reportInstance
+        Write-JournalEvent -Journal $unresumableJournal -Level 'Error' -Message 'The clone was not verified.' -Data ([pscustomobject]@{ CloneIndex = 7; CloneName = 'Half-made clone'; StaticReady = $false })
+        Fail-OperationJournal -Journal $unresumableJournal -Result (Get-ToolkitResult -Status 'CriticalError' -Message 'The clone was not verified.' -Data ([pscustomobject]@{ Code = 'CLONE_UNVERIFIED' }))
+        $refusedAfterFailure = Get-ToolkitVerifiedClone -StateRoot $unresumableRoot -Install $reportInstall.Install -Index 2
+        Assert-Equal 'CriticalError' $refusedAfterFailure.Status 'A run that failed while making its clone was treated as resumable.'
+        Assert-Equal 'CLONE_RECORD_MISSING' ([string]$refusedAfterFailure.Data.Code) 'An unverified clone failure does not report the missing-record code.'
         $journalRecords = @(Get-ToolkitJournalRecords -StateRoot $menuStateRoot)
         Assert-Equal 1 @($journalRecords | Where-Object { [string]$_.Operation -ceq 'Root12' }).Count 'The journal store did not report its records.'
         $cloneReport = Get-ToolkitReport -Install $reportInstall.Install -Instance $reportInstance -StateRoot $menuStateRoot -Runner (New-MenuGuestRunner -Responses (Get-MenuGuestResponses))
